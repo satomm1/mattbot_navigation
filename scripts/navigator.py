@@ -67,10 +67,10 @@ class Navigator:
         self.plan_start = [0.0, 0.0]
 
         # Robot limits
-        self.v_max = 0.2  # maximum velocity
-        self.om_max = 0.4  # maximum angular velocity
+        self.v_max = 0.5  # maximum velocity
+        self.om_max = 1  # maximum angular velocity
 
-        self.v_des = 0.2  # desired cruising velocity
+        self.v_des = 0.3  # desired cruising velocity
         self.theta_start_thresh = 0.05  # threshold in theta to start moving forward when path-following
         self.start_pos_thresh = (
             0.2  # threshold to be far enough into the plan to recompute it
@@ -186,7 +186,7 @@ class Navigator:
 
     def rviz_goal_callback(self, msg):
         print("RViz goal received")
-        origin_frame = "/odom"
+        origin_frame = "odom"
         try:
             nav_pose_origin = self.trans_listener.transformPose(origin_frame, msg)
             self.x_g = nav_pose_origin.pose.position.x
@@ -260,26 +260,26 @@ class Navigator:
     def publish_planned_path(self, path, publisher):
         # publish planned plan for visualization
         path_msg = Path()
-        path_msg.header.frame_id = "map"
+        path_msg.header.frame_id = "odom"
         for state in path:
             pose_st = PoseStamped()
             pose_st.pose.position.x = state[0]
             pose_st.pose.position.y = state[1]
             pose_st.pose.orientation.w = 1
-            pose_st.header.frame_id = "map"
+            pose_st.header.frame_id = "odom"
             path_msg.poses.append(pose_st)
         publisher.publish(path_msg)
 
     def publish_smoothed_path(self, traj, publisher):
         # publish planned plan for visualization
         path_msg = Path()
-        path_msg.header.frame_id = "map"
+        path_msg.header.frame_id = "odom"
         for i in range(traj.shape[0]):
             pose_st = PoseStamped()
             pose_st.pose.position.x = traj[i, 0]
             pose_st.pose.position.y = traj[i, 1]
             pose_st.pose.orientation.w = 1
-            pose_st.header.frame_id = "map"
+            pose_st.header.frame_id = "odom"
             path_msg.poses.append(pose_st)
         publisher.publish(path_msg)
 
@@ -421,10 +421,11 @@ class Navigator:
     def run(self):
         rate = rospy.Rate(10)  # 10 Hz
         while not rospy.is_shutdown():
+        
             # try to get state information to update self.x, self.y, self.theta
             try:
                 (translation, rotation) = self.trans_listener.lookupTransform(
-                    "odom", "base_footprint", rospy.Time(0)
+                    "/odom", "/base_footprint", rospy.Time(0)
                 )
                 self.x = translation[0]
                 self.y = translation[1]
@@ -444,6 +445,7 @@ class Navigator:
             # STATE MACHINE LOGIC
             # some transitions handled by callbacks
             if self.mode == Mode.IDLE:
+                
                 pass
             elif self.mode == Mode.ALIGN:
                 if self.aligned():
@@ -469,7 +471,8 @@ class Navigator:
                     self.switch_mode(Mode.IDLE)
 
             self.publish_control()
-            rate.sleep()
+            #rate.sleep()
+            time.sleep(0.01)
 
 
 if __name__ == "__main__":
