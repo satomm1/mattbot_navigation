@@ -1,0 +1,9 @@
+<!-- navigator_launch_file.launch -->
+<launch>
+
+  <!-- Launch the navigator.py script -->
+  <node name="navigator_node" pkg="mattbot_navigation" type="navigator.py" output="screen">
+  
+  </node>
+
+</launch>
