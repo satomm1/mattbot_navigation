@@ -67,8 +67,8 @@ class Navigator:
         self.plan_start = [0.0, 0.0]
 
         # Robot limits
-        self.v_max = 0.2  # maximum velocity
-        self.om_max = 0.4  # maximum angular velocity
+        self.v_max = 0.25  # maximum velocity
+        self.om_max = 1.5  # maximum angular velocity
 
         self.v_des = 0.2  # desired cruising velocity
         self.theta_start_thresh = 0.05  # threshold in theta to start moving forward when path-following
@@ -99,7 +99,7 @@ class Navigator:
             self.kpx, self.kpy, self.kdx, self.kdy, self.v_max, self.om_max
         )
         self.pose_controller = PoseController(
-            0.0, 0.0, 0.0, self.v_max, self.om_max
+            0.1, 0.1, 0.1, self.v_max, self.om_max
         )
         self.heading_controller = HeadingController(self.kp_th, self.om_max)
 
@@ -186,7 +186,7 @@ class Navigator:
 
     def rviz_goal_callback(self, msg):
         print("RViz goal received")
-        origin_frame = "/odom"
+        origin_frame = "map"
         try:
             nav_pose_origin = self.trans_listener.transformPose(origin_frame, msg)
             self.x_g = nav_pose_origin.pose.position.x
@@ -392,9 +392,9 @@ class Navigator:
                 rospy.loginfo(
                     "New plan rejected (longer duration than current plan)"
                 )
-                self.publish_smoothed_path(
-                    traj_new, self.nav_smoothed_path_rej_pub
-                )
+                # self.publish_smoothed_path(
+                #     traj_new, self.nav_smoothed_path_rej_pub
+                # )
                 return
 
         # Otherwise follow the new plan
@@ -421,10 +421,11 @@ class Navigator:
     def run(self):
         rate = rospy.Rate(10)  # 10 Hz
         while not rospy.is_shutdown():
+        
             # try to get state information to update self.x, self.y, self.theta
             try:
                 (translation, rotation) = self.trans_listener.lookupTransform(
-                    "odom", "base_footprint", rospy.Time(0)
+                    "/map", "/base_footprint", rospy.Time(0)
                 )
                 self.x = translation[0]
                 self.y = translation[1]
@@ -444,6 +445,7 @@ class Navigator:
             # STATE MACHINE LOGIC
             # some transitions handled by callbacks
             if self.mode == Mode.IDLE:
+                
                 pass
             elif self.mode == Mode.ALIGN:
                 if self.aligned():
@@ -469,7 +471,8 @@ class Navigator:
                     self.switch_mode(Mode.IDLE)
 
             self.publish_control()
-            rate.sleep()
+            #rate.sleep()
+            time.sleep(0.01)
 
 
 if __name__ == "__main__":

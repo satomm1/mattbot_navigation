@@ -25,9 +25,9 @@ class PoseController:
 
         # rospy.init_node("controller_outputs", anonymous=True)
 
-        self.pub_alpha = rospy.Publisher('/controller/alpha', Float64, queue_size=10)
-        self.pub_delta = rospy.Publisher('/controller/delta', Float64, queue_size=10)
-        self.pub_rho = rospy.Publisher('/controller/rho', Float64, queue_size=10)
+        # self.pub_alpha = rospy.Publisher('/controller/alpha', Float64, queue_size=10)
+        # self.pub_delta = rospy.Publisher('/controller/delta', Float64, queue_size=10)
+        # self.pub_rho = rospy.Publisher('/controller/rho', Float64, queue_size=10)
         
 
     def load_goal(self, x_g, y_g, th_g):
