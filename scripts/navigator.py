@@ -10,7 +10,7 @@ import tf
 import numpy as np
 from numpy import linalg
 from utils.utils import wrapToPi
-from utils.grids import StochOccupancyGrid2D
+from utils.grids import StochOccupancyGrid2D, DetOccupancyGrid2D
 from planners import AStar, compute_smoothed_traj
 import scipy.interpolate
 import matplotlib.pyplot as plt
@@ -59,7 +59,7 @@ class Navigator:
 
         # plan parameters
         self.plan_resolution = 0.1
-        self.plan_horizon = 15
+        self.plan_horizon = 50
 
         # time when we started following the plan
         self.current_plan_start_time = rospy.get_rostime()
@@ -99,7 +99,7 @@ class Navigator:
             self.kpx, self.kpy, self.kdx, self.kdy, self.v_max, self.om_max
         )
         self.pose_controller = PoseController(
-            0.1, 0.1, 0.1, self.v_max, self.om_max
+            0, 0, 0, self.v_max, self.om_max
         )
         self.heading_controller = HeadingController(self.kp_th, self.om_max)
 
@@ -175,7 +175,7 @@ class Navigator:
                 self.map_height,
                 self.map_origin[0],
                 self.map_origin[1],
-                7,
+                5,
                 self.map_probs,
             )
             if self.x_g is not None:
@@ -364,6 +364,7 @@ class Navigator:
 
         # Check whether path is too short
         if planned_path == None:
+            rospy.loginfo("planned_path is None")
             return
         elif len(planned_path) < 4:
             rospy.loginfo("Path too short to track")

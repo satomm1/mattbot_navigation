@@ -93,7 +93,7 @@ class AStar(object):
         ########## Code starts here ##########
         for ii in [1, 0, -1]:
             for jj in [1, 0, -1]:
-                if ii != 0 or jj != 0:
+                if ii != 0 and jj != 0:
                     x0 = x[0]
                     x1 = x[1]
                     x0 += ii * self.resolution  # /(np.linalg.norm(np.array((ii, jj))))
@@ -121,6 +121,7 @@ class AStar(object):
         path = [self.x_goal]
         current = path[-1]
         while current != self.x_init:
+            # print(current)
             path.append(self.came_from[current])
             current = path[-1]
         return list(reversed(path))
@@ -170,7 +171,13 @@ class AStar(object):
                 set membership efficiently using the syntax "if item in set".
         """
         ########## Code starts here ##########
+        time_limit = 2
+        start = time.time()
+        
         while len(self.open_set) > 0:
+            if time.time() - start > time_limit:
+                return False
+        
             x_current = self.find_best_est_cost_through()
             if x_current == self.x_goal:
                 self.path = self.reconstruct_path()
