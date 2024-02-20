@@ -40,7 +40,8 @@ class StochOccupancyGrid2D(object):
         self.origin_x = origin_x
         self.origin_y = origin_y
         self.probs = np.reshape(np.asarray(probs), (height, width))
-        self.window_size = window_size
+        self.window_size = 10 # window_size
+        # print(window_size)
         self.thresh = thresh
 
     def snap_to_grid(self, x):

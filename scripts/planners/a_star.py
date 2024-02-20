@@ -40,7 +40,7 @@ class AStar(object):
               useful here
         """
         ########## Code starts here ##########
-        if self.occupancy.is_free(x) and 0 <= x[0] < self.occupancy.height and 0 <= x[1] < self.occupancy.width:
+        if self.occupancy.is_free(x) and self.statespace_lo[0] <= x[0] < self.statespace_hi[1] and self.statespace_lo[1] <= x[1] < self.statespace_hi[1]:
             return True
         else:
             return False
@@ -93,7 +93,7 @@ class AStar(object):
         ########## Code starts here ##########
         for ii in [1, 0, -1]:
             for jj in [1, 0, -1]:
-                if ii != 0 and jj != 0:
+                if ii != 0 or jj != 0:
                     x0 = x[0]
                     x1 = x[1]
                     x0 += ii * self.resolution  # /(np.linalg.norm(np.array((ii, jj))))
@@ -121,7 +121,6 @@ class AStar(object):
         path = [self.x_goal]
         current = path[-1]
         while current != self.x_init:
-            # print(current)
             path.append(self.came_from[current])
             current = path[-1]
         return list(reversed(path))
@@ -175,8 +174,8 @@ class AStar(object):
         start = time.time()
         
         while len(self.open_set) > 0:
-            if time.time() - start > time_limit:
-                return False
+            # if time.time() - start > time_limit:
+                # return False
         
             x_current = self.find_best_est_cost_through()
             if x_current == self.x_goal:
@@ -185,16 +184,23 @@ class AStar(object):
             self.open_set.remove(x_current)
             self.closed_set.add(x_current)
             for x_neigh in self.get_neighbors(x_current):
-                if x_neigh in self.closed_set:
-                    continue
+                
+                # if x_neigh not in self.closed_set:
+                #     continue
+                # tentative_cost_to_arrive = self.cost_to_arrive[x_current] + self.distance(x_current, x_neigh)
+                # if x_neigh not in self.open_set:
+                #     self.open_set.add(x_neigh)
+                # elif tentative_cost_to_arrive > self.cost_to_arrive[x_neigh]:
+                #     continue
+                # self.came_from[x_neigh] = x_current
+                # self.cost_to_arrive[x_neigh] = tentative_cost_to_arrive
+                # self.est_cost_through[x_neigh] = tentative_cost_to_arrive + self.distance(x_neigh, self.x_goal)
                 tentative_cost_to_arrive = self.cost_to_arrive[x_current] + self.distance(x_current, x_neigh)
-                if x_neigh not in self.open_set:
+                if x_neigh not in self.cost_to_arrive or tentative_cost_to_arrive < self.cost_to_arrive[x_neigh]:
                     self.open_set.add(x_neigh)
-                elif tentative_cost_to_arrive > self.cost_to_arrive[x_neigh]:
-                    continue
-                self.came_from[x_neigh] = x_current
-                self.cost_to_arrive[x_neigh] = tentative_cost_to_arrive
-                self.est_cost_through[x_neigh] = tentative_cost_to_arrive + self.distance(x_neigh, self.x_goal)
+                    self.came_from[x_neigh] = x_current
+                    self.cost_to_arrive[x_neigh] = tentative_cost_to_arrive
+                    self.est_cost_through[x_neigh] = tentative_cost_to_arrive + self.distance(x_neigh, self.x_goal)
         return False
         ########## Code ends here ##########
 
