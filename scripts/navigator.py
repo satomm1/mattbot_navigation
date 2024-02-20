@@ -69,6 +69,7 @@ class Navigator:
         # Robot limits
         self.v_max = 0.4  # maximum velocity
         self.om_max = 2.5  # maximum angular velocity
+        self.om_heading = 1.5  # angular velocity for heading controller
 
         self.v_des = 0.2  # desired cruising velocity
         self.theta_start_thresh = 0.05  # threshold in theta to start moving forward when path-following
@@ -101,7 +102,7 @@ class Navigator:
         self.pose_controller = PoseController(
             0, 0, 0, self.v_max, self.om_max
         )
-        self.heading_controller = HeadingController(self.kp_th, self.om_max)
+        self.heading_controller = HeadingController(self.kp_th, self.om_heading)
 
         self.nav_planned_path_pub = rospy.Publisher(
             "/planned_path", Path, queue_size=10
