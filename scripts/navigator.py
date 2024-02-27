@@ -190,8 +190,16 @@ class Navigator:
         origin_frame = "map"
         try:
             nav_pose_origin = self.trans_listener.transformPose(origin_frame, msg)
-            self.x_g = nav_pose_origin.pose.position.x
-            self.y_g = nav_pose_origin.pose.position.y
+            
+            x_g_proposed = nav_pose_origin.pose.position.x
+            y_g_proposed = nav_pose_origin.pose.position.y
+            
+            if not self.occupancy.is_free((x_g_proposed, y_g_proposed)):
+                rospy.loginfo("Not a valid goal")
+                return
+            
+            self.x_g = x_g_proposed
+            self.y_g = y_g_proposed
             quaternion = (nav_pose_origin.pose.orientation.x, nav_pose_origin.pose.orientation.y, nav_pose_origin.pose.orientation.z, nav_pose_origin.pose.orientation.w)
             euler = tf.transformations.euler_from_quaternion(quaternion)
             self.theta_g = euler[2]
