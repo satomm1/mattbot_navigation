@@ -69,7 +69,7 @@ class Navigator:
         # Robot limits
         self.v_max = 0.4  # maximum velocity
         self.om_max = 2.5  # maximum angular velocity
-        self.om_heading = 1.5  # angular velocity for heading controller
+        self.om_heading = 1.3  # angular velocity for heading controller
 
         self.v_des = 0.2  # desired cruising velocity
         self.theta_start_thresh = 0.05  # threshold in theta to start moving forward when path-following
@@ -181,9 +181,9 @@ class Navigator:
             )
             if self.x_g is not None:
                 # if we have a goal to plan to, replan
-                # pass
-                rospy.loginfo("replanning because of new map")
-                self.replan()  # new map, need to replan
+                pass
+                #rospy.loginfo("replanning because of new map")
+                # self.replan()  # new map, need to replan
 
     def rviz_goal_callback(self, msg):
         print("RViz goal received")
@@ -398,7 +398,7 @@ class Navigator:
             t_init_align = abs(th_err / self.om_max)
             t_remaining_new = t_init_align + t_new[-1]
 
-            if t_remaining_new > t_remaining_curr:
+            if t_remaining_new > t_remaining_curr-2:
                 rospy.loginfo(
                     "New plan rejected (longer duration than current plan)"
                 )
@@ -406,6 +406,8 @@ class Navigator:
                 #     traj_new, self.nav_smoothed_path_rej_pub
                 # )
                 return
+            else:
+                rospy.loginfo("New plan accepted")
 
         # Otherwise follow the new plan
         self.publish_planned_path(planned_path, self.nav_planned_path_pub)
@@ -469,7 +471,7 @@ class Navigator:
                     self.replan()
                 elif (
                     rospy.get_rostime() - self.current_plan_start_time
-                ).to_sec() > self.current_plan_duration:
+                ).to_sec() > self.current_plan_duration+2:
                     rospy.loginfo("replanning because out of time")
                     self.replan()  # we aren't near the goal but we thought we should have been, so replan
             elif self.mode == Mode.PARK:
