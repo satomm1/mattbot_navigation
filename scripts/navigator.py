@@ -4,27 +4,472 @@ import time
 import rospy
 from nav_msgs.msg import OccupancyGrid, MapMetaData, Path
 from geometry_msgs.msg import Twist, Pose2D, PoseStamped
-from std_msgs.msg import String, Int32
+from std_msgs.msg import String, Int32, Float64
 # from asl_turtlebot.msg import DetectedObject
 import tf
 import numpy as np
 from numpy import linalg
-from utils.utils import wrapToPi
-from utils.grids import StochOccupancyGrid2D
-from planners import AStar, compute_smoothed_traj
 import scipy.interpolate
 import matplotlib.pyplot as plt
-from controllers import TrajectoryTracker, HeadingController, PoseController
 from enum import Enum
 
 from dynamic_reconfigure.server import Server
 # from asl_turtlebot.cfg import NavigatorConfig
+
+V_PREV_THRES = 0.0001
+
+# command zero velocities once we are this close to the goal
+RHO_THRES = 0.05
+ALPHA_THRES = 0.1
+DELTA_THRES = 0.1
 
 class Mode(Enum):
     IDLE = 0
     ALIGN = 1
     TRACK = 2
     PARK = 3
+
+def wrapToPi(a):
+    if isinstance(a, list):
+        return [(x+np.pi) % (2*np.pi) - np.pi for x in a]
+    return (a + np.pi) % (2*np.pi) - np.pi
+
+def compute_smoothed_traj(path, V_des, k, alpha, dt):
+    """
+    Fit cubic spline to a path and generate a resulting trajectory for our
+    wheeled robot.
+
+    Inputs:
+        path (np.array [N,2]): Initial path
+        V_des (float): Desired nominal velocity, used as a heuristic to assign nominal
+            times to points in the initial path
+        k (int): The degree of the spline fit.
+            For this assignment, k should equal 3 (see documentation for
+            scipy.interpolate.splrep)
+        alpha (float): Smoothing parameter (see documentation for
+            scipy.interpolate.splrep)
+        dt (float): Timestep used in final smooth trajectory
+    Outputs:
+        t_smoothed (np.array [N]): Associated trajectory times
+        traj_smoothed (np.array [N,7]): Smoothed trajectory
+    Hint: Use splrep and splev from scipy.interpolate
+    """
+    assert(path and k > 2 and k < len(path))
+    ########## Code starts here ##########
+    t = np.zeros(len(path))
+    for ii in range(len(path) - 1):
+        dist = np.linalg.norm(np.array(path[ii + 1]) - np.array(path[ii]))  # distance between consecutive points
+        t[ii + 1] = dist / V_des + t[ii]  # time at next point assuming constant velocity V_des
+
+    tck_x = scipy.interpolate.splrep(t, np.array(path)[:, 0], k=k, s=alpha)
+    tck_y = scipy.interpolate.splrep(t, np.array(path)[:, 1], k=k, s=alpha)
+
+    t_smoothed = np.arange(0, t[-1], dt)
+    x_d = scipy.interpolate.splev(t_smoothed, tck_x, der=0)
+    y_d = scipy.interpolate.splev(t_smoothed, tck_y, der=0)
+    xd_d = scipy.interpolate.splev(t_smoothed, tck_x, der=1)
+    yd_d = scipy.interpolate.splev(t_smoothed, tck_y, der=1)
+    xdd_d = scipy.interpolate.splev(t_smoothed, tck_x, der=2)
+    ydd_d = scipy.interpolate.splev(t_smoothed, tck_y, der=2)
+    theta_d = np.arctan2(yd_d, xd_d)
+    ########## Code ends here ##########
+    traj_smoothed = np.stack([x_d, y_d, theta_d, xd_d, yd_d, xdd_d, ydd_d]).transpose()
+
+    return t_smoothed, traj_smoothed
+
+# A 2D state space grid with a set of rectangular obstacles. The grid is fully deterministic
+class DetOccupancyGrid2D(object):
+    def __init__(self, width, height, obstacles):
+        self.width = width
+        self.height = height
+        self.obstacles = obstacles
+
+    def is_free(self, x):
+        for obs in self.obstacles:
+            inside = True
+            for dim in range(len(x)):
+                if x[dim] < obs[0][dim] or x[dim] > obs[1][dim]:
+                    inside = False
+                    break
+            if inside:
+                return False
+        return True
+
+class StochOccupancyGrid2D(object):
+    def __init__(self, resolution, width, height, origin_x, origin_y,
+                window_size, probs, thresh=0.5):
+        self.resolution = resolution
+        self.width = width
+        self.height = height
+        self.origin_x = origin_x
+        self.origin_y = origin_y
+        self.probs = np.reshape(np.asarray(probs), (height, width))
+        self.window_size = window_size
+        self.thresh = thresh
+
+    def snap_to_grid(self, x):
+        return (self.resolution*round(x[0]/self.resolution), self.resolution*round(x[1]/self.resolution))
+
+    def is_free(self, state):
+        # combine the probabilities of each cell by assuming independence
+        # of each estimation
+        x, y = self.snap_to_grid(state)
+        grid_x = int((x - self.origin_x) / self.resolution)
+        grid_y = int((y - self.origin_y) / self.resolution)
+
+        half_size = int(round((self.window_size-1)/2))
+        grid_x_lower = max(0, grid_x - half_size)
+        grid_y_lower = max(0, grid_y - half_size)
+        grid_x_upper = min(self.width, grid_x + half_size + 1)
+        grid_y_upper = min(self.height, grid_y + half_size + 1)
+
+        prob_window = self.probs[grid_y_lower:grid_y_upper, grid_x_lower:grid_x_upper]
+        p_total = np.prod(1. - np.maximum(prob_window / 100., 0.))
+
+        return (1. - p_total) < self.thresh
+    
+class AStar(object):
+    """Represents a motion planning problem to be solved using A*"""
+
+    def __init__(self, statespace_lo, statespace_hi, x_init, x_goal, occupancy, resolution=1):
+        self.statespace_lo = np.array(statespace_lo)  # state space lower bound (e.g., [-5, -5])
+        self.statespace_hi = np.array(statespace_hi)  # state space upper bound (e.g., [5, 5])
+        self.occupancy = occupancy  # occupancy grid (a DetOccupancyGrid2D object)
+        self.resolution = resolution  # resolution of the discretization of state space (cell/m)
+        self.x_init = self.snap_to_grid(x_init)  # initial state
+        self.x_goal = self.snap_to_grid(x_goal)  # goal state
+
+        self.closed_set = set()  # the set containing the states that have been visited
+        self.open_set = set()  # the set containing the states that are condidate for future expension
+        self.came_from = {}  # dictionary keeping track of each state's parent to reconstruct the path
+        self.est_cost_through = {}
+        self.cost_to_arrive = {}
+
+        self.open_set.add(self.x_init)
+        self.cost_to_arrive[self.x_init] = 0
+        self.est_cost_through[self.x_init] = self.distance(self.x_init, self.x_goal)
+
+        self.path = None  # the final path as a list of states
+
+    def is_free(self, x):
+        """
+        Checks if a give state x is free, meaning it is inside the bounds of the map and
+        is not inside any obstacle.
+        Inputs:
+            x: state tuple
+        Output:
+            Boolean True/False
+        Hint: self.occupancy is a DetOccupancyGrid2D object, take a look at its methods for what might be
+              useful here
+        """
+        ########## Code starts here ##########
+        if self.occupancy.is_free(x) and 0 <= x[0] < self.occupancy.height and 0 <= x[1] < self.occupancy.width:
+            return True
+        else:
+            return False
+        ########## Code ends here ##########
+
+    def distance(self, x1, x2):
+        """
+        Computes the Euclidean distance between two states.
+        Inputs:
+            x1: First state tuple
+            x2: Second state tuple
+        Output:
+            Float Euclidean distance
+
+        HINT: This should take one line. Tuples can be converted to numpy arrays using np.array().
+        """
+        ########## Code starts here ##########
+        return np.linalg.norm(np.array(x1) - np.array(x2))
+        ########## Code ends here ##########
+
+    def snap_to_grid(self, x):
+        """ Returns the closest point on a discrete state grid
+        Input:
+            x: tuple state
+        Output:
+            A tuple that represents the closest point to x on the discrete state grid
+        """
+        return (self.resolution * round(x[0] / self.resolution), self.resolution * round(x[1] / self.resolution))
+
+    def get_neighbors(self, x):
+        """
+        Gets the FREE neighbor states of a given state x. Assumes a motion model
+        where we can move up, down, left, right, or along the diagonals by an
+        amount equal to self.resolution.
+        Input:
+            x: tuple state
+        Ouput:
+            List of neighbors that are free, as a list of TUPLES
+
+        HINTS: Use self.is_free to check whether a given state is indeed free.
+               Use self.snap_to_grid (see above) to ensure that the neighbors
+               you compute are actually on the discrete grid, i.e., if you were
+               to compute neighbors by adding/subtracting self.resolution from x,
+               numerical errors could creep in over the course of many additions
+               and cause grid point equality checks to fail. To remedy this, you
+               should make sure that every neighbor is snapped to the grid as it
+               is computed.
+        """
+        neighbors = []
+        ########## Code starts here ##########
+        for ii in [1, 0, -1]:
+            for jj in [1, 0, -1]:
+                if ii != 0 or jj != 0:
+                    x0 = x[0]
+                    x1 = x[1]
+                    x0 += ii * self.resolution  # /(np.linalg.norm(np.array((ii, jj))))
+                    x1 += jj * self.resolution  # /(np.linalg.norm(np.array((ii, jj))))
+                    state = self.snap_to_grid((x0, x1))
+                    if self.is_free(state):
+                        neighbors.append(state)
+        ########## Code ends here ##########
+        return neighbors
+
+    def find_best_est_cost_through(self):
+        """
+        Gets the state in open_set that has the lowest est_cost_through
+        Output: A tuple, the state found in open_set that has the lowest est_cost_through
+        """
+        return min(self.open_set, key=lambda x: self.est_cost_through[x])
+
+    def reconstruct_path(self):
+        """
+        Use the came_from map to reconstruct a path from the initial location to
+        the goal location
+        Output:
+            A list of tuples, which is a list of the states that go from start to goal
+        """
+        path = [self.x_goal]
+        current = path[-1]
+        while current != self.x_init:
+            path.append(self.came_from[current])
+            current = path[-1]
+        return list(reversed(path))
+
+    def plot_path(self, fig_num=0, show_init_label=True):
+        """Plots the path found in self.path and the obstacles"""
+        if not self.path:
+            return
+
+        self.occupancy.plot(fig_num)
+
+        solution_path = np.array(self.path) * self.resolution
+        plt.plot(solution_path[:, 0], solution_path[:, 1], color="green", linewidth=2, label="A* solution path",
+                 zorder=10)
+        plt.scatter([self.x_init[0] * self.resolution, self.x_goal[0] * self.resolution],
+                    [self.x_init[1] * self.resolution, self.x_goal[1] * self.resolution], color="green", s=30,
+                    zorder=10)
+        if show_init_label:
+            plt.annotate(r"$x_{init}$", np.array(self.x_init) * self.resolution + np.array([.2, .2]), fontsize=16)
+        plt.annotate(r"$x_{goal}$", np.array(self.x_goal) * self.resolution + np.array([.2, .2]), fontsize=16)
+        plt.legend(loc='upper center', bbox_to_anchor=(0.5, -0.03), fancybox=True, ncol=3)
+
+        plt.axis([0, self.occupancy.width, 0, self.occupancy.height])
+
+    def plot_tree(self, point_size=15):
+        plot_line_segments([(x, self.came_from[x]) for x in self.open_set if x != self.x_init], linewidth=1,
+                           color="blue", alpha=0.2)
+        plot_line_segments([(x, self.came_from[x]) for x in self.closed_set if x != self.x_init], linewidth=1,
+                           color="blue", alpha=0.2)
+        px = [x[0] for x in self.open_set | self.closed_set if x != self.x_init and x != self.x_goal]
+        py = [x[1] for x in self.open_set | self.closed_set if x != self.x_init and x != self.x_goal]
+        plt.scatter(px, py, color="blue", s=point_size, zorder=10, alpha=0.2)
+
+    def solve(self):
+        """
+        Solves the planning problem using the A* search algorithm. It places
+        the solution as a list of tuples (each representing a state) that go
+        from self.x_init to self.x_goal inside the variable self.path
+        Input:
+            None
+        Output:
+            Boolean, True if a solution from x_init to x_goal was found
+
+        HINTS:  We're representing the open and closed sets using python's built-in
+                set() class. This allows easily adding and removing items using
+                .add(item) and .remove(item) respectively, as well as checking for
+                set membership efficiently using the syntax "if item in set".
+        """
+        ########## Code starts here ##########
+        while len(self.open_set) > 0:
+            x_current = self.find_best_est_cost_through()
+            if x_current == self.x_goal:
+                self.path = self.reconstruct_path()
+                return True
+            self.open_set.remove(x_current)
+            self.closed_set.add(x_current)
+            for x_neigh in self.get_neighbors(x_current):
+                if x_neigh in self.closed_set:
+                    continue
+                tentative_cost_to_arrive = self.cost_to_arrive[x_current] + self.distance(x_current, x_neigh)
+                if x_neigh not in self.open_set:
+                    self.open_set.add(x_neigh)
+                elif tentative_cost_to_arrive > self.cost_to_arrive[x_neigh]:
+                    continue
+                self.came_from[x_neigh] = x_current
+                self.cost_to_arrive[x_neigh] = tentative_cost_to_arrive
+                self.est_cost_through[x_neigh] = tentative_cost_to_arrive + self.distance(x_neigh, self.x_goal)
+        return False
+        ########## Code ends here ##########
+
+class TrajectoryTracker:
+    """ Trajectory tracking controller using differential flatness """
+
+    def __init__(self, kpx, kpy, kdx, kdy,
+                 V_max=0.5, om_max=1):
+        self.kpx = kpx
+        self.kpy = kpy
+        self.kdx = kdx
+        self.kdy = kdy
+
+        self.V_max = V_max
+        self.om_max = om_max
+
+        self.coeffs = np.zeros(8)  # Polynomial coefficients for x(t) and y(t) as
+        # returned by the differential flatness code
+
+    def reset(self):
+        self.V_prev = 0.
+        self.om_prev = 0.
+        self.t_prev = 0.
+
+    def load_traj(self, times, traj):
+        """ Loads in a new trajectory to follow, and resets the time """
+        self.reset()
+        self.traj_times = times
+        self.traj = traj
+
+    def get_desired_state(self, t):
+        """
+        Input:
+            t: Current time
+        Output:
+            x_d, xd_d, xdd_d, y_d, yd_d, ydd_d: Desired state and derivatives
+                at time t according to self.coeffs
+        """
+        x_d = np.interp(t, self.traj_times, self.traj[:, 0])
+        y_d = np.interp(t, self.traj_times, self.traj[:, 1])
+        xd_d = np.interp(t, self.traj_times, self.traj[:, 3])
+        yd_d = np.interp(t, self.traj_times, self.traj[:, 4])
+        xdd_d = np.interp(t, self.traj_times, self.traj[:, 5])
+        ydd_d = np.interp(t, self.traj_times, self.traj[:, 6])
+
+        return x_d, xd_d, xdd_d, y_d, yd_d, ydd_d
+
+    def compute_control(self, x, y, th, t):
+        """
+        Inputs:
+            x,y,th: Current state
+            t: Current time
+        Outputs:
+            V, om: Control actions
+        """
+
+        dt = t - self.t_prev
+        x_d, xd_d, xdd_d, y_d, yd_d, ydd_d = self.get_desired_state(t)
+
+        ########## Code starts here ##########
+        if self.V_prev < V_PREV_THRES:
+            self.V_prev = np.sqrt(xd_d ** 2 + yd_d ** 2)
+
+        x_dot = self.V_prev * np.cos(th)
+        y_dot = self.V_prev * np.sin(th)
+
+        u1 = xdd_d + self.kpx * (x_d - x) + self.kdx * (xd_d - x_dot)
+        u2 = ydd_d + self.kpy * (y_d - y) + self.kdy * (yd_d - y_dot)
+
+        a = u1 * np.cos(th) + u2 * np.sin(th)
+        om = -u1 * np.sin(th) / self.V_prev + u2 * np.cos(th) / self.V_prev
+
+        V = self.V_prev + a * dt
+        ########## Code ends here ##########
+
+        # apply control limits
+        V = np.clip(V, -self.V_max, self.V_max)
+        om = np.clip(om, -self.om_max, self.om_max)
+
+        # save the commands that were applied and the time
+        self.t_prev = t
+        self.V_prev = V
+        self.om_prev = om
+
+        return V, om
+
+class PoseController:
+    """ Pose stabilization controller """
+    def __init__(self, k1, k2, k3,
+                 V_max=0.5, om_max=1):
+        self.k1 = k1
+        self.k2 = k2
+        self.k3 = k3
+
+        self.V_max = V_max
+        self.om_max = om_max
+
+        # rospy.init_node("controller_outputs", anonymous=True)
+
+        self.pub_alpha = rospy.Publisher('/controller/alpha', Float64, queue_size=10)
+        self.pub_delta = rospy.Publisher('/controller/delta', Float64, queue_size=10)
+        self.pub_rho = rospy.Publisher('/controller/rho', Float64, queue_size=10)
+        
+
+    def load_goal(self, x_g, y_g, th_g):
+        """ Loads in a new goal position """
+        self.x_g = x_g
+        self.y_g = y_g
+        self.th_g = th_g
+
+    def compute_control(self, x, y, th, t):
+        """
+        Inputs:
+            x,y,th: Current state
+            t: Current time (you shouldn't need to use this)
+        Outputs:
+            V, om: Control actions
+
+        Hints: You'll need to use the wrapToPi function. The np.sinc function
+        may also be useful, look up its documentation
+        """
+        ########## Code starts here ##########
+        rho = np.sqrt((x - self.x_g) ** 2 + (y - self.y_g) ** 2)
+        alpha = wrapToPi(np.arctan2(self.y_g - y, self.x_g - x) - th)
+        delta = wrapToPi(np.arctan2(self.y_g - y, self.x_g - x) - self.th_g)
+
+        V = self.k1 * rho * np.cos(alpha)
+        om = self.k2 * alpha + self.k1 * np.sinc(alpha / np.pi) * np.cos(alpha) * (alpha + self.k3 * delta)
+        ########## Code ends here ##########
+
+        # apply control limits
+        V = np.clip(V, -self.V_max, self.V_max)
+        om = np.clip(om, -self.om_max, self.om_max)
+
+        return V, om
+
+class HeadingController:
+    """
+    pose stabilization controller
+    """
+    def __init__(self, kp, om_max=1):
+        self.kp = kp
+        self.om_max = om_max
+
+    def load_goal(self, th_g):
+        """
+        loads in a new goal position
+        """
+        self.th_g = th_g
+
+    def compute_control(self, x, y, th, t):
+        err = wrapToPi(self.th_g - th)
+        om = self.kp*err
+
+        # apply control limits
+        V = 0
+        om = np.clip(om, -self.om_max, self.om_max)
+
+        return V, om
 
 class Navigator:
     """
