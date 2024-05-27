@@ -4,7 +4,7 @@ import time
 import rospy
 from nav_msgs.msg import OccupancyGrid, MapMetaData, Path
 from geometry_msgs.msg import Twist, Pose2D, PoseStamped
-from std_msgs.msg import String, Int32, Float64
+from std_msgs.msg import String, Int32, Float64, Bool
 # from asl_turtlebot.msg import DetectedObject
 import tf
 import numpy as np
@@ -482,6 +482,8 @@ class Navigator:
         rospy.init_node("mattbot_navigator", anonymous=True)
         self.mode = Mode.IDLE
 
+        self.is_localized = False
+
         # current state
         self.x = 0.0
         self.y = 0.0
@@ -569,6 +571,7 @@ class Navigator:
         rospy.Subscriber("/map_metadata", MapMetaData, self.map_md_callback)
         rospy.Subscriber("/cmd_nav", Pose2D, self.cmd_nav_callback)
         rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.rviz_goal_callback)
+        self.localized_sub = rospy.Subscriber("/localized", Bool, self.localized_callback)
 
         self.has_stopped = False
 
@@ -636,16 +639,16 @@ class Navigator:
         origin_frame = "map"
         try:
             nav_pose_origin = self.trans_listener.transformPose(origin_frame, msg)
-            
             x_g_proposed = nav_pose_origin.pose.position.x
             y_g_proposed = nav_pose_origin.pose.position.y
-            
+
             if not self.occupancy.is_free((x_g_proposed, y_g_proposed)):
                 rospy.loginfo("Not a valid goal")
                 return
             
             self.x_g = x_g_proposed
             self.y_g = y_g_proposed
+
             quaternion = (nav_pose_origin.pose.orientation.x, nav_pose_origin.pose.orientation.y, nav_pose_origin.pose.orientation.z, nav_pose_origin.pose.orientation.w)
             euler = tf.transformations.euler_from_quaternion(quaternion)
             self.theta_g = euler[2]
@@ -653,23 +656,12 @@ class Navigator:
             print(self.y_g)
             print(self.theta_g)
             self.replan()
-            # nav_pose_origin = self.trans_listener.transformPose(origin_frame, msg)
-            # self.x_g = nav_pose_origin.pose.position.x
-            # self.y_g = nav_pose_origin.pose.position.y
-            # quaternion = (nav_pose_origin.pose.orientation.x, nav_pose_origin.pose.orientation.y, nav_pose_origin.pose.orientation.z, nav_pose_origin.pose.orientation.w)
-            # euler = tf.transformations.euler_from_quaternion(quaternion)
-            # self.theta_g = euler[2]
-            # self.x_g = msg.pose.position.x
-            # self.y_g = msg.pose.position.y
-            # quaternion = (msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w)
-            # euler = tf.transformations.euler_from_quaternion(quaternion)
-            # self.theta_g = euler[2]
-            # print(self.x_g)
-            # print(self.y_g)
-            # print(self.theta_g)
-            # self.replan()
         except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            print("RVIZ Goal exception:")
             print(e)
+
+    def localized_callback(self, msg):
+        self.is_localized = msg.data
 
     def shutdown_callback(self):
         """
@@ -888,6 +880,32 @@ class Navigator:
         rospy.loginfo("Ready to track")
         self.switch_mode(Mode.TRACK)
 
+    def localize(self):
+        """
+        Rotates slowly to localize the robot
+        """
+        rate = rospy.Rate(10)  # 10 Hz
+        while not self.is_localized:
+            # rotate until we get a valid position
+            cmd_vel = Twist()
+            cmd_vel.angular.z = 0.2
+            self.nav_vel_pub.publish(cmd_vel)
+
+            rate.sleep()
+
+        # Display message that we have localized
+        rospy.loginfo("Navigator: localized")
+
+        # Unsubscribe from the localized topic
+        self.is_localized = True
+        self.localized_sub.unregister()
+        self.localized_sub = None
+
+        # Now that we are localized, we can stop the robot
+        cmd_vel = Twist()
+        cmd_vel.angular.z = 0.0
+        self.nav_vel_pub.publish(cmd_vel)
+
     def run(self):
         rate = rospy.Rate(10)  # 10 Hz
         while not rospy.is_shutdown():
@@ -915,7 +933,6 @@ class Navigator:
             # STATE MACHINE LOGIC
             # some transitions handled by callbacks
             if self.mode == Mode.IDLE:
-                
                 pass
             elif self.mode == Mode.ALIGN:
                 if self.aligned():
@@ -948,4 +965,5 @@ class Navigator:
 if __name__ == "__main__":
     nav = Navigator()
     rospy.on_shutdown(nav.shutdown_callback)
-    nav.run()
+    nav.localize()  # rotate to localize
+    nav.run()  # run the main loop
