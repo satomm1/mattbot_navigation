@@ -888,7 +888,7 @@ class Navigator:
         while not self.is_localized:
             # rotate until we get a valid position
             cmd_vel = Twist()
-            cmd_vel.angular.z = 0.2
+            cmd_vel.angular.z = 1
             self.nav_vel_pub.publish(cmd_vel)
 
             rate.sleep()
@@ -965,5 +965,6 @@ class Navigator:
 if __name__ == "__main__":
     nav = Navigator()
     rospy.on_shutdown(nav.shutdown_callback)
+    time.sleep(5)  # Give time for everything to set up
     nav.localize()  # rotate to localize
     nav.run()  # run the main loop
