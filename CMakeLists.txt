@@ -164,6 +164,7 @@ catkin_install_python(PROGRAMS
   scripts/navigator.py
   scripts/utils/__init__.py
   scripts/utils/utils.py
+  scripts/localize_and_navigate.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
