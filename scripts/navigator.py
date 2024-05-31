@@ -569,6 +569,7 @@ class Navigator:
         rospy.Subscriber("/map_metadata", MapMetaData, self.map_md_callback)
         rospy.Subscriber("/cmd_nav", Pose2D, self.cmd_nav_callback)
         rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.rviz_goal_callback)
+        rospy.Subscriber("/external_goal", Pose2D, self.goal_callback)
 
         self.has_stopped = False
 
@@ -653,23 +654,19 @@ class Navigator:
             print(self.y_g)
             print(self.theta_g)
             self.replan()
-            # nav_pose_origin = self.trans_listener.transformPose(origin_frame, msg)
-            # self.x_g = nav_pose_origin.pose.position.x
-            # self.y_g = nav_pose_origin.pose.position.y
-            # quaternion = (nav_pose_origin.pose.orientation.x, nav_pose_origin.pose.orientation.y, nav_pose_origin.pose.orientation.z, nav_pose_origin.pose.orientation.w)
-            # euler = tf.transformations.euler_from_quaternion(quaternion)
-            # self.theta_g = euler[2]
-            # self.x_g = msg.pose.position.x
-            # self.y_g = msg.pose.position.y
-            # quaternion = (msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w)
-            # euler = tf.transformations.euler_from_quaternion(quaternion)
-            # self.theta_g = euler[2]
-            # print(self.x_g)
-            # print(self.y_g)
-            # print(self.theta_g)
-            # self.replan()
         except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
             print(e)
+
+    def goal_callback(self, msg):
+        x_g_proposed = msg.x
+        y_g_proposed = msg.y
+        if not self.occupancy.is_free((x_g_proposed, y_g_proposed)):
+            rospy.loginfo("Not a valid goal")
+            return
+        self.x_g = x_g_proposed
+        self.y_g = y_g_proposed
+        self.theta_g = msg.theta
+        self.replan()
 
     def shutdown_callback(self):
         """
