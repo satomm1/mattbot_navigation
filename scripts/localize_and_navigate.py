@@ -571,6 +571,7 @@ class Navigator:
         rospy.Subscriber("/map_metadata", MapMetaData, self.map_md_callback)
         rospy.Subscriber("/cmd_nav", Pose2D, self.cmd_nav_callback)
         rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.rviz_goal_callback)
+        rospy.Subscriber("/external_goal", Pose2D, self.external_goal_callback)
         self.localized_sub = rospy.Subscriber("/localized", Bool, self.localized_callback)
 
         self.has_stopped = False
@@ -659,6 +660,19 @@ class Navigator:
         except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
             print("RVIZ Goal exception:")
             print(e)
+    
+    def external_goal_callback(self, msg):
+        x_g_proposed = msg.x
+        y_g_proposed = msg.y
+
+        if not self.occupancy.is_free((x_g_proposed, y_g_proposed)):
+            rospy.loginfo("Not a valid goal")
+            return
+        
+        self.x_g = x_g_proposed
+        self.y_g = y_g_proposed
+        self.theta_g = msg.theta
+        self.replan()
 
     def localized_callback(self, msg):
         self.is_localized = msg.data
