@@ -746,16 +746,20 @@ class Navigator:
             path_msg.poses.append(pose_st)
         publisher.publish(path_msg)
 
-    def publish_smoothed_path(self, traj, publisher):
+    def publish_smoothed_path(self, traj, publisher, times=None):
         # publish planned plan for visualization
         path_msg = Path()
         path_msg.header.frame_id = "map"
+        current_time = rospy.get_rostime()
+        path_msg.header.stamp = current_time
         for i in range(traj.shape[0]):
             pose_st = PoseStamped()
             pose_st.pose.position.x = traj[i, 0]
             pose_st.pose.position.y = traj[i, 1]
             pose_st.pose.orientation.w = 1
             pose_st.header.frame_id = "map"
+            if times is not None:
+                pose_st.header.stamp = rospy.Duration(times[i]) + current_time
             path_msg.poses.append(pose_st)
         publisher.publish(path_msg)
 
@@ -875,7 +879,7 @@ class Navigator:
 
         # Otherwise follow the new plan
         self.publish_planned_path(planned_path, self.nav_planned_path_pub)
-        self.publish_smoothed_path(traj_new, self.nav_smoothed_path_pub)
+        self.publish_smoothed_path(traj_new, self.nav_smoothed_path_pub, times=t_new)
 
         self.pose_controller.load_goal(self.x_g, self.y_g, self.theta_g)
         self.traj_controller.load_traj(t_new, traj_new)
