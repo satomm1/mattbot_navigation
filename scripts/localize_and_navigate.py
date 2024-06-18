@@ -12,6 +12,8 @@ from numpy import linalg
 import scipy.interpolate
 import matplotlib.pyplot as plt
 from enum import Enum
+import requests
+import os
 
 from dynamic_reconfigure.server import Server
 # from asl_turtlebot.cfg import NavigatorConfig
@@ -148,7 +150,7 @@ class StochOccupancyGrid2D(object):
 class AStar(object):
     """Represents a motion planning problem to be solved using A*"""
 
-    def __init__(self, statespace_lo, statespace_hi, x_init, x_goal, occupancy, resolution=1):
+    def __init__(self, statespace_lo, statespace_hi, x_init, x_goal, occupancy, resolution=1, robots_x=None, robots_y=None, robots_d=0.5):
         self.statespace_lo = np.array(statespace_lo)  # state space lower bound (e.g., [-5, -5])
         self.statespace_hi = np.array(statespace_hi)  # state space upper bound (e.g., [5, 5])
         self.occupancy = occupancy  # occupancy grid (a DetOccupancyGrid2D object)
@@ -168,6 +170,11 @@ class AStar(object):
 
         self.path = None  # the final path as a list of states
 
+        # Location of other robots in the map
+        self.robots_x = robots_x
+        self.robots_y = robots_y
+        self.robots_d = robots_d  # Diameter of the robot
+
     def is_free(self, x):
         """
         Checks if a give state x is free, meaning it is inside the bounds of the map and
@@ -181,6 +188,10 @@ class AStar(object):
         """
         ########## Code starts here ##########
         if self.occupancy.is_free(x) and self.statespace_lo[0] <= x[0] < self.statespace_hi[1] and self.statespace_lo[1] <= x[1] < self.statespace_hi[1]:
+            if self.robots_x is not None:
+                for ii in range(len(self.robots_x)):
+                    if np.linalg.norm(np.array((self.robots_x[ii], self.robots_y[ii])) - np.array(x)) < self.robots_d:
+                        return False
             return True
         else:
             return False
@@ -478,7 +489,7 @@ class Navigator:
     It is the sole node that should publish to cmd_vel
     """
 
-    def __init__(self):
+    def __init__(self, server_url='http://192.168.50.2:8000/graphql'):
         rospy.init_node("mattbot_navigator", anonymous=True)
         self.mode = Mode.IDLE
 
@@ -505,6 +516,18 @@ class Navigator:
         self.occupancy = None
         self.occupancy_updated = False
 
+        self.server_url = server_url
+        self.stopped_robot_location_query = """
+                                            {
+                                                stoppedRobotPositions {
+                                                    id
+                                                    x
+                                                    y
+                                                    theta 
+                                                }
+                                            }
+                                            """
+                                            
         # plan parameters
         self.plan_resolution = 0.1
         self.plan_horizon = 50
@@ -796,6 +819,25 @@ class Navigator:
         t = (rospy.get_rostime() - self.current_plan_start_time).to_sec()
         return max(0.0, t)  # clip negative time to 0
 
+    def get_stopped_robot_locations(self):
+        # Query using graphql
+        response = requests.post(self.server_url, json={'query': self.stopped_robot_location_query})
+        data = response.json()
+
+        # Extract the data
+        position_data = data.get('data', {}).get('stoppedRobotPositions', {})
+        x = []
+        y = []
+        theta = []
+
+        my_id = int(os.environ.get('ROBOT_ID'))
+        for robot in position_data:
+            if robot.get('id') != my_id:
+                x.append(robot.get('x'))
+                y.append(robot.get('y'))
+                theta.append(robot.get('theta'))
+        return x, y, theta
+
     def replan(self):
         """
         loads goal into pose controller
@@ -821,6 +863,7 @@ class Navigator:
         x_init = self.snap_to_grid((self.x, self.y))
         self.plan_start = x_init
         x_goal = self.snap_to_grid((self.x_g, self.y_g))
+        robots_x, robots_y, robots_theta = self.get_stopped_robot_locations()
         problem = AStar(
             state_min,
             state_max,
@@ -828,6 +871,8 @@ class Navigator:
             x_goal,
             self.occupancy,
             self.plan_resolution,
+            robots_x=robots_x,
+            robots_y=robots_y
         )
 
         rospy.loginfo("Navigator: computing navigation plan")
