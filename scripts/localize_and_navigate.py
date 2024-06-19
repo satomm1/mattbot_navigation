@@ -549,9 +549,10 @@ class Navigator:
         )
 
         # threshold at which navigator switches from trajectory to pose control
-        self.near_thresh = 0.2
-        self.at_thresh = 0.02
+        self.near_thresh = 0.01
+        self.at_thresh = 0.01
         self.at_thresh_theta = 0.05
+        self.theta_goal_thresh = 0.05
 
         # trajectory smoothing
         self.spline_alpha = 0.15
@@ -574,6 +575,7 @@ class Navigator:
             0.0, 0.0, 0.0, self.v_max, self.om_max
         )
         self.heading_controller = HeadingController(self.kp_th, self.om_max)
+        self.heading_controller2 = HeadingController(self.kp_th, self.om_max)
 
         self.nav_planned_path_pub = rospy.Publisher(
             "/planned_path", Path, queue_size=10
@@ -738,6 +740,14 @@ class Navigator:
         return (
             abs(wrapToPi(self.theta - self.th_init)) < self.theta_start_thresh
         )
+    
+    def aligned_goal(self):
+        """
+        returns whether robot is aligned with goal direction
+        """
+        return (
+            abs(wrapToPi(self.theta - self.theta_g)) < self.theta_goal_thresh
+        )
 
     def close_to_plan_start(self):
         return (
@@ -794,7 +804,10 @@ class Navigator:
         t = self.get_current_plan_time()
 
         if self.mode == Mode.PARK:
-            V, om = self.pose_controller.compute_control(
+            # V, om = self.pose_controller.compute_control(
+            #     self.x, self.y, self.theta, t
+            # )
+            V, om = self.heading_controller.compute_control(
                 self.x, self.y, self.theta, t
             )
         elif self.mode == Mode.TRACK:
@@ -893,6 +906,7 @@ class Navigator:
         elif len(planned_path) < 4:
             rospy.loginfo("Path too short to track")
             self.pose_controller.load_goal(self.x_g, self.y_g, self.theta_g)
+            self.heading_controller.load_goal(self.theta_g)
             self.switch_mode(Mode.PARK)
             return
 
@@ -1003,6 +1017,8 @@ class Navigator:
                     self.switch_mode(Mode.TRACK)
             elif self.mode == Mode.TRACK:
                 if self.near_goal():
+                    self.heading_controller.load_goal(self.theta_g)
+                    print("Setting theta goal to", self.theta_g)
                     self.switch_mode(Mode.PARK)
                 elif not self.close_to_plan_start():
                     rospy.loginfo("replanning because far from start")
@@ -1014,7 +1030,7 @@ class Navigator:
                     self.replan()  # we aren't near the goal but we thought we should have been, so replan
             elif self.mode == Mode.PARK:
                 # Reached goal: forget goal coordinates and stop
-                if self.at_goal():
+                if self.aligned_goal():
                     self.x_g = None
                     self.y_g = None
                     self.theta_g = None
