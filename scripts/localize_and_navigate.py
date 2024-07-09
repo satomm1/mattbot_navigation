@@ -5,6 +5,7 @@ import rospy
 from nav_msgs.msg import OccupancyGrid, MapMetaData, Path
 from geometry_msgs.msg import Twist, Pose2D, PoseStamped
 from std_msgs.msg import String, Int32, Float64, Bool
+from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray
 # from asl_turtlebot.msg import DetectedObject
 import tf
 import numpy as np
@@ -150,7 +151,7 @@ class StochOccupancyGrid2D(object):
 class AStar(object):
     """Represents a motion planning problem to be solved using A*"""
 
-    def __init__(self, statespace_lo, statespace_hi, x_init, x_goal, occupancy, resolution=1, robots_x=None, robots_y=None, robots_d=0.5):
+    def __init__(self, statespace_lo, statespace_hi, x_init, x_goal, occupancy, resolution=1, robots_x=None, robots_y=None, obj_x=None, obj_y=None, obj_d=None, robots_d=0.5):
         self.statespace_lo = np.array(statespace_lo)  # state space lower bound (e.g., [-5, -5])
         self.statespace_hi = np.array(statespace_hi)  # state space upper bound (e.g., [5, 5])
         self.occupancy = occupancy  # occupancy grid (a DetOccupancyGrid2D object)
@@ -175,6 +176,10 @@ class AStar(object):
         self.robots_y = robots_y
         self.robots_d = robots_d  # Diameter of the robot
 
+        self.obj_x = obj_x
+        self.obj_y = obj_y
+        self.obj_d = obj_d
+
     def is_free(self, x):
         """
         Checks if a give state x is free, meaning it is inside the bounds of the map and
@@ -191,6 +196,9 @@ class AStar(object):
             if self.robots_x is not None:
                 for ii in range(len(self.robots_x)):
                     if np.linalg.norm(np.array((self.robots_x[ii], self.robots_y[ii])) - np.array(x)) < self.robots_d:
+                        return False
+                for ii in range(len(self.obj_x)):
+                    if np.linalg.norm(np.array((self.obj_x[ii], self.obj_y[ii])) - np.array(x)) < self.obj_d[ii]/2:
                         return False
             return True
         else:
@@ -577,6 +585,10 @@ class Navigator:
         self.heading_controller = HeadingController(self.kp_th, self.om_max)
         self.heading_controller2 = HeadingController(self.kp_th, self.om_max)
 
+        # Data structures to hold the detected objects
+        self.detected_objects = []
+        self.current_plan = []
+
         self.nav_planned_path_pub = rospy.Publisher(
             "/planned_path", Path, queue_size=10
         )
@@ -597,6 +609,7 @@ class Navigator:
         rospy.Subscriber("/cmd_nav", Pose2D, self.cmd_nav_callback)
         rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.rviz_goal_callback)
         rospy.Subscriber("/external_goal", Pose2D, self.external_goal_callback)
+        rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
         self.localized_sub = rospy.Subscriber("/localized", Bool, self.localized_callback)
 
         self.has_stopped = False
@@ -699,6 +712,18 @@ class Navigator:
         self.theta_g = msg.theta
         self.replan()
 
+    def detected_objects_callback(self, msg):
+        """
+        receives detected objects and updates the map
+        """
+        self.detected_objects = []
+        object_array = msg.objects
+        for obj in object_array:
+            x = obj.pose.position.x
+            y = obj.pose.position.y
+            w = obj.width
+            self.detected_objects.append((x, y, w))
+
     def localized_callback(self, msg):
         self.is_localized = msg.data
 
@@ -796,6 +821,22 @@ class Navigator:
             path_msg.poses.append(pose_st)
         publisher.publish(path_msg)
 
+    def path_intersects_obstacle(self, path):
+        for point in path:
+            for obj in self.detected_objects:
+                x_obj, y_obj, obj_diameter = obj
+                distance = np.sqrt((point[0] - x_obj)**2 + (point[1] - y_obj)**2)
+                if distance <= obj_diameter/2:
+                    obj_x = []
+                    obj_y = []
+                    obj_d = []
+                    for obj in self.detected_objects:
+                        obj_x.append(obj[0])
+                        obj_y.append(obj[1])
+                        obj_d.append(obj[2])
+                    return True, obj_x, obj_y, obj_d
+        return False, [], [], []
+
     def publish_control(self):
         """
         Runs appropriate controller depending on the mode. Assumes all controllers
@@ -851,7 +892,7 @@ class Navigator:
                 theta.append(robot.get('theta'))
         return x, y, theta
 
-    def replan(self):
+    def replan(self, obj_x=[], obj_y=[], obj_d=[]):
         """
         loads goal into pose controller
         runs planner based on current pose
@@ -885,7 +926,10 @@ class Navigator:
             self.occupancy,
             self.plan_resolution,
             robots_x=robots_x,
-            robots_y=robots_y
+            robots_y=robots_y,
+            obj_x=obj_x,
+            obj_y=obj_y,
+            obj_d=obj_d
         )
 
         rospy.loginfo("Navigator: computing navigation plan")
@@ -927,7 +971,28 @@ class Navigator:
             t_init_align = abs(th_err / self.om_max)
             t_remaining_new = t_init_align + t_new[-1]
 
-            if t_remaining_new > t_remaining_curr:
+            if self.replanning_from_object:
+                self.publish_planned_path(planned_path, self.nav_planned_path_pub)
+                self.publish_smoothed_path(traj_new, self.nav_smoothed_path_pub, times=t_new)
+
+                self.pose_controller.load_goal(self.x_g, self.y_g, self.theta_g)
+                self.traj_controller.load_traj(t_new, traj_new)
+                self.current_plan = traj_new
+
+                self.current_plan_start_time = rospy.get_rostime()
+                self.current_plan_duration = t_new[-1]
+
+                self.th_init = traj_new[0, 2]
+                self.heading_controller.load_goal(self.th_init)
+
+                if not self.aligned():
+                    rospy.loginfo("Not aligned with start direction")
+                    self.switch_mode(Mode.ALIGN)
+                    return
+
+                rospy.loginfo("Ready to track")
+                self.switch_mode(Mode.TRACK)
+            elif t_remaining_new > t_remaining_curr:
                 rospy.loginfo(
                     "New plan rejected (longer duration than current plan)"
                 )
@@ -942,6 +1007,7 @@ class Navigator:
 
         self.pose_controller.load_goal(self.x_g, self.y_g, self.theta_g)
         self.traj_controller.load_traj(t_new, traj_new)
+        self.current_plan = traj_new
 
         self.current_plan_start_time = rospy.get_rostime()
         self.current_plan_duration = t_new[-1]
@@ -1007,6 +1073,8 @@ class Navigator:
                 print(e)
                 pass
 
+            self.replanning_from_object = False
+
             # STATE MACHINE LOGIC
             # some transitions handled by callbacks
             if self.mode == Mode.IDLE:
@@ -1016,6 +1084,7 @@ class Navigator:
                     self.current_plan_start_time = rospy.get_rostime()
                     self.switch_mode(Mode.TRACK)
             elif self.mode == Mode.TRACK:
+                path_blocked, obj_x, obj_y, obj_d = self.path_intersects_obstacle(self.current_plan)
                 if self.near_goal():
                     self.heading_controller.load_goal(self.theta_g)
                     print("Setting theta goal to", self.theta_g)
@@ -1028,6 +1097,11 @@ class Navigator:
                 ).to_sec() > self.current_plan_duration:
                     rospy.loginfo("replanning because out of time")
                     self.replan()  # we aren't near the goal but we thought we should have been, so replan
+                elif(path_blocked):
+                    rospy.loginfo("replanning because path intersects obstacle")
+                    # set controls to zero
+                    self.replanning_from_object = True
+                    self.replan(obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
             elif self.mode == Mode.PARK:
                 # Reached goal: forget goal coordinates and stop
                 if self.aligned_goal():
