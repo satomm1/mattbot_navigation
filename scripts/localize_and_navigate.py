@@ -198,7 +198,7 @@ class AStar(object):
                     if np.linalg.norm(np.array((self.robots_x[ii], self.robots_y[ii])) - np.array(x)) < self.robots_d:
                         return False
                 for ii in range(len(self.obj_x)):
-                    if np.linalg.norm(np.array((self.obj_x[ii], self.obj_y[ii])) - np.array(x)) < self.obj_d[ii]/2:
+                    if np.linalg.norm(np.array((self.obj_x[ii], self.obj_y[ii])) - np.array(x)) < self.obj_d[ii]/2 + self.robots_d/2:
                         return False
             return True
         else:
@@ -716,13 +716,44 @@ class Navigator:
         """
         receives detected objects and updates the map
         """
-        self.detected_objects = []
+        # self.detected_objects = []
+
+        num_existing_objects = len(self.detected_objects)
+        indx_matching_objects = []
+
         object_array = msg.objects
         for obj in object_array:
             x = obj.pose.position.x
             y = obj.pose.position.y
             w = obj.width
-            self.detected_objects.append((x, y, w))
+
+            object_already_exists = False
+            for i in range(len(self.detected_objects)):
+                if np.linalg.norm(np.array([x - self.detected_objects[i][0], y - self.detected_objects[i][1]]) < 0.2):
+                    self.detected_objects[i] = (x, y, w, 0)
+                    object_already_exists = True
+                    indx_matching_objects.append(i)
+                    break
+            
+            if not object_already_exists:
+                self.detected_objects.append((x, y, w, 0))
+
+        # Increment the counter for objects that were not detected
+        for i in range(num_existing_objects):
+            if i not in indx_matching_objects:
+                self.detected_objects[i] = (self.detected_objects[i][0], self.detected_objects[i][1], self.detected_objects[i][2], self.detected_objects[i][3] + 1)
+        
+        # Remove objects that were not detected for a certain number of frames
+        self.detected_objects = [obj for obj in self.detected_objects if obj[3] < 60]
+
+            
+            # Add to list if doesn't already exist
+            # if not any(
+            #     np.linalg.norm(np.array([x - existing_obj[0], y - existing_obj[1]]) < 0.2)
+            #     for existing_obj in self.detected_objects
+            # ):
+            #     self.detected_objects.append((x, y, w, 0))
+
 
     def localized_callback(self, msg):
         self.is_localized = msg.data
@@ -824,9 +855,9 @@ class Navigator:
     def path_intersects_obstacle(self, path):
         for point in path:
             for obj in self.detected_objects:
-                x_obj, y_obj, obj_diameter = obj
+                x_obj, y_obj, obj_diameter, _ = obj
                 distance = np.sqrt((point[0] - x_obj)**2 + (point[1] - y_obj)**2)
-                if distance <= obj_diameter/2:
+                if distance <= obj_diameter/2 + 0.3: # 0.3 is the radius of the robot
                     obj_x = []
                     obj_y = []
                     obj_d = []
@@ -1089,9 +1120,9 @@ class Navigator:
                     self.heading_controller.load_goal(self.theta_g)
                     print("Setting theta goal to", self.theta_g)
                     self.switch_mode(Mode.PARK)
-                elif not self.close_to_plan_start():
-                    rospy.loginfo("replanning because far from start")
-                    self.replan()
+                # elif not self.close_to_plan_start():
+                #     rospy.loginfo("replanning because far from start")
+                #     self.replan()
                 elif (
                     rospy.get_rostime() - self.current_plan_start_time
                 ).to_sec() > self.current_plan_duration:
