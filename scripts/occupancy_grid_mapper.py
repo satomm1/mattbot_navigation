@@ -293,28 +293,36 @@ class Map:
 
         print("Received Message")
 
+        t1 = time.time()
         point_list = []
-        for point in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
-            point_list.append([point[0], point[1], point[2]])
+        height_list = []
+        for point in reversed(list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))):
+            height = -point[1]+self.camera_height
+            height_list.append(height)
+            dist = np.sqrt(point[0]**2 + point[2]**2)
+
+            # Points in general increase in height, so can stop adding as soon as we reach the total height
+            if height <= self.total_height and dist < 3:
+                point_list.append([point[0], point[1], point[2]])
+            else:
+                break
 
         # x/y/z in camera frame (z=depth from camera)
         points_np = np.array(point_list)
-        points_np[:, 1] += self.camera_height  # account for camera height
 
-        # Only use points within a certain height
-        indx = np.where(points_np[:, 1] <= self.total_height)
-        points_np = points_np[indx]
+        # # Only use points within a certain height
+        # indx = np.where(points_np[:, 1] <= self.total_height)
+        # points_np = points_np[indx]
 
         # Only use points within a certain distance
-        dist = np.sqrt(points_np[:, 0]**2 + points_np[:, 2]**2)
-        indx = np.where(dist < 3)
-        points_np = points_np[indx]
+        # dist = np.sqrt(points_np[:, 0]**2 + points_np[:, 2]**2)
+        # indx = np.where(dist < 3)
+        # points_np = points_np[indx]
 
         x_local = points_np[:, 0]
         y_local = points_np[:, 2]
 
-        plt.scatter(x_local, y_local)
-        plt.savefig('scatter_local.png')
+        t2 = time.time()
 
         # Get current position of the camera 
         try:
@@ -330,6 +338,8 @@ class Map:
             print("No location yet...", e)
             # Location not available yet
             return
+
+        
 
         # Now map local coordinates to global coordinates
         theta_objects = np.arctan2(x_local, y_local)
@@ -351,21 +361,29 @@ class Map:
         (camera_x, camera_y) = self.new_map_as_np.snap_to_grid((camera_x, camera_y))
         (camera_x_indx, camera_y_indx) = self.new_map_as_np.get_index((camera_x, camera_y))
 
-        # TODO: Since have multiple height levels, we need to remove points that are behind another point
+        
 
         # Get perceptual field of the camera
         perceptual_field_indx = []
         indices_to_remove = []
         for i in range(unique_points.shape[0]):
             field, ignore = self.perceptual_field(camera_x_indx, camera_y_indx, unique_points[i, 0], unique_points[i, 1], unique_points[:, 0], unique_points[:, 1])
+            
+            # Since have multiple height levels, we need to remove points that are behind another point
             if ignore:
                 indices_to_remove.append(i)
             else:
                 perceptual_field_indx.extend(field)
 
+        # Remove points that are behind another point
+        unique_points = np.delete(unique_points, indices_to_remove, axis=0)
+        theta_objects = np.delete(theta_objects, indices_to_remove)
+
         # Only unique points in perceptual field
         perceptual_field_indx = np.unique(perceptual_field_indx, axis=0)
         perceptual_field_coords = np.array(perceptual_field_indx) * self.resolution
+
+        
 
         r = np.sqrt((perceptual_field_coords[:, 0] - camera_location[0])**2 + (perceptual_field_coords[:,1] - camera_location[1])**2)
         phi = np.arctan2(perceptual_field_coords[:,1] - camera_location[1], perceptual_field_coords[:, 0] - camera_location[0]) - camera_location[2]
@@ -374,26 +392,33 @@ class Map:
         
         l = np.ones(len(k))
 
-        indx = np.where(np.logical_or(r > 5, r > y_local[k] + self.alpha/2))
+        indx = np.where(np.logical_or(r > 5, r > y_local[k] + self.alpha/2))[0]
         l[indx] = 0
-        indx = np.where(np.abs(phi - theta_objects[k]) < self.beta/2)
+        indx = np.where(np.abs(phi - theta_objects[k]) < self.beta/2)[0]
         l[indx] = 0
 
-        indx = np.where(np.logical_and(y_local[k] <= 5, np.abs(r - y_local[k]) < self.alpha/2))
-        l[indx] *= self.l_occ
+        indx = np.where(r <= y_local[k])[0]
+        l[indx] = self.l_free
 
-        indx = np.where(r <= y_local[k])
-        l[indx] *= self.l_free
+        indx = np.where(np.logical_and(y_local[k] <= 5, np.abs(r - y_local[k]) < self.alpha/2))[0]
+        l[indx] = self.l_occ
 
+        t3 = time.time()
+
+        # TODO: Make sure this update is actually correct...
         self.new_map_as_np.l[perceptual_field_indx[:, 1].astype(int), perceptual_field_indx[:, 0].astype(int)] += l
         self.new_map_as_np.recalculate_probs()
         self.new_map.data = (self.new_map_as_np.probs.flatten()*100).astype(int).tolist()
         self.new_map_publisher.publish(self.new_map)
 
+        
+        print("Intermediate Time taken: ", t2 - t1)
+        print("Total Time taken: ", t3 - t1)
+
     def run(self):
 
         # self.rgbd_subscriber = rospy.Subscriber('/camera/depth/image_raw', Image, self.rgbd_callback)
-        self.point_cloud_subscriber = rospy.Subscriber('/camera/depth_registered/points', PointCloud2, self.point_callback)
+        self.point_cloud_subscriber = rospy.Subscriber('/camera/depth_registered/points', PointCloud2, self.point_callback, queue_size=1)
         rospy.spin()
         
 
