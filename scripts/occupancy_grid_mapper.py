@@ -1,7 +1,9 @@
 import rospy
 from nav_msgs.msg import OccupancyGrid
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+from visualization_msgs.msg import Marker, MarkerArray
 import tf
+import sensor_msgs.point_cloud2 as pc2
 
 import time
 
@@ -28,6 +30,9 @@ class StochOccupancyGrid2D(object):
 
     def snap_to_grid1(self, x):
         return (self.resolution * np.round(x[0] / self.resolution), self.resolution * np.round(x[1] / self.resolution))
+
+    def get_index(self, x):
+        return (np.round((x[0]-self.origin_x)/self.resolution), np.round((x[1]-self.origin_y)/self.resolution))
 
     def recalculate_probs(self):
         self.probs = 1 - 1/(1+np.exp(self.l))
@@ -106,9 +111,10 @@ class Map:
         x = x.flatten()
         y = y.flatten()
         z = depth.flatten()
-        x = (x - self.cx) * z / self.fx
-        y = (y - self.cy) * z / self.fy
-        
+        x = (x - self.cx) * z / self.fx / 1000
+        y = (y - self.cy) * z / self.fy / 1000
+        z = z / 1000
+
         # Now map x/y/z to global coordinates using camera location
         theta_objects = np.arctan2(x, z)
         hypo = np.sqrt(x**2 + z**2)
@@ -116,13 +122,16 @@ class Map:
         y_global = camera_location[1] + np.sin(camera_location[2] - theta_objects) * hypo
         z_global = y + self.camera_height
 
+        plt.scatter(x_global, y_global)
+        plt.savefig('scatter.png')
+
         # Only use valid z measurements!
         indx = np.where(z > 0)
         x_global = x_global[indx]
         y_global = y_global[indx]
         z_global = z_global[indx]
 
-        indx = np.where(z_global <= self.total_height)
+        indx = np.where(z_global/1000 <= self.total_height)
         x_global = x_global[indx]
         y_global = y_global[indx]
         z_global = z_global[indx]
@@ -131,7 +140,39 @@ class Map:
         y_global = y_global / 1000  # meters
         z_global = z_global / 1000  # meters
 
-        self.occupancy_grid_mapper(camera_location, x_global, y_global, z_global)
+        # Get coordinates in discrete map of x,y
+        (x_global, y_global) = self.new_map_as_np.snap_to_grid1((x_global, y_global))
+
+        
+
+        # Get indices of the points in the map
+        (x_global_indx, y_global_indx) = self.new_map_as_np.get_index((x_global, y_global))
+
+        # Get unique points
+        unique_points = np.unique(np.column_stack((x_global_indx, y_global_indx)), axis=0)
+
+        # Get camera indices
+        (camera_x, camera_y) = self.new_map_as_np.snap_to_grid((camera_x, camera_y))
+        (camera_x_indx, camera_y_indx) = self.new_map_as_np.get_index((camera_x, camera_y))
+
+        
+
+        # Get perceptual field of the camera
+        perceptual_field = []
+        for i in range(unique_points.shape[0]):
+            field = self.perceptual_field(camera_x_indx, camera_y_indx, unique_points[i, 0], unique_points[i, 1])
+            perceptual_field.extend(field)
+
+        
+
+        print(len(perceptual_field))
+
+        # TODO: Only unique points in perceptual field
+        perceptual_field = np.unique(perceptual_field, axis=0)
+
+        print((perceptual_field))
+
+        # self.occupancy_grid_mapper(camera_location, x_global, y_global, z_global)
     
     def occupancy_grid_mapper(self, camera_location, x_measurement, y_measurement, z_measurement):
 
@@ -199,15 +240,168 @@ class Map:
         self.new_map.data = self.new_map_as_np.probs.flatten()
         self.new_map_publisher.publish(self.new_map)                
 
+    def perceptual_field(self, x0, y0, x1, y1, all_x, all_y):
+        """
+        Determines the perceptual field of the camera in the global frame
+        using Bresenham's line algorithm.
+
+        x0/y0: global coordinates of the camera
+        x1/y1: global coordinates of the end of the perceptual field (point cloud point)
+
+        returns: list of tuples of the perceptual field
+        """
+        dx = np.abs(x1 - x0)
+        if (x0 < x1):
+            sx = 1
+        else:
+            sx = -1
+        
+        dy = -np.abs(y1 - y0)
+        if (y0 < y1):
+            sy = 1
+        else:
+            sy = -1
+
+        perceptual_field = []
+        e = dx + dy
+        ignore_point = False
+        while True:
+            perceptual_field.append((x0, y0))
+            if (x0 == x1 and y0 == y1):
+                break
+
+            if (x0, y0) in zip(all_x, all_y):
+                ignore_point = True
+                break
+            
+            e2 = 2 * e
+            if e2 >= dy:
+                if x0 == x1:
+                    break
+                e += dy
+                x0 += sx
+            
+            if e2 <= dx:
+                if y0 == y1:
+                    break
+                e += dx
+                y0 += sy
+        
+        return perceptual_field, ignore_point
+
+    def point_callback(self, msg):
+
+        print("Received Message")
+
+        point_list = []
+        for point in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
+            point_list.append([point[0], point[1], point[2]])
+
+        # x/y/z in camera frame (z=depth from camera)
+        points_np = np.array(point_list)
+        points_np[:, 1] += self.camera_height  # account for camera height
+
+        # Only use points within a certain height
+        indx = np.where(points_np[:, 1] <= self.total_height)
+        points_np = points_np[indx]
+
+        # Only use points within a certain distance
+        dist = np.sqrt(points_np[:, 0]**2 + points_np[:, 2]**2)
+        indx = np.where(dist < 3)
+        points_np = points_np[indx]
+
+        x_local = points_np[:, 0]
+        y_local = points_np[:, 2]
+
+        plt.scatter(x_local, y_local)
+        plt.savefig('scatter_local.png')
+
+        # Get current position of the camera 
+        try:
+            (translation, rotation) = self.trans_listener.lookupTransform("/map", "/camera_link", rospy.Time(0))
+            camera_x = translation[0]
+            camera_y = translation[1]
+            euler = tf.transformations.euler_from_quaternion(rotation)
+            camera_theta = euler[2]
+
+            camera_location = (camera_x, camera_y, camera_theta)
+
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            print("No location yet...", e)
+            # Location not available yet
+            return
+
+        # Now map local coordinates to global coordinates
+        theta_objects = np.arctan2(x_local, y_local)
+        hypo = np.sqrt(x_local**2 + y_local**2)
+        x_global = camera_location[0] + np.cos(camera_location[2] - theta_objects) * hypo
+        y_global = camera_location[1] + np.sin(camera_location[2] - theta_objects) * hypo
+
+        # Get coordinates in discrete map of x,y
+        (x_global, y_global) = self.new_map_as_np.snap_to_grid1((x_global, y_global))
+
+        # Get indices of the points in the map
+        (x_global_indx, y_global_indx) = self.new_map_as_np.get_index((x_global, y_global))
+
+        # Get unique points
+        unique_points, unique_indx = np.unique(np.column_stack((x_global_indx, y_global_indx)), axis=0, return_index=True)
+        theta_objects = theta_objects[unique_indx]
+
+        # Get camera indices
+        (camera_x, camera_y) = self.new_map_as_np.snap_to_grid((camera_x, camera_y))
+        (camera_x_indx, camera_y_indx) = self.new_map_as_np.get_index((camera_x, camera_y))
+
+        # TODO: Since have multiple height levels, we need to remove points that are behind another point
+
+        # Get perceptual field of the camera
+        perceptual_field_indx = []
+        indices_to_remove = []
+        for i in range(unique_points.shape[0]):
+            field, ignore = self.perceptual_field(camera_x_indx, camera_y_indx, unique_points[i, 0], unique_points[i, 1], unique_points[:, 0], unique_points[:, 1])
+            if ignore:
+                indices_to_remove.append(i)
+            else:
+                perceptual_field_indx.extend(field)
+
+        # Only unique points in perceptual field
+        perceptual_field_indx = np.unique(perceptual_field_indx, axis=0)
+        perceptual_field_coords = np.array(perceptual_field_indx) * self.resolution
+
+        r = np.sqrt((perceptual_field_coords[:, 0] - camera_location[0])**2 + (perceptual_field_coords[:,1] - camera_location[1])**2)
+        phi = np.arctan2(perceptual_field_coords[:,1] - camera_location[1], perceptual_field_coords[:, 0] - camera_location[0]) - camera_location[2]
+
+        k = np.argmin(np.abs(phi[:, np.newaxis] - theta_objects), axis=1)
+        
+        l = np.ones(len(k))
+
+        indx = np.where(np.logical_or(r > 5, r > y_local[k] + self.alpha/2))
+        l[indx] = 0
+        indx = np.where(np.abs(phi - theta_objects[k]) < self.beta/2)
+        l[indx] = 0
+
+        indx = np.where(np.logical_and(y_local[k] <= 5, np.abs(r - y_local[k]) < self.alpha/2))
+        l[indx] *= self.l_occ
+
+        indx = np.where(r <= y_local[k])
+        l[indx] *= self.l_free
+
+        self.new_map_as_np.l[perceptual_field_indx[:, 1].astype(int), perceptual_field_indx[:, 0].astype(int)] += l
+        self.new_map_as_np.recalculate_probs()
+        self.new_map.data = (self.new_map_as_np.probs.flatten()*100).astype(int).tolist()
+        self.new_map_publisher.publish(self.new_map)
+
     def run(self):
 
-        self.rgbd_subscriber = rospy.Subscriber('/camera/depth/image_raw', Image, self.rgbd_callback)
+        # self.rgbd_subscriber = rospy.Subscriber('/camera/depth/image_raw', Image, self.rgbd_callback)
+        self.point_cloud_subscriber = rospy.Subscriber('/camera/depth_registered/points', PointCloud2, self.point_callback)
         rospy.spin()
         
 
 if __name__ == '__main__':
     rospy.init_node('occupancy_grid_mapper', anonymous=True)
     rospy.loginfo("Occupancy Grid Mapper Started")
+
+    marker_arr_pub = rospy.Publisher('/visualization_marker_array', MarkerArray, queue_size=10)
 
     my_map = Map()
     my_map.run()
