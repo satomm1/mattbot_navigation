@@ -45,7 +45,7 @@ class Map:
         self.total_height = total_height
 
         # Tuning parameters for the inverse range sensor model
-        self.alpha = 0.1   # 0.1 meters
+        self.alpha = 0.2   # 0.1 meters
         self.beta = 0.035  # 2 radians
 
         self.trans_listener = tf.TransformListener()
@@ -293,6 +293,21 @@ class Map:
 
         print("Received Message")
 
+        # Get current position of the camera immediately so that it is as close to the point cloud as possible
+        try:
+            (translation, rotation) = self.trans_listener.lookupTransform("/map", "/camera_link", rospy.Time(0))
+            camera_x = translation[0]
+            camera_y = translation[1]
+            euler = tf.transformations.euler_from_quaternion(rotation)
+            camera_theta = euler[2]
+
+            camera_location = (camera_x, camera_y, camera_theta)
+
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            print("No location yet...", e)
+            # Location not available yet
+            return
+
         t1 = time.time()
         point_list = []
         height_list = []
@@ -324,23 +339,6 @@ class Map:
 
         t2 = time.time()
 
-        # Get current position of the camera 
-        try:
-            (translation, rotation) = self.trans_listener.lookupTransform("/map", "/camera_link", rospy.Time(0))
-            camera_x = translation[0]
-            camera_y = translation[1]
-            euler = tf.transformations.euler_from_quaternion(rotation)
-            camera_theta = euler[2]
-
-            camera_location = (camera_x, camera_y, camera_theta)
-
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
-            print("No location yet...", e)
-            # Location not available yet
-            return
-
-        
-
         # Now map local coordinates to global coordinates
         theta_objects = np.arctan2(x_local, y_local)
         hypo = np.sqrt(x_local**2 + y_local**2)
@@ -356,12 +354,11 @@ class Map:
         # Get unique points
         unique_points, unique_indx = np.unique(np.column_stack((x_global_indx, y_global_indx)), axis=0, return_index=True)
         theta_objects = theta_objects[unique_indx]
+        hypo = hypo[unique_indx]
 
         # Get camera indices
         (camera_x, camera_y) = self.new_map_as_np.snap_to_grid((camera_x, camera_y))
         (camera_x_indx, camera_y_indx) = self.new_map_as_np.get_index((camera_x, camera_y))
-
-        
 
         # Get perceptual field of the camera
         perceptual_field_indx = []
@@ -378,30 +375,86 @@ class Map:
         # Remove points that are behind another point
         unique_points = np.delete(unique_points, indices_to_remove, axis=0)
         theta_objects = np.delete(theta_objects, indices_to_remove)
+        hypo = np.delete(hypo, indices_to_remove)
+
+        # Display the unique points
+        marker_array = MarkerArray()
+        i = 0
+        for j in range(unique_points.shape[0]):
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.id = i
+            marker.scale.x = 0.1
+            marker.scale.y = 0.1
+            marker.scale.z = 0.1
+            marker.color.a = 0.5
+            marker.color.r = 0.0
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+            marker.pose.position.x = unique_points[j, 0] * self.resolution
+            marker.pose.position.y = unique_points[j, 1] * self.resolution
+            marker.pose.position.z = 0.1
+            marker_array.markers.append(marker)
+            i += 1
+        # marker_arr_pub.publish(marker_array)
+
+        r_objects = np.sqrt((unique_points[:, 0]* self.resolution - camera_location[0])**2 + (unique_points[:,1]* self.resolution - camera_location[1])**2)
+        phi_objects = np.arctan2(unique_points[:,1]* self.resolution - camera_location[1], unique_points[:, 0]* self.resolution - camera_location[0]) - camera_location[2]
 
         # Only unique points in perceptual field
         perceptual_field_indx = np.unique(perceptual_field_indx, axis=0)
         perceptual_field_coords = np.array(perceptual_field_indx) * self.resolution
 
-        
+        # Display the perceptual field
+        # marker_array = MarkerArray()
+        for j in range(perceptual_field_coords.shape[0]):
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.id = i
+            marker.scale.x = 0.05
+            marker.scale.y = 0.05
+            marker.scale.z = 0.05
+            marker.color.a = 1.0
+            marker.color.r = 1.0
+            marker.color.g = 0.0
+            marker.color.b = 0.0
+            marker.pose.position.x = perceptual_field_coords[j, 0]
+            marker.pose.position.y = perceptual_field_coords[j, 1]
+            marker.pose.position.z = 0.1
+            marker_array.markers.append(marker)
+            i += 1
+        marker_arr_pub.publish(marker_array)
 
         r = np.sqrt((perceptual_field_coords[:, 0] - camera_location[0])**2 + (perceptual_field_coords[:,1] - camera_location[1])**2)
         phi = np.arctan2(perceptual_field_coords[:,1] - camera_location[1], perceptual_field_coords[:, 0] - camera_location[0]) - camera_location[2]
+        # k = np.argmin(np.abs(phi[:, np.newaxis] - theta_objects), axis=1)
+        k = np.argmin(np.abs(phi[:, np.newaxis] - phi_objects), axis=1)
+        print(phi.shape)
+        print(phi_objects.shape)
+        print(phi_objects)
 
-        k = np.argmin(np.abs(phi[:, np.newaxis] - theta_objects), axis=1)
-        
         l = np.ones(len(k))
+        
 
-        indx = np.where(np.logical_or(r > 5, r > y_local[k] + self.alpha/2))[0]
-        l[indx] = 0
-        indx = np.where(np.abs(phi - theta_objects[k]) < self.beta/2)[0]
-        l[indx] = 0
-
-        indx = np.where(r <= y_local[k])[0]
+        indx = np.where(r <= r_objects[k])[0]
         l[indx] = self.l_free
+        print(len(indx))
 
-        indx = np.where(np.logical_and(y_local[k] <= 5, np.abs(r - y_local[k]) < self.alpha/2))[0]
+        indx = np.where(np.logical_and(r_objects[k] <= 8, np.abs(r - r_objects[k]) < self.alpha/2))[0]
         l[indx] = self.l_occ
+        print(len(indx))
+        
+        indx = np.where(np.logical_or(r > 8, r > r_objects[k] + self.alpha/2))[0]
+        l[indx] = 0
+        print(len(indx))
+        indx = np.where(np.abs(phi - phi_objects[k]) > self.beta/2)[0]
+        l[indx] = 0
+        print(len(indx))
+        
 
         t3 = time.time()
 
