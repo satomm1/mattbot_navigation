@@ -51,14 +51,14 @@ class Map:
         self.trans_listener = tf.TransformListener()
 
         # Get current map created from LIDAR SLAM
-        map_msg = rospy.wait_for_message("/map", OccupancyGrid)
+        self.map_msg = rospy.wait_for_message("/map", OccupancyGrid)
         self.new_map = OccupancyGrid()
-        self.new_map.header = map_msg.header
-        self.new_map.info = map_msg.info
-        self.new_map.data = map_msg.data
-        self.width = map_msg.info.width
-        self.height = map_msg.info.height
-        self.resolution = map_msg.info.resolution
+        self.new_map.header = self.map_msg.header
+        self.new_map.info = self.map_msg.info
+        self.new_map.data = self.map_msg.data
+        self.width = self.map_msg.info.width
+        self.height = self.map_msg.info.height
+        self.resolution = self.map_msg.info.resolution
 
         self.new_map_as_np = StochOccupancyGrid2D(self.new_map.info.resolution, 
                                                        self.new_map.info.width, 
@@ -71,6 +71,12 @@ class Map:
         # Publish the map
         self.new_map_publisher = rospy.Publisher('/new_map', OccupancyGrid, queue_size=10)
         self.new_map_publisher.publish(self.new_map)
+
+        # Prepare the combined map and the publisher
+        self.combined_map = OccupancyGrid()
+        self.combined_map.header = self.map_msg.header
+        self.combined_map.info = self.map_msg.info
+        self.combined_map_publisher = rospy.Publisher('/navigation_map', OccupancyGrid, queue_size=10)
 
         camera_info_msg = rospy.wait_for_message("/camera/color/camera_info", CameraInfo)
         camera_info = camera_info_msg.K
@@ -464,6 +470,11 @@ class Map:
         self.new_map.data = (self.new_map_as_np.probs.flatten()*100).astype(int).tolist()
         self.new_map_publisher.publish(self.new_map)
 
+        combined_map_data = np.array(self.map_msg.data)
+        new_map_binary = np.where(self.new_map_as_np.probs.flatten() > 0.5)[0]
+        combined_map_data[new_map_binary] = 100
+        self.combined_map.data = combined_map_data.astype(int).tolist()
+        self.combined_map_publisher.publish(self.combined_map) 
         
         print("Intermediate Time taken: ", t2 - t1)
         print("Total Time taken: ", t3 - t1)
