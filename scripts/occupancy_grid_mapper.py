@@ -315,10 +315,13 @@ class Map:
         # print("Total Time taken: ", t3 - t1)
 
     def run(self):
-
-        # self.rgbd_subscriber = rospy.Subscriber('/camera/depth/image_raw', Image, self.rgbd_callback)
+        while not self.is_localized:
+            rospy.sleep(1)
         self.point_cloud_subscriber = rospy.Subscriber('/camera/depth_registered/points', PointCloud2, self.point_callback, queue_size=1)
         rospy.spin()
+
+    def shutdown(self):
+        rospy.loginfo("Shutting down Occupancy Grid Mapper")
         
 
 if __name__ == '__main__':
@@ -328,4 +331,5 @@ if __name__ == '__main__':
     marker_arr_pub = rospy.Publisher('/visualization_marker_array', MarkerArray, queue_size=10)
 
     my_map = Map()
+    rospy.on_shutdown(my_map.shutdown)
     my_map.run()
