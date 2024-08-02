@@ -90,161 +90,8 @@ class Map:
         self.l_occ = np.log(0.65/0.35)
         self.l_free = np.log(0.35/0.65)
 
-    def rgbd_callback(self, depth_data):
-        rospy.loginfo("Received rgbd data")
-        
-        # Get current position of the camera 
-        try:
-            (translation, rotation) = self.trans_listener.lookupTransform("/map", "/camera_link", rospy.Time(0))
-            camera_x = translation[0]
-            camera_y = translation[1]
-            euler = tf.transformations.euler_from_quaternion(rotation)
-            camera_theta = euler[2]
-
-            camera_location = (camera_x, camera_y, camera_theta)
-
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
-            print("No location yet...", e)
-            # Location not available yet
-            return
-
-        # Get the rgbd data
-        depth = np.frombuffer(depth_data.data, dtype=np.uint16).reshape(depth_data.height, depth_data.width)
-        # Get x/y/z coordinates from depth data
-        x = np.arange(0, depth_data.width)
-        y = np.arange(0, depth_data.height)
-        x, y = np.meshgrid(x, y)
-        x = x.flatten()
-        y = y.flatten()
-        z = depth.flatten()
-        x = (x - self.cx) * z / self.fx / 1000
-        y = (y - self.cy) * z / self.fy / 1000
-        z = z / 1000
-
-        # Now map x/y/z to global coordinates using camera location
-        theta_objects = np.arctan2(x, z)
-        hypo = np.sqrt(x**2 + z**2)
-        x_global = camera_location[0] + np.cos(camera_location[2] - theta_objects) * hypo
-        y_global = camera_location[1] + np.sin(camera_location[2] - theta_objects) * hypo
-        z_global = y + self.camera_height
-
-        plt.scatter(x_global, y_global)
-        plt.savefig('scatter.png')
-
-        # Only use valid z measurements!
-        indx = np.where(z > 0)
-        x_global = x_global[indx]
-        y_global = y_global[indx]
-        z_global = z_global[indx]
-
-        indx = np.where(z_global/1000 <= self.total_height)
-        x_global = x_global[indx]
-        y_global = y_global[indx]
-        z_global = z_global[indx]
-
-        x_global = x_global / 1000  # meters
-        y_global = y_global / 1000  # meters
-        z_global = z_global / 1000  # meters
-
-        # Get coordinates in discrete map of x,y
-        (x_global, y_global) = self.new_map_as_np.snap_to_grid1((x_global, y_global))
-
-        
-
-        # Get indices of the points in the map
-        (x_global_indx, y_global_indx) = self.new_map_as_np.get_index((x_global, y_global))
-
-        # Get unique points
-        unique_points = np.unique(np.column_stack((x_global_indx, y_global_indx)), axis=0)
-
-        # Get camera indices
-        (camera_x, camera_y) = self.new_map_as_np.snap_to_grid((camera_x, camera_y))
-        (camera_x_indx, camera_y_indx) = self.new_map_as_np.get_index((camera_x, camera_y))
-
-        
-
-        # Get perceptual field of the camera
-        perceptual_field = []
-        for i in range(unique_points.shape[0]):
-            field = self.perceptual_field(camera_x_indx, camera_y_indx, unique_points[i, 0], unique_points[i, 1])
-            perceptual_field.extend(field)
-
-        
-
-        print(len(perceptual_field))
-
-        # TODO: Only unique points in perceptual field
-        perceptual_field = np.unique(perceptual_field, axis=0)
-
-        print((perceptual_field))
-
-        # self.occupancy_grid_mapper(camera_location, x_global, y_global, z_global)
-    
-    def occupancy_grid_mapper(self, camera_location, x_measurement, y_measurement, z_measurement):
-
-        # Calculate angle between camera and measurement points (in global frame)
-        thetas = np.arctan2(y_measurement - camera_location[1], x_measurement - camera_location[0])
-        thetas = np.arctan2(np.sin(thetas), np.cos(thetas))
-
-        # calculate distance between camera and measurement points
-        distances = np.sqrt((x_measurement - camera_location[0])**2 + (y_measurement - camera_location[1])**2)
-
-        # Meshgrid for the map
-        i = np.arange(0, self.width) * self.resolution
-        j = np.arange(0, self.height) * self.resolution
-        i, j = np.meshgrid(i, j)
-
-        x, y = self.new_map_as_np.snap_to_grid1((i, j))
-
-        # Implementation of inverse_range_sensor_model from Probabilistic Robotics, Table 9.2
-        r = np.sqrt((x - camera_location[0])**2 + (y - camera_location[1])**2)
-        phi = np.arctan2(y - camera_location[1], x - camera_location[0]) - camera_location[2]
-        phi = np.arctan2(np.sin(phi), np.cos(phi))
-
-
-        print(np.min(phi), np.max(phi))
-
-        if np.max(thetas) > np.pi - 0.1 and np.min(thetas) < -np.pi + 0.1:
-            pass
-            # TODO
-        else:
-            max_theta = np.max(thetas)
-            min_theta = np.min(thetas)
-
-            indx = np.where(np.logical_and(phi >= min_theta, phi <= max_theta, r < 5))
-            phi = phi[indx]
-            r = r[indx]
-
-            k = np.argmin(np.abs(phi[:, np.newaxis] - thetas), axis=1)
-            print(len(k))
-            print(len(phi))
-
-        # print(np.min(phi), np.max(phi))
-
-        # k = np.argmin(np.abs(thetas - phi[i]))
-
-        # for i in range(self.width):
-        #     for j in range(self.height):
-        #         x, y = self.new_map_as_np.snap_to_grid1((i, j))
-
-        #         # Implementation of inverse_range_sensor_model from Probabilistic Robotics, Table 9.2
-        #         r = np.sqrt((x - camera_location[0])**2 + (y - camera_location[1])**2)
-        #         phi = np.arctan2(y - camera_location[1], x - camera_location[0]) - camera_location[2]
-
-        #         k = np.argmin(np.abs(thetas - phi))
-
-        #         if r > np.min([distances[k] + self.alpha/2, 5]):
-        #             continue
-        #         elif np.abs(phi - thetas[k]) > self.beta/2:
-        #             continue
-        #         elif distances[k] < 5 and np.abs(r - distances[k]) < self.alpha/2:
-        #             self.new_map_as_np.l[j, i] += self.l_occ
-        #         elif r <= distances[k]:
-        #             self.new_map_as_np.probs[j, i] += self.l_free
-
-        self.new_map_as_np.recalculate_probs()
-        self.new_map.data = self.new_map_as_np.probs.flatten()
-        self.new_map_publisher.publish(self.new_map)                
+    def localized_callback(self, msg):
+        self.is_localized = msg.data   
 
     def perceptual_field(self, x0, y0, x1, y1, all_x, all_y):
         """
@@ -297,8 +144,6 @@ class Map:
 
     def point_callback(self, msg):
 
-        print("Received Message")
-
         # Get current position of the camera immediately so that it is as close to the point cloud as possible
         try:
             (translation, rotation) = self.trans_listener.lookupTransform("/map", "/camera_link", rospy.Time(0))
@@ -331,17 +176,13 @@ class Map:
         # x/y/z in camera frame (z=depth from camera)
         points_np = np.array(point_list)
 
-        # # Only use points within a certain height
-        # indx = np.where(points_np[:, 1] <= self.total_height)
-        # points_np = points_np[indx]
-
-        # Only use points within a certain distance
-        # dist = np.sqrt(points_np[:, 0]**2 + points_np[:, 2]**2)
-        # indx = np.where(dist < 3)
-        # points_np = points_np[indx]
-
+        # If no points at all, return immediately
+        if points_np.shape[0] == 0:
+            return
+        
         x_local = points_np[:, 0]
         y_local = points_np[:, 2]
+
 
         t2 = time.time()
 
@@ -404,7 +245,6 @@ class Map:
             marker.pose.position.z = 0.1
             marker_array.markers.append(marker)
             i += 1
-        # marker_arr_pub.publish(marker_array)
 
         r_objects = np.sqrt((unique_points[:, 0]* self.resolution - camera_location[0])**2 + (unique_points[:,1]* self.resolution - camera_location[1])**2)
         phi_objects = np.arctan2(unique_points[:,1]* self.resolution - camera_location[1], unique_points[:, 0]* self.resolution - camera_location[0]) - camera_location[2]
@@ -437,34 +277,29 @@ class Map:
 
         r = np.sqrt((perceptual_field_coords[:, 0] - camera_location[0])**2 + (perceptual_field_coords[:,1] - camera_location[1])**2)
         phi = np.arctan2(perceptual_field_coords[:,1] - camera_location[1], perceptual_field_coords[:, 0] - camera_location[0]) - camera_location[2]
-        # k = np.argmin(np.abs(phi[:, np.newaxis] - theta_objects), axis=1)
+        
+        # Get the index of the object that is closest to the perceptual field
         k = np.argmin(np.abs(phi[:, np.newaxis] - phi_objects), axis=1)
-        print(phi.shape)
-        print(phi_objects.shape)
-        print(phi_objects)
 
         l = np.ones(len(k))
         
-
+        # Free space
         indx = np.where(r <= r_objects[k])[0]
         l[indx] = self.l_free
-        print(len(indx))
 
+        # Occupied space
         indx = np.where(np.logical_and(r_objects[k] <= 8, np.abs(r - r_objects[k]) < self.alpha/2))[0]
         l[indx] = self.l_occ
-        print(len(indx))
         
+        # Unknown space
         indx = np.where(np.logical_or(r > 8, r > r_objects[k] + self.alpha/2))[0]
         l[indx] = 0
-        print(len(indx))
         indx = np.where(np.abs(phi - phi_objects[k]) > self.beta/2)[0]
         l[indx] = 0
-        print(len(indx))
         
 
         t3 = time.time()
 
-        # TODO: Make sure this update is actually correct...
         self.new_map_as_np.l[perceptual_field_indx[:, 1].astype(int), perceptual_field_indx[:, 0].astype(int)] += l
         self.new_map_as_np.recalculate_probs()
         self.new_map.data = (self.new_map_as_np.probs.flatten()*100).astype(int).tolist()
@@ -476,8 +311,8 @@ class Map:
         self.combined_map.data = combined_map_data.astype(int).tolist()
         self.combined_map_publisher.publish(self.combined_map) 
         
-        print("Intermediate Time taken: ", t2 - t1)
-        print("Total Time taken: ", t3 - t1)
+        # print("Intermediate Time taken: ", t2 - t1)
+        # print("Total Time taken: ", t3 - t1)
 
     def run(self):
 
