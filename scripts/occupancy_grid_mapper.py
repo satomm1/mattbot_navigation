@@ -1,4 +1,5 @@
 import rospy
+from std_msgs.msg import Bool
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from visualization_msgs.msg import Marker, MarkerArray
@@ -49,6 +50,9 @@ class Map:
         self.beta = 0.035  # 2 radians
 
         self.trans_listener = tf.TransformListener()
+
+        self.is_localized = False
+        self.localized_sub = rospy.Subscriber("/localized", Bool, self.localized_callback)
 
         # Get current map created from LIDAR SLAM
         self.map_msg = rospy.wait_for_message("/map", OccupancyGrid)
