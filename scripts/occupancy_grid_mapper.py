@@ -1,6 +1,7 @@
 import rospy
 from std_msgs.msg import Bool
 from nav_msgs.msg import OccupancyGrid
+from geometry_msgs.msg import Twist
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from visualization_msgs.msg import Marker, MarkerArray
 import tf
@@ -91,8 +92,10 @@ class Map:
         self.cy = camera_info[1, 2]
 
         # Log-Probabilities to add or remove from the map 
-        self.l_occ = np.log(0.65/0.35)
+        self.l_occ = 0.3
         self.l_free = np.log(0.35/0.65)
+
+        self.is_turning = False
 
     def localized_callback(self, msg):
         self.is_localized = msg.data   
@@ -147,6 +150,10 @@ class Map:
         return perceptual_field, ignore_point
 
     def point_callback(self, msg):
+
+        # If the robot is turning, don't do anything since the camera is not stable
+        if self.is_turning:
+            return
 
         # Get current position of the camera immediately so that it is as close to the point cloud as possible
         try:
@@ -228,27 +235,27 @@ class Map:
         theta_objects = np.delete(theta_objects, indices_to_remove)
         hypo = np.delete(hypo, indices_to_remove)
 
-        # Display the unique points
-        marker_array = MarkerArray()
-        i = 0
-        for j in range(unique_points.shape[0]):
-            marker = Marker()
-            marker.header.frame_id = "map"
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-            marker.id = i
-            marker.scale.x = 0.1
-            marker.scale.y = 0.1
-            marker.scale.z = 0.1
-            marker.color.a = 0.5
-            marker.color.r = 0.0
-            marker.color.g = 1.0
-            marker.color.b = 0.0
-            marker.pose.position.x = unique_points[j, 0] * self.resolution
-            marker.pose.position.y = unique_points[j, 1] * self.resolution
-            marker.pose.position.z = 0.1
-            marker_array.markers.append(marker)
-            i += 1
+        # # Display the unique points
+        # marker_array = MarkerArray()
+        # i = 0
+        # for j in range(unique_points.shape[0]):
+        #     marker = Marker()
+        #     marker.header.frame_id = "map"
+        #     marker.type = Marker.SPHERE
+        #     marker.action = Marker.ADD
+        #     marker.id = i
+        #     marker.scale.x = 0.1
+        #     marker.scale.y = 0.1
+        #     marker.scale.z = 0.1
+        #     marker.color.a = 0.5
+        #     marker.color.r = 0.0
+        #     marker.color.g = 1.0
+        #     marker.color.b = 0.0
+        #     marker.pose.position.x = unique_points[j, 0] * self.resolution
+        #     marker.pose.position.y = unique_points[j, 1] * self.resolution
+        #     marker.pose.position.z = 0.1
+        #     marker_array.markers.append(marker)
+        #     i += 1
 
         r_objects = np.sqrt((unique_points[:, 0]* self.resolution - camera_location[0])**2 + (unique_points[:,1]* self.resolution - camera_location[1])**2)
         phi_objects = np.arctan2(unique_points[:,1]* self.resolution - camera_location[1], unique_points[:, 0]* self.resolution - camera_location[0]) - camera_location[2]
@@ -259,25 +266,25 @@ class Map:
 
         # Display the perceptual field
         # marker_array = MarkerArray()
-        for j in range(perceptual_field_coords.shape[0]):
-            marker = Marker()
-            marker.header.frame_id = "map"
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-            marker.id = i
-            marker.scale.x = 0.05
-            marker.scale.y = 0.05
-            marker.scale.z = 0.05
-            marker.color.a = 1.0
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 0.0
-            marker.pose.position.x = perceptual_field_coords[j, 0]
-            marker.pose.position.y = perceptual_field_coords[j, 1]
-            marker.pose.position.z = 0.1
-            marker_array.markers.append(marker)
-            i += 1
-        marker_arr_pub.publish(marker_array)
+        # for j in range(perceptual_field_coords.shape[0]):
+        #     marker = Marker()
+        #     marker.header.frame_id = "map"
+        #     marker.type = Marker.SPHERE
+        #     marker.action = Marker.ADD
+        #     marker.id = i
+        #     marker.scale.x = 0.05
+        #     marker.scale.y = 0.05
+        #     marker.scale.z = 0.05
+        #     marker.color.a = 1.0
+        #     marker.color.r = 1.0
+        #     marker.color.g = 0.0
+        #     marker.color.b = 0.0
+        #     marker.pose.position.x = perceptual_field_coords[j, 0]
+        #     marker.pose.position.y = perceptual_field_coords[j, 1]
+        #     marker.pose.position.z = 0.1
+        #     marker_array.markers.append(marker)
+        #     i += 1
+        # marker_arr_pub.publish(marker_array)
 
         r = np.sqrt((perceptual_field_coords[:, 0] - camera_location[0])**2 + (perceptual_field_coords[:,1] - camera_location[1])**2)
         phi = np.arctan2(perceptual_field_coords[:,1] - camera_location[1], perceptual_field_coords[:, 0] - camera_location[0]) - camera_location[2]
@@ -301,7 +308,6 @@ class Map:
         indx = np.where(np.abs(phi - phi_objects[k]) > self.beta/2)[0]
         l[indx] = 0
         
-
         t3 = time.time()
 
         self.new_map_as_np.l[perceptual_field_indx[:, 1].astype(int), perceptual_field_indx[:, 0].astype(int)] += l
@@ -310,17 +316,25 @@ class Map:
         self.new_map_publisher.publish(self.new_map)
 
         combined_map_data = np.array(self.map_msg.data)
-        new_map_binary = np.where(self.new_map_as_np.probs.flatten() > 0.5)[0]
+        new_map_binary = np.where(self.new_map_as_np.probs.flatten() > 0.85)[0]
         combined_map_data[new_map_binary] = 100
         self.combined_map.data = combined_map_data.astype(int).tolist()
         self.combined_map_publisher.publish(self.combined_map) 
+
         
         # print("Intermediate Time taken: ", t2 - t1)
         # print("Total Time taken: ", t3 - t1)
 
+    def cmd_vel_callback(self, msg):
+        if np.abs(msg.angular.z) > 0.125:
+            self.is_turning = True
+        else:
+            self.is_turning = False
+
     def run(self):
         while not self.is_localized:
             rospy.sleep(1)
+        self.cmd_vel_subscriber = rospy.Subscriber('/cmd_vel', Twist, self.cmd_vel_callback, queue_size=1)
         self.point_cloud_subscriber = rospy.Subscriber('/camera/depth_registered/points', PointCloud2, self.point_callback, queue_size=1)
         rospy.spin()
 
