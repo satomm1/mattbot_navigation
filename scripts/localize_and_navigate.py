@@ -303,9 +303,10 @@ class AStar(object):
         time_limit = 2
         start = time.time()
         
+        print(self.x_init)
         while len(self.open_set) > 0:
-            # if time.time() - start > time_limit:
-                # return False
+            if time.time() - start > time_limit:
+                return False
         
             x_current = self.find_best_est_cost_through()
             if x_current == self.x_goal:
@@ -588,6 +589,7 @@ class Navigator:
         # Data structures to hold the detected objects
         self.detected_objects = []
         self.current_plan = []
+        self.unsmoothed_plan = []
 
         self.nav_planned_path_pub = rospy.Publisher(
             "/planned_path", Path, queue_size=10
@@ -869,6 +871,14 @@ class Navigator:
                     return True, obj_x, obj_y, obj_d
         return False, [], [], []
 
+    def path_still_valid(self, path):
+        for point in path:
+            if not self.occupancy.is_free(point):
+                print("Path no longer valid...")
+                print(point)
+                return False
+        return True
+
     def publish_control(self):
         """
         Runs appropriate controller depending on the mode. Assumes all controllers
@@ -1010,6 +1020,7 @@ class Navigator:
                 self.pose_controller.load_goal(self.x_g, self.y_g, self.theta_g)
                 self.traj_controller.load_traj(t_new, traj_new)
                 self.current_plan = traj_new
+                self.unsmoothed_plan = planned_path
 
                 self.current_plan_start_time = rospy.get_rostime()
                 self.current_plan_duration = t_new[-1]
@@ -1040,6 +1051,7 @@ class Navigator:
         self.pose_controller.load_goal(self.x_g, self.y_g, self.theta_g)
         self.traj_controller.load_traj(t_new, traj_new)
         self.current_plan = traj_new
+        self.unsmoothed_plan = planned_path
 
         self.current_plan_start_time = rospy.get_rostime()
         self.current_plan_duration = t_new[-1]
@@ -1134,6 +1146,20 @@ class Navigator:
                     # set controls to zero
                     self.replanning_from_object = True
                     self.replan(obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
+                elif(not self.path_still_valid(self.unsmoothed_plan)):
+                    rospy.loginfo("replanning because path is no longer valid")
+                    # self.replanning_from_object = True
+                    # self.replan()
+
+                    self.switch_mode(Mode.IDLE)
+                    # Stop the robot
+                    cmd_vel = Twist()
+                    cmd_vel.linear.x = 0.0
+                    cmd_vel.angular.z = 0.0
+                    self.nav_vel_pub.publish(cmd_vel)
+
+                    # Now replan
+                    self.replan()
             elif self.mode == Mode.PARK:
                 # Reached goal: forget goal coordinates and stop
                 if self.aligned_goal():
@@ -1143,8 +1169,8 @@ class Navigator:
                     self.switch_mode(Mode.IDLE)
 
             self.publish_control()
-            #rate.sleep()
-            time.sleep(0.01)
+            rate.sleep()
+            # time.sleep(0.01)
 
 
 if __name__ == "__main__":
