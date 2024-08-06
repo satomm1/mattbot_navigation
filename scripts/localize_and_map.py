@@ -130,9 +130,9 @@ class StochOccupancyGrid2D(object):
         config_x_upper = min(self.width, grid_x + half_config_size)
         config_y_upper = min(self.height, grid_y + half_config_size)
         if np.sum(self.probs[config_y_lower:config_y_upper, config_x_lower:config_x_upper]>85):
-            # values, counts = np.unique(self.probs[config_y_lower:config_y_upper, config_x_lower:config_x_upper], return_counts=True)
-            # print(values)
-            # print(counts)
+            #values, counts = np.unique(self.probs[config_y_lower:config_y_upper, config_x_lower:config_x_upper], return_counts=True)
+            #print(values)
+            #print(counts)
             #print(self.resolution)
             return False  # Not free according to configuration space
 
@@ -602,10 +602,9 @@ class Navigator:
 
         self.trans_listener = tf.TransformListener()
 
-        # Get map parameter to determine what map to use
-        map_name = rospy.get_param('map_name', '/map')
+        # self.cfg_srv = Server(NavigatorConfig, self.dyn_cfg_callback)
 
-        rospy.Subscriber(map_name, OccupancyGrid, self.map_callback)
+        rospy.Subscriber("/map", OccupancyGrid, self.map_callback)
         rospy.Subscriber("/map_metadata", MapMetaData, self.map_md_callback)
         rospy.Subscriber("/cmd_nav", Pose2D, self.cmd_nav_callback)
         rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.rviz_goal_callback)
@@ -1152,4 +1151,4 @@ if __name__ == "__main__":
     rospy.on_shutdown(nav.shutdown_callback)
     time.sleep(5)  # Give time for everything to set up
     nav.localize()  # rotate to localize
-    nav.run()  # run the main loop
+    # nav.run()  # run the main loop

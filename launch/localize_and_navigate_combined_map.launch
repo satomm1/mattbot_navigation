@@ -1,7 +1,12 @@
 <!-- navigator_launch_file.launch -->
 <launch>
 
-  <param name="map_name" value="/map" />
+  <param name="map_name" value="/navigation_map" />
+
+  <!-- Launch the occupancy grid mapper -->
+  <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
+
+  </node>
 
   <!-- Launch the navigator.py script -->
   <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate.py" output="screen">
