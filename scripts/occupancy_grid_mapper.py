@@ -41,10 +41,11 @@ class StochOccupancyGrid2D(object):
 
 class Map:
 
-    def __init__(self, camera_height=0.216, total_height=0.3175):
+    def __init__(self, camera_height=0.216, total_height=0.5, robot_d=0.6):
 
         self.camera_height = camera_height
         self.total_height = total_height
+        self.robot_d = robot_d
 
         # Tuning parameters for the inverse range sensor model
         self.alpha = 0.2   # 0.1 meters
@@ -164,6 +165,8 @@ class Map:
             camera_theta = euler[2]
 
             camera_location = (camera_x, camera_y, camera_theta)
+            camera_offset = 0.127
+            robot_location = (camera_x - camera_offset*np.cos(camera_theta), camera_y - camera_offset*np.sin(camera_theta), camera_theta)
 
         except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
             print("No location yet...", e)
@@ -229,6 +232,25 @@ class Map:
                 indices_to_remove.append(i)
             else:
                 perceptual_field_indx.extend(field)
+
+        # Get footprint of the robot
+        theta_array = np.arange(0, 2*np.pi, 0.1)
+        robot_outline_x = []
+        robot_outline_y = []
+        for i in np.arange(0, self.robot_d/2.5, self.resolution):  # use 2.5 to be conservative
+            robot_outline_x.append(i*np.cos(theta_array) + robot_location[0])
+            robot_outline_y.append(i*np.sin(theta_array) + robot_location[1])
+        robot_outline_x = np.array(robot_outline_x).flatten()
+        robot_outline_y = np.array(robot_outline_y).flatten()
+        (robot_outline_x, robot_outline_y) = self.new_map_as_np.snap_to_grid1((robot_outline_x, robot_outline_y))
+        
+        # Get indices of only the unique points as integers
+        robot_outline = np.unique(np.column_stack((robot_outline_x, robot_outline_y)), axis=0) 
+        robot_outline_x = robot_outline[:, 0]
+        robot_outline_y = robot_outline[:, 1]
+        (robot_outline_x_indx, robot_outline_y_indx) = self.new_map_as_np.get_index((robot_outline_x, robot_outline_y))
+        robot_outline_x_indx = robot_outline_x_indx.astype(int)
+        robot_outline_y_indx = robot_outline_y_indx.astype(int)        
 
         # Remove points that are behind another point
         unique_points = np.delete(unique_points, indices_to_remove, axis=0)
@@ -311,6 +333,10 @@ class Map:
         t3 = time.time()
 
         self.new_map_as_np.l[perceptual_field_indx[:, 1].astype(int), perceptual_field_indx[:, 0].astype(int)] += l
+
+        # Now set robot locations to lfree
+        self.new_map_as_np.l[robot_outline_y_indx, robot_outline_x_indx] += 2*self.l_free
+
         self.new_map_as_np.recalculate_probs()
         self.new_map.data = (self.new_map_as_np.probs.flatten()*100).astype(int).tolist()
         self.new_map_publisher.publish(self.new_map)
