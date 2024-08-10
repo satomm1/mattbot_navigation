@@ -181,7 +181,7 @@ class Map:
             height_list.append(height)
             dist = np.sqrt(point[0]**2 + point[2]**2)
 
-            if height <= self.total_height+0.5 and dist < 5:
+            if height <= self.total_height+0.5 and dist < 4:
                 point_list.append([point[0], point[1], point[2]])
             else: # Points in general increase in height, so can stop adding as soon as we reach the total height
                 break
