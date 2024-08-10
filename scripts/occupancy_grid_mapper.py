@@ -93,7 +93,7 @@ class Map:
         self.cy = camera_info[1, 2]
 
         # Log-Probabilities to add or remove from the map 
-        self.l_occ = 0.3
+        self.l_occ = 0.4
         self.l_free = np.log(0.35/0.65)
 
         self.is_turning = False
@@ -181,10 +181,9 @@ class Map:
             height_list.append(height)
             dist = np.sqrt(point[0]**2 + point[2]**2)
 
-            # Points in general increase in height, so can stop adding as soon as we reach the total height
-            if height <= self.total_height and dist < 3:
+            if height <= self.total_height+0.5 and dist < 5:
                 point_list.append([point[0], point[1], point[2]])
-            else:
+            else: # Points in general increase in height, so can stop adding as soon as we reach the total height
                 break
 
         # x/y/z in camera frame (z=depth from camera)
@@ -323,6 +322,10 @@ class Map:
         # Occupied space
         indx = np.where(np.logical_and(r_objects[k] <= 8, np.abs(r - r_objects[k]) < self.alpha/2))[0]
         l[indx] = self.l_occ
+
+        # Ignore any really close points
+        indx = np.where(r < 0.075)[0]
+        l[indx] = self.l_free
         
         # Unknown space
         indx = np.where(np.logical_or(r > 8, r > r_objects[k] + self.alpha/2))[0]
