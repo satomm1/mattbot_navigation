@@ -300,7 +300,7 @@ class AStar(object):
                 set membership efficiently using the syntax "if item in set".
         """
         ########## Code starts here ##########
-        time_limit = 2
+        time_limit = 10
         start = time.time()
         
         print(self.x_init)
@@ -539,7 +539,7 @@ class Navigator:
                                             
         # plan parameters
         self.plan_resolution = 0.1
-        self.plan_horizon = 50
+        self.plan_horizon = 500
 
         # time when we started following the plan
         self.current_plan_start_time = rospy.get_rostime()
