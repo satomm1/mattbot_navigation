@@ -300,12 +300,13 @@ class AStar(object):
                 set membership efficiently using the syntax "if item in set".
         """
         ########## Code starts here ##########
-        time_limit = 10
+        time_limit = 120
         start = time.time()
         
         print(self.x_init)
         while len(self.open_set) > 0:
             if time.time() - start > time_limit:
+                print("A* took too long")
                 return False
         
             x_current = self.find_best_est_cost_through()
@@ -339,7 +340,7 @@ class TrajectoryTracker:
     """ Trajectory tracking controller using differential flatness """
 
     def __init__(self, kpx, kpy, kdx, kdy,
-                 V_max=0.5, om_max=1):
+                 V_max=0.6, om_max=1):
         self.kpx = kpx
         self.kpy = kpy
         self.kdx = kdx
@@ -547,11 +548,11 @@ class Navigator:
         self.plan_start = [0.0, 0.0]
 
         # Robot limits
-        self.v_max = 0.4  # maximum velocity
-        self.om_max = 2.5  # maximum angular velocity
+        self.v_max = 0.6  # maximum velocity
+        self.om_max = 3  # maximum angular velocity
         self.om_heading = 1.3  # angular velocity for heading controller
 
-        self.v_des = 0.25  # desired cruising velocity
+        self.v_des = 0.5  # desired cruising velocity
         self.theta_start_thresh = 0.05  # threshold in theta to start moving forward when path-following
         self.start_pos_thresh = (
             0.2  # threshold to be far enough into the plan to recompute it
