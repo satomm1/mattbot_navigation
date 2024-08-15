@@ -58,6 +58,7 @@ class Map:
 
         # Get current map created from LIDAR SLAM
         self.map_msg = rospy.wait_for_message("/map", OccupancyGrid)
+        self.map_mod_msg = rospy.wait_for_message("/map_mod", OccupancyGrid)
         self.new_map = OccupancyGrid()
         self.new_map.header = self.map_msg.header
         self.new_map.info = self.map_msg.info
@@ -344,9 +345,13 @@ class Map:
         self.new_map.data = (self.new_map_as_np.probs.flatten()*100).astype(int).tolist()
         self.new_map_publisher.publish(self.new_map)
 
-        combined_map_data = np.array(self.map_msg.data)
-        new_map_binary = np.where(self.new_map_as_np.probs.flatten() > 0.85)[0]
-        combined_map_data[new_map_binary] = 100
+        # combined_map_data = np.array(self.map_msg.data)
+        map_data = np.array(self.map_msg.data)
+        mod_data = np.array(self.map_mod_msg.data)
+        combined_map_data = np.maximum(map_data, mod_data)
+
+        # new_map_binary = np.where(self.new_map_as_np.probs.flatten() > 0.85)[0]
+        # combined_map_data[new_map_binary] = 100
         self.combined_map.data = combined_map_data.astype(int).tolist()
         self.combined_map_publisher.publish(self.combined_map) 
 
