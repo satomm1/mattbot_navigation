@@ -483,9 +483,15 @@ class HeadingController:
         """
         self.th_g = th_g
 
-    def compute_control(self, x, y, th, t):
+    def compute_control(self, x, y, th, t, prev_om=None):
         err = wrapToPi(self.th_g - th)
         om = self.kp*err
+
+        if prev_om is not None:
+            if np.abs(prev_om) <= 1e-3:
+                om = np.clip(om, -0.2, 0.2)
+            elif np.abs(prev_om) <= 0.5:
+                om = np.clip(om, -1.5*np.abs(prev_om), 1.5*np.abs(prev_om))
 
         # apply control limits
         V = 0
@@ -548,7 +554,7 @@ class Navigator:
         self.plan_start = [0.0, 0.0]
 
         # Robot limits
-        self.v_max = 0.6  # maximum velocity
+        self.v_max = 0.7  # maximum velocity
         self.om_max = 3  # maximum angular velocity
         self.om_heading = 1.3  # angular velocity for heading controller
 
@@ -576,7 +582,8 @@ class Navigator:
         self.kdy = 1.5
 
         # heading controller parameters
-        self.kp_th = 2.0
+        self.kp_th = 1.5
+        self.om_prev = 0.0
 
         self.traj_controller = TrajectoryTracker(
             self.kpx, self.kpy, self.kdx, self.kdy, self.v_max, self.om_max
@@ -607,13 +614,14 @@ class Navigator:
 
         # Get map parameter to determine what map to use
         map_name = rospy.get_param('map_name', '/map')
+        # map_name = "/map"
 
         rospy.Subscriber(map_name, OccupancyGrid, self.map_callback)
         rospy.Subscriber("/map_metadata", MapMetaData, self.map_md_callback)
         rospy.Subscriber("/cmd_nav", Pose2D, self.cmd_nav_callback)
         rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.rviz_goal_callback)
         rospy.Subscriber("/external_goal", Pose2D, self.external_goal_callback)
-        rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
+        # rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
         self.localized_sub = rospy.Subscriber("/localized", Bool, self.localized_callback)
 
         self.has_stopped = False
@@ -905,6 +913,8 @@ class Navigator:
         else:
             V = 0.0
             om = 0.0
+
+        self.prev_om = om
 
         cmd_vel = Twist()
         cmd_vel.linear.x = V
