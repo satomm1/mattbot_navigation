@@ -1,7 +1,7 @@
 import rospy
 from std_msgs.msg import Bool
 from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, Pose
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from visualization_msgs.msg import Marker, MarkerArray
 import tf
@@ -106,6 +106,7 @@ class Map:
         self.object_marker_array = MarkerArray()
 
         self.cone_map = np.ones((self.height, self.width))*-1
+        self.new_cone_publisher = rospy.Publisher('/new_cone_map', Pose, queue_size=10)
 
         self.object_publisher = rospy.Publisher('/object_array', MarkerArray, queue_size=10)
         rospy.Subscriber('/detected_objects', DetectedObjectArray, self.detected_objects_callback, queue_size=10)
@@ -434,6 +435,12 @@ class Map:
                             marker.pose.position.y = y
                             marker.pose.position.z = 0.1
                             self.object_marker_array.markers.append(marker)
+
+                            cone_pose = Pose()
+                            cone_pose.position.x = x
+                            cone_pose.position.y = y
+                            cone_pose.orientation.w = 1
+                            self.new_cone_publisher.publish(cone_pose)
 
                             break
                 
