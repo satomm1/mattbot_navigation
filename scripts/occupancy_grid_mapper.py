@@ -109,7 +109,7 @@ class Map:
         self.new_cone_publisher = rospy.Publisher('/new_cone_map', DetectedObject, queue_size=10)
 
         self.object_publisher = rospy.Publisher('/object_array', MarkerArray, queue_size=10)
-        rospy.Subscriber('/detected_objects', DetectedObjectArray, self.detected_objects_callback, queue_size=10)
+        
 
     def localized_callback(self, msg):
         self.is_localized = msg.data   
@@ -466,6 +466,7 @@ class Map:
             rospy.sleep(1)
         self.cmd_vel_subscriber = rospy.Subscriber('/cmd_vel', Twist, self.cmd_vel_callback, queue_size=1)
         self.point_cloud_subscriber = rospy.Subscriber('/camera/depth_registered/points', PointCloud2, self.point_callback, queue_size=1)
+        self.detected_object_subscriber = rospy.Subscriber('/detected_objects', DetectedObjectArray, self.detected_objects_callback, queue_size=10)
         rospy.spin()
 
     def shutdown(self):
