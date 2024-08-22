@@ -105,6 +105,7 @@ class Map:
         self.num_detected_objects = 0
         self.object_marker_array = MarkerArray()
 
+        self.cone_map = np.ones((self.height, self.width))*-1
 
         self.object_publisher = rospy.Publisher('/object_array', MarkerArray, queue_size=10)
         rospy.Subscriber('/detected_objects', DetectedObjectArray, self.detected_objects_callback, queue_size=10)
@@ -359,6 +360,7 @@ class Map:
         map_data = np.array(self.map_msg.data)
         mod_data = np.array(self.map_mod_msg.data)
         combined_map_data = np.maximum(map_data, mod_data)
+        combined_map_data = np.maximum(combined_map_data, self.cone_map.flatten())
 
         # new_map_binary = np.where(self.new_map_as_np.probs.flatten() > 0.85)[0]
         # combined_map_data[new_map_binary] = 100
@@ -409,6 +411,12 @@ class Map:
                             self.detected_objects.append([x, y, obj.width])
                             self.num_detected_objects += 1
                             print("Number of detected objects: ", self.num_detected_objects)
+
+                            x_min = int((x - obj.width/2)/self.resolution)
+                            x_max = int((x + obj.width/2)/self.resolution)
+                            y_min = int((y - obj.width/2)/self.resolution)
+                            y_max = int((y + obj.width/2)/self.resolution)
+                            self.cone_map[y_min:y_max, x_min:x_max] = 100
 
                             marker = Marker()
                             marker.header.frame_id = "map"
