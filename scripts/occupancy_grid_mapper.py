@@ -6,6 +6,7 @@ from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from visualization_msgs.msg import Marker, MarkerArray
 import tf
 import sensor_msgs.point_cloud2 as pc2
+from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray
 
 import time
 
@@ -98,6 +99,15 @@ class Map:
         self.l_free = np.log(0.35/0.65)
 
         self.is_turning = False
+
+        self.proposed_objects = []
+        self.detected_objects = []
+        self.num_detected_objects = 0
+        self.object_marker_array = MarkerArray()
+
+
+        self.object_publisher = rospy.Publisher('/object_array', MarkerArray, queue_size=10)
+        rospy.Subscriber('/detected_objects', DetectedObjectArray, self.detected_objects_callback, queue_size=10)
 
     def localized_callback(self, msg):
         self.is_localized = msg.data   
@@ -364,6 +374,74 @@ class Map:
             self.is_turning = True
         else:
             self.is_turning = False
+
+    def detected_objects_callback(self, msg):
+        object_array = msg.objects
+        new_proposed_objects = []
+        objs_to_pop = []
+
+        for obj in object_array:
+            already_exists = False
+            x = obj.pose.position.x
+            y = obj.pose.position.y
+
+            for detected_obj in self.detected_objects:
+                if np.sqrt((detected_obj[0] - x)**2 + (detected_obj[1] - y)**2) < obj.width/2:
+                    already_exists = True
+                    break
+
+            if not already_exists:
+
+                match_proposed = False
+                # Check if we match with any proposed object
+                for ii in range(len(self.proposed_objects)-1, -1, -1):
+                    proposed_obj = self.proposed_objects[ii]
+                    if np.sqrt((proposed_obj[0] - x)**2 + (proposed_obj[1] - y)**2) < obj.width/2:
+
+                        self.proposed_objects[ii][3] += 1
+                        self.proposed_objects[ii][5] = True
+                        if self.proposed_objects[ii][3] > 5:
+
+                            match_proposed = True
+                            self.proposed_objects.pop(ii)
+
+                            # Matches a proposed object, add to detected objects 
+                            self.detected_objects.append([x, y, obj.width])
+                            self.num_detected_objects += 1
+                            print("Number of detected objects: ", self.num_detected_objects)
+
+                            marker = Marker()
+                            marker.header.frame_id = "map"
+                            marker.type = Marker.SPHERE
+                            marker.action = Marker.ADD
+                            marker.id = self.num_detected_objects
+                            marker.scale.x = 0.1
+                            marker.scale.y = 0.1
+                            marker.scale.z = 0.1
+                            marker.color.a = 1.0
+                            marker.color.r = 0.0
+                            marker.color.g = 1.0
+                            marker.color.b = 0.0
+                            marker.pose.position.x = x
+                            marker.pose.position.y = y
+                            marker.pose.position.z = 0.1
+                            self.object_marker_array.markers.append(marker)
+
+                            break
+                
+                if not match_proposed:
+                    self.proposed_objects.append([x, y, obj.width, 0, 0, True])
+
+        for ii in range(len(self.proposed_objects)-1, -1, -1):
+            if self.proposed_objects[ii][5] == False:
+                self.proposed_objects[ii][4] += 1
+                if self.proposed_objects[ii][4] > 10:
+                    self.proposed_objects.pop(ii)
+            else:
+                self.proposed_objects[ii][5] = False
+
+        self.object_publisher.publish(self.object_marker_array)
+        
 
     def run(self):
         while not self.is_localized:
