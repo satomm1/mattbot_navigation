@@ -386,7 +386,7 @@ class Map:
             y = obj.pose.position.y
 
             for detected_obj in self.detected_objects:
-                if np.sqrt((detected_obj[0] - x)**2 + (detected_obj[1] - y)**2) < obj.width/2:
+                if np.sqrt((detected_obj[0] - x)**2 + (detected_obj[1] - y)**2) < obj.width:
                     already_exists = True
                     break
 
