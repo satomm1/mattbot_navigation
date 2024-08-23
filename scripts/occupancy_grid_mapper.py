@@ -464,6 +464,11 @@ class Map:
         x = msg.pose.position.x
         y = msg.pose.position.y
         width = msg.width
+
+        for detected_obj in self.detected_objects:
+            if np.sqrt((detected_obj[0] - x)**2 + (detected_obj[1] - y)**2) < width:
+                return
+
         self.detected_objects.append([x, y, width])
         self.num_detected_objects += 1
         print("Added object from other agent")
