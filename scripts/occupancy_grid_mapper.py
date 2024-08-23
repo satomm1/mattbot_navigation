@@ -459,7 +459,39 @@ class Map:
                 self.proposed_objects[ii][5] = False
 
         self.object_publisher.publish(self.object_marker_array)
-        
+
+    def object_from_agent_callback(self, msg):
+        x = msg.pose.position.x
+        y = msg.pose.position.y
+        width = msg.width
+        self.detected_objects.append([x, y, width])
+        self.num_detected_objects += 1
+        print("Added object from other agent")
+        print("Number of detected objects: ", self.num_detected_objects)
+
+        x_min = int((x - width/2)/self.resolution)
+        x_max = int((x + width/2)/self.resolution)
+        y_min = int((y - width/2)/self.resolution)
+        y_max = int((y + width/2)/self.resolution)
+        self.cone_map[y_min:y_max, x_min:x_max] = 100
+
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.id = self.num_detected_objects
+        marker.scale.x = 0.1
+        marker.scale.y = 0.1
+        marker.scale.z = 0.1
+        marker.color.a = 1.0
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        marker.pose.position.x = x
+        marker.pose.position.y = y
+        marker.pose.position.z = 0.1
+        self.object_marker_array.markers.append(marker)     
+        self.object_publisher.publish(self.object_marker_array)
 
     def run(self):
         while not self.is_localized:
@@ -467,6 +499,7 @@ class Map:
         self.cmd_vel_subscriber = rospy.Subscriber('/cmd_vel', Twist, self.cmd_vel_callback, queue_size=1)
         self.point_cloud_subscriber = rospy.Subscriber('/camera/depth_registered/points', PointCloud2, self.point_callback, queue_size=1)
         self.detected_object_subscriber = rospy.Subscriber('/detected_objects', DetectedObjectArray, self.detected_objects_callback, queue_size=10)
+        self.object_from_agent_subscriber = rospy.Subscriber('/object_from_agent', DetectedObject, self.object_from_agent_callback, queue_size=10)
         rospy.spin()
 
     def shutdown(self):
