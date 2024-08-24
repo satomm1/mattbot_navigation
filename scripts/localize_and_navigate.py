@@ -6,6 +6,7 @@ from nav_msgs.msg import OccupancyGrid, MapMetaData, Path
 from geometry_msgs.msg import Twist, Pose2D, PoseStamped
 from std_msgs.msg import String, Int32, Float64, Bool
 from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray
+from mattbot_dds.msg import AgentPath
 # from asl_turtlebot.msg import DetectedObject
 import tf
 import numpy as np
@@ -543,6 +544,9 @@ class Navigator:
                                                 }
                                             }
                                             """
+
+        self.other_agents_paths = dict()
+        self.other_agents_goals = dict()
                                             
         # plan parameters
         self.plan_resolution = 0.1
@@ -621,6 +625,7 @@ class Navigator:
         rospy.Subscriber("/cmd_nav", Pose2D, self.cmd_nav_callback)
         rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.rviz_goal_callback)
         rospy.Subscriber("/external_goal", Pose2D, self.external_goal_callback)
+        rospy.Subscriber("/path_from_agent", AgentPath, self.path_from_agent_callback)
         # rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
         self.localized_sub = rospy.Subscriber("/localized", Bool, self.localized_callback)
 
@@ -769,6 +774,17 @@ class Navigator:
 
     def localized_callback(self, msg):
         self.is_localized = msg.data
+
+    def path_from_agent_callback(self, msg):
+        """
+        receives path from agent and updates the map
+        """
+        agent_id = msg.agentID.data
+        path = msg.path
+        goal = [path.poses[-1].pose.position.x, path.poses[-1].pose.position.y]
+        self.other_agents_paths[agent_id] = path
+        self.other_agents_goals[agent_id] = goal
+        print("received new path from agent")
 
     def shutdown_callback(self):
         """
