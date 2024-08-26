@@ -6,7 +6,7 @@ from nav_msgs.msg import OccupancyGrid, MapMetaData, Path
 from geometry_msgs.msg import Twist, Pose2D, PoseStamped
 from std_msgs.msg import String, Int32, Float64, Bool
 from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray
-from mattbot_dds.msg import AgentPath
+from mattbot_dds.msg import AgentPath, AgentLocation
 # from asl_turtlebot.msg import DetectedObject
 import tf
 import numpy as np
@@ -547,6 +547,9 @@ class Navigator:
 
         self.other_agents_paths = dict()
         self.other_agents_goals = dict()
+        self.other_agents_at_goal = []
+        self.other_agents_static = []
+        self.other_agents_locations = dict()
                                             
         # plan parameters
         self.plan_resolution = 0.1
@@ -626,6 +629,7 @@ class Navigator:
         rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.rviz_goal_callback)
         rospy.Subscriber("/external_goal", Pose2D, self.external_goal_callback)
         rospy.Subscriber("/path_from_agent", AgentPath, self.path_from_agent_callback)
+        rospy.Subscriber("/agent_location", AgentLocation, self.agent_location_callback)
         # rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
         self.localized_sub = rospy.Subscriber("/localized", Bool, self.localized_callback)
 
@@ -784,7 +788,38 @@ class Navigator:
         goal = [path.poses[-1].pose.position.x, path.poses[-1].pose.position.y]
         self.other_agents_paths[agent_id] = path
         self.other_agents_goals[agent_id] = goal
+
+        # Agent not at goal
+        if agent_id in self.other_agents_at_goal:
+            self.other_agents_at_goal.remove(agent_id)
+
         print("received new path from agent")
+
+    def agent_location_callback(self, msg):
+        
+
+        current_time = rospy.get_rostime()
+        agent_id = msg.agentID.data
+
+        prev_pose = None
+        if agent_id in self.other_agents_locations:
+            prev_pose = self.other_agents_locations[agent_id]
+
+        agent_pose = msg.pose
+        x = agent_pose.position.x
+        y = agent_pose.position.y
+        quaternion = (agent_pose.orientation.x, agent_pose.orientation.y, agent_pose.orientation.z, agent_pose.orientation.w)
+        euler = tf.transformations.euler_from_quaternion(quaternion)
+        theta = euler[2]
+        self.other_agents_locations[agent_id] = [x, y, theta, current_time]
+
+        if prev_pose is not None:
+            if np.linalg.norm(np.array([x - prev_pose[0], y - prev_pose[1]]) < 0.1) and np.abs(theta - prev_pose[2]) < 0.1:
+                if agent_id not in self.other_agents_static:
+                    self.other_agents_static.append(agent_id)
+            else: 
+                if agent_id in self.other_agents_static:
+                    self.other_agents_static.remove(agent_id)
 
     def shutdown_callback(self):
         """
@@ -980,13 +1015,41 @@ class Navigator:
             self.switch_mode(Mode.IDLE)
             return
 
+        current_time = rospy.get_rostime()
+        # Remove old paths
+        agents_to_remove = []
+        for agent_id, path in self.other_agents_paths.items():
+            if len(path.poses) == 0:
+                continue
+            
+            goal_time = path.poses[-1].header.stamp
+            if goal_time < current_time:
+                agents_to_remove.append(agent_id)
+                continue
+        for agent_id in agents_to_remove:
+            del self.other_agents_paths[agent_id]
+
+        # # Check if other robot goals are close to ours
+        # for agent_id, goal in self.other_agents_goals.items():
+        #     if np.linalg.norm(np.array([self.x_g - goal[0], self.y_g - goal[1]]) < 0.5):
+        #         # rospy.loginfo("Other agent is close to our goal. Waiting for them to move.")
+        #         # self.switch_mode(Mode.IDLE)
+        #         continue
+        #         # TODO: 
+
         # Attempt to plan a path
         state_min = self.snap_to_grid((-self.plan_horizon, -self.plan_horizon))
         state_max = self.snap_to_grid((self.plan_horizon, self.plan_horizon))
         x_init = self.snap_to_grid((self.x, self.y))
         self.plan_start = x_init
         x_goal = self.snap_to_grid((self.x_g, self.y_g))
-        robots_x, robots_y, robots_theta = self.get_stopped_robot_locations()
+        # robots_x, robots_y, robots_theta = self.get_stopped_robot_locations()
+        robots_x = []
+        robots_y = []
+        for agent_id in self.other_agents_static:
+            agent_x, agent_y, agent_theta, _ = self.other_agents_locations[agent_id]
+            robots_x.append(agent_x)
+            robots_y.append(agent_y)
         problem = AStar(
             state_min,
             state_max,
