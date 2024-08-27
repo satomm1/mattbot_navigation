@@ -996,6 +996,29 @@ class Navigator:
                 theta.append(robot.get('theta'))
         return x, y, theta
 
+    def paths_intersect(self, planned_path, planned_times, other_path):
+        current_time = rospy.get_rostime()
+        for pose in other_path.poses:
+            other_time = pose.header.stamp
+
+            # Time already passed
+            if other_time < current_time:
+                continue
+
+            for ii in range(len(planned_path)):
+                planned_time = planned_times[ii] + current_time
+                
+                # Times are close enough
+                if np.abs(planned_time.to_sec() - other_time.to_sec()) < 0.5:
+                    point = planned_path[ii]
+                    distance = np.sqrt((point[0] - pose.pose.position.x)**2 + (point[1] - pose.pose.position.y)**2)
+
+                    # Agents are close enough
+                    if distance < 0.5:
+                        return True
+                    
+        return False
+
     def replan(self, obj_x=[], obj_y=[], obj_d=[]):
         """
         loads goal into pose controller
