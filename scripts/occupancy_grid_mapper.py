@@ -411,7 +411,7 @@ class Map:
                             # Matches a proposed object, add to detected objects 
                             self.detected_objects.append([x, y, obj.width])
                             self.num_detected_objects += 1
-                            print("Number of detected objects: ", self.num_detected_objects)
+                            print("Number of detected objects: ", self.num_detected_objects - self.num_removed_objects)
 
                             x_min = int((x - obj.width/2)/self.resolution)
                             x_max = int((x + obj.width/2)/self.resolution)
@@ -472,7 +472,7 @@ class Map:
         self.detected_objects.append([x, y, width])
         self.num_detected_objects += 1
         print("Added object from other agent")
-        print("Number of detected objects: ", self.num_detected_objects)
+        print("Number of detected objects: ", self.num_detected_objects - self.num_removed_objects)
 
         x_min = int((x - width/2)/self.resolution)
         x_max = int((x + width/2)/self.resolution)
@@ -498,13 +498,106 @@ class Map:
         self.object_marker_array.markers.append(marker)     
         self.object_publisher.publish(self.object_marker_array)
 
+    def object_from_sensor_callback(self, msg):
+        object_array = msg.objects
+        sensor_id = msg.sending_agent
+
+        sensed_object_indx = []
+
+        new_object_list = []
+
+        for obj in object_array:
+            x = obj.pose.position.x
+            y = obj.pose.position.y
+            width = obj.width
+
+            new_object_list.append([x, y, width])
+
+            obj_exists = False
+            for detected_obj in self.detected_objects:
+                if np.sqrt((detected_obj[0] - x)**2 + (detected_obj[1] - y)**2) < width:
+                    obj_exists = True
+
+            obj_num = 0
+            if sensor_id in list(self.sensor_objects.keys()):
+                for sens_obj in self.sensor_objects[sensor_id]:
+                    if np.sqrt((sens_obj[0] - x)**2 + (sens_obj[1] - y)**2) < width:
+                        sensed_object_indx.append(obj_num)
+                        break
+                    obj_num += 1
+
+            if not obj_exists:
+                self.detected_objects.append([x, y, width])
+                self.num_detected_objects += 1
+                print("Added object from sensor")
+                print("Number of detected objects: ", self.num_detected_objects - self.num_removed_objects)
+
+                x_min = int((x - width/2)/self.resolution)
+                x_max = int((x + width/2)/self.resolution)
+                y_min = int((y - width/2)/self.resolution)
+                y_max = int((y + width/2)/self.resolution)
+                self.cone_map[y_min:y_max, x_min:x_max] = 100
+
+                marker = Marker()
+                marker.header.frame_id = "map"
+                marker.type = Marker.SPHERE
+                marker.action = Marker.ADD
+                marker.id = self.num_detected_objects
+                marker.scale.x = 0.1
+                marker.scale.y = 0.1
+                marker.scale.z = 0.1
+                marker.color.a = 1.0
+                marker.color.r = 0.0
+                marker.color.g = 1.0
+                marker.color.b = 0.0
+                marker.pose.position.x = x
+                marker.pose.position.y = y
+                marker.pose.position.z = 0.1
+                self.object_marker_array.markers.append(marker)     
+        self.object_publisher.publish(self.object_marker_array)
+
+        # Remove the objects that were not sensed
+        if sensor_id in list(self.sensor_objects.keys()):
+            for i in range(len(self.sensor_objects[sensor_id])):
+                if i not in sensed_object_indx:
+                    old_x, old_y, old_width = self.sensor_objects[sensor_id][i]
+                    for j in range(len(self.detected_objects)):
+                        obj  = self.detected_objects[j]
+                        if np.sqrt((obj[0] - old_x)**2 + (obj[1] - old_y)**2) < old_width:
+                            self.detected_objects.remove(obj)
+                            x_min = int((obj[0] - obj[2]/2)/self.resolution)
+                            x_max = int((obj[0] + obj[2]/2)/self.resolution)
+                            y_min = int((obj[1] - obj[2]/2)/self.resolution)
+                            y_max = int((obj[1] + obj[2]/2)/self.resolution)
+                            self.cone_map[y_min:y_max, x_min:x_max] = 0
+                            break
+                    # Remove the marker
+                    print("Removed object from sensor")
+                    self.num_removed_objects += 1
+
+                    # Remove corresponding marker
+                    for j in range(len(self.object_marker_array.markers)):
+                        marker = self.object_marker_array.markers[j]
+                        if np.sqrt((marker.pose.position.x - old_x)**2 + (marker.pose.position.y - old_y)**2) < old_width:
+                            self.object_marker_array.markers[j].action = Marker.DELETE
+                            break
+                    self.object_publisher.publish(self.object_marker_array)
+
+        # Update the sensor objects
+        self.sensor_objects[sensor_id] = new_object_list
+
     def run(self):
         while not self.is_localized:
             rospy.sleep(1)
+
+        self.sensor_objects = dict()
+        self.num_removed_objects = 0
+
         self.cmd_vel_subscriber = rospy.Subscriber('/cmd_vel', Twist, self.cmd_vel_callback, queue_size=1)
         self.point_cloud_subscriber = rospy.Subscriber('/camera/depth_registered/points', PointCloud2, self.point_callback, queue_size=1)
         self.detected_object_subscriber = rospy.Subscriber('/detected_objects', DetectedObjectArray, self.detected_objects_callback, queue_size=10)
         self.object_from_agent_subscriber = rospy.Subscriber('/object_from_agent', DetectedObject, self.object_from_agent_callback, queue_size=10)
+        self.object_from_sensor_subscriber = rospy.Subscriber('/object_from_sensor', DetectedObjectArray, self.object_from_sensor_callback, queue_size=10)
         rospy.spin()
 
     def shutdown(self):
