@@ -5,6 +5,7 @@ import rospy
 from nav_msgs.msg import OccupancyGrid, MapMetaData, Path
 from geometry_msgs.msg import Twist, Pose2D, PoseStamped
 from std_msgs.msg import String, Int32, Float64, Bool
+from visualization_msgs.msg import Marker, MarkerArray
 from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray
 from mattbot_dds.msg import AgentPath, AgentLocation
 # from asl_turtlebot.msg import DetectedObject
@@ -32,6 +33,7 @@ class Mode(Enum):
     ALIGN = 1
     TRACK = 2
     PARK = 3
+    BACKING = 4
 
 def wrapToPi(a):
     if isinstance(a, list):
@@ -572,7 +574,7 @@ class Navigator:
         )
 
         # threshold at which navigator switches from trajectory to pose control
-        self.near_thresh = 0.01
+        self.near_thresh = 0.1
         self.at_thresh = 0.01
         self.at_thresh_theta = 0.05
         self.theta_goal_thresh = 0.05
@@ -617,6 +619,8 @@ class Navigator:
         #Publishes current state of robot (IDLE, ALIGN, etc)
         self.state_pub = rospy.Publisher("/robot_mode", Int32, queue_size=10)
 
+        self.waypoint_pub = rospy.Publisher("/waypoints", MarkerArray, queue_size=10)
+
         self.trans_listener = tf.TransformListener()
 
         # Get map parameter to determine what map to use
@@ -634,6 +638,9 @@ class Navigator:
         self.localized_sub = rospy.Subscriber("/localized", Bool, self.localized_callback)
 
         self.has_stopped = False
+
+        self.waypoints = []
+        self.backing_start_time = 0
 
     def dyn_cfg_callback(self, config, level):
         rospy.loginfo(
@@ -961,6 +968,9 @@ class Navigator:
             V, om = self.heading_controller.compute_control(
                 self.x, self.y, self.theta, t
             )
+        elif self.mode == Mode.BACKING:
+            V = -0.4
+            om = 0.0
         else:
             V = 0.0
             om = 0.0
@@ -1171,6 +1181,34 @@ class Navigator:
 
         self.th_init = traj_new[0, 2]
         self.heading_controller.load_goal(self.th_init)
+        
+        # Populate the waypoints, use every 20th point:
+        self.waypoints = []
+        marker_arr = MarkerArray()
+        th_init_new = traj_new[0, 2]
+        th_err = wrapToPi(th_init_new - self.theta)
+        t_init_align = abs(th_err / self.om_max)
+        current_time = rospy.get_rostime().to_sec()
+        for i in range(20, len(traj_new), 20):
+            self.waypoints.append([traj_new[i, 0], traj_new[i, 1], t_new[i]+2])  # +2 to add a buffer +t_init_align+current_time
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = rospy.Time.now()
+            marker.id = i
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.pose.position.x = traj_new[i, 0]
+            marker.pose.position.y = traj_new[i, 1]
+            marker.pose.position.z = 0.1
+            marker.scale.x = 0.1
+            marker.scale.y = 0.1
+            marker.scale.z = 0.1
+            marker.color.a = 1.0
+            marker.color.r = 0.0
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+            marker_arr.markers.append(marker)
+        self.waypoint_pub.publish(marker_arr)
 
         if not self.aligned():
             rospy.loginfo("Not aligned with start direction")
@@ -1242,6 +1280,7 @@ class Navigator:
                     self.switch_mode(Mode.TRACK)
             elif self.mode == Mode.TRACK:
                 path_blocked, obj_x, obj_y, obj_d = self.path_intersects_obstacle(self.current_plan)
+                current_time = rospy.get_rostime().to_sec()
                 if self.near_goal():
                     self.heading_controller.load_goal(self.theta_g)
                     print("Setting theta goal to", self.theta_g)
@@ -1249,11 +1288,7 @@ class Navigator:
                 # elif not self.close_to_plan_start():
                 #     rospy.loginfo("replanning because far from start")
                 #     self.replan()
-                elif (
-                    rospy.get_rostime() - self.current_plan_start_time
-                ).to_sec() > self.current_plan_duration:
-                    rospy.loginfo("replanning because out of time")
-                    self.replan()  # we aren't near the goal but we thought we should have been, so replan
+                
                 elif(path_blocked):
                     rospy.loginfo("replanning because path intersects obstacle")
                     # set controls to zero
@@ -1273,6 +1308,20 @@ class Navigator:
 
                     # Now replan
                     self.replan()
+                elif len(self.waypoints) > 0:
+                    if current_time - self.current_plan_start_time.to_sec() > self.waypoints[0][2]:
+                        print("******************************************")
+                        print("Backing up because haven't reached waypoint")
+                        print("******************************************")
+                        # self.replan()
+                        self.backing_start_time = current_time
+                        self.switch_mode(Mode.BACKING)
+                    elif np.linalg.norm(np.array([self.x - self.waypoints[0][0], self.y - self.waypoints[0][1]])) < 0.35:
+                        print("Waypoint reached")
+                        self.waypoints.pop(0)  # Remove the first waypoint since we are close to it
+                elif (rospy.get_rostime() - self.current_plan_start_time).to_sec() > self.current_plan_duration:
+                    rospy.loginfo("replanning because out of time")
+                    self.replan()  # we aren't near the goal but we thought we should have been, so replan
             elif self.mode == Mode.PARK:
                 # Reached goal: forget goal coordinates and stop
                 if self.aligned_goal():
@@ -1280,6 +1329,21 @@ class Navigator:
                     self.y_g = None
                     self.theta_g = None
                     self.switch_mode(Mode.IDLE)
+            elif self.mode == Mode.BACKING:
+                print("Backing Up")
+                current_time = rospy.get_rostime().to_sec()
+                if current_time - self.backing_start_time > 1:
+                    self.switch_mode(Mode.IDLE)
+                    
+                    # Stop moving
+                    cmd_vel = Twist()
+                    cmd_vel.linear.x = 0.0
+                    cmd_vel.angular.z = 0.0
+                    self.nav_vel_pub.publish(cmd_vel)
+
+                    # Now replan
+                    print("Replanning after backing up")
+                    self.replan()
 
             self.publish_control()
             rate.sleep()
