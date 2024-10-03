@@ -384,6 +384,11 @@ class Map:
         objs_to_pop = []
 
         for obj in object_array:
+
+            # Temporary while we figure out what we want to do
+            if obj.class_name != "cone":
+                continue
+
             already_exists = False
             x = obj.pose.position.x
             y = obj.pose.position.y
