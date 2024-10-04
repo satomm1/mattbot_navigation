@@ -186,21 +186,32 @@ class Map:
             # Location not available yet
             return
 
+
         t1 = time.time()
-        point_list = []
-        height_list = []
-        for point in reversed(list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))):
-            height = -point[1]+self.camera_height
-            height_list.append(height)
-            dist = np.sqrt(point[0]**2 + point[2]**2)
 
-            if height <= self.total_height+0.5 and dist < 4:
-                point_list.append([point[0], point[1], point[2]])
-            else: # Points in general increase in height, so can stop adding as soon as we reach the total height
-                break
+        # Get data from msg into an numpy array
+        data = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)))
+        dist = np.sqrt(data[:, 0]**2 + data[:, 2]**2)
+        height = -data[:, 1] + self.camera_height        
+        
+        # Get only the points that are within the height and distance range
+        indices = np.where(np.logical_and(height <= self.total_height+0.5, dist < 4))[0]
+        points_np = data[indices, :]
+        
+        # point_list = []
+        # height_list = []
+        # for point in reversed(list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))):
+        #     height = -point[1]+self.camera_height
+        #     height_list.append(height)
+        #     dist = np.sqrt(point[0]**2 + point[2]**2)
 
-        # x/y/z in camera frame (z=depth from camera)
-        points_np = np.array(point_list)
+        #     if height <= self.total_height+0.5 and dist < 4:
+        #         point_list.append([point[0], point[1], point[2]])
+        #     else: # Points in general increase in height, so can stop adding as soon as we reach the total height
+        #         break
+
+        # # x/y/z in camera frame (z=depth from camera)
+        # points_np = np.array(point_list)
 
         # If no points at all, return immediately
         if points_np.shape[0] == 0:
@@ -212,11 +223,46 @@ class Map:
 
         t2 = time.time()
 
+        # print("Time taken to get points: ", t2 - t1)
+
         # Now map local coordinates to global coordinates
         theta_objects = np.arctan2(x_local, y_local)
         hypo = np.sqrt(x_local**2 + y_local**2)
-        x_global = camera_location[0] + np.cos(camera_location[2] - theta_objects) * hypo
-        y_global = camera_location[1] + np.sin(camera_location[2] - theta_objects) * hypo
+
+        sorted_indx = np.argsort(theta_objects)
+        min_angle = theta_objects[sorted_indx[0]]
+        max_angle = theta_objects[sorted_indx[-1]]
+
+        angle_indx = 0
+        angle = min_angle
+        max_dist = hypo[sorted_indx[0]]
+
+        x_global = []
+        y_global = []
+
+        for i in range(1, len(sorted_indx)):
+            
+            angle_diff = theta_objects[sorted_indx[i]] - angle
+            if angle_diff > 0.01:
+                x_global.append(camera_location[0] + np.cos(camera_location[2] - theta_objects[sorted_indx[angle_indx]]) * max_dist)
+                y_global.append(camera_location[1] + np.sin(camera_location[2] - theta_objects[sorted_indx[angle_indx]]) * max_dist)
+
+                if i < len(sorted_indx)-1:
+                    angle = theta_objects[sorted_indx[i]]
+                    max_dist = hypo[sorted_indx[i]]
+                    angle_indx = i
+            else:
+                if hypo[sorted_indx[i]] > max_dist:
+                    max_dist = hypo[sorted_indx[i]]
+                    angle_indx = i
+
+        x_global = np.array(x_global)
+        y_global = np.array(y_global)
+        # print("Number of points: ", x_global.shape[0])
+
+        # x_global = camera_location[0] + np.cos(camera_location[2] - theta_objects) * hypo
+        # y_global = camera_location[1] + np.sin(camera_location[2] - theta_objects) * hypo
+        # print("Full Number of points: ", x_global.shape[0])
 
         # Get coordinates in discrete map of x,y
         (x_global, y_global) = self.new_map_as_np.snap_to_grid1((x_global, y_global))
@@ -226,12 +272,13 @@ class Map:
 
         # Get unique points
         unique_points, unique_indx = np.unique(np.column_stack((x_global_indx, y_global_indx)), axis=0, return_index=True)
-        theta_objects = theta_objects[unique_indx]
-        hypo = hypo[unique_indx]
 
         # Get camera indices
         (camera_x, camera_y) = self.new_map_as_np.snap_to_grid((camera_x, camera_y))
         (camera_x_indx, camera_y_indx) = self.new_map_as_np.get_index((camera_x, camera_y))
+
+        t21 = time.time()
+        # print("Preprocessing TIme: ", t21 - t2)
 
         # Get perceptual field of the camera
         perceptual_field_indx = []
@@ -244,6 +291,9 @@ class Map:
                 indices_to_remove.append(i)
             else:
                 perceptual_field_indx.extend(field)
+
+        t22 = time.time()
+        # print("Perceptual Field Time: ", t22 - t21)
 
         # Get footprint of the robot
         theta_array = np.arange(0, 2*np.pi, 0.1)
@@ -264,10 +314,11 @@ class Map:
         robot_outline_x_indx = robot_outline_x_indx.astype(int)
         robot_outline_y_indx = robot_outline_y_indx.astype(int)        
 
+        t23 = time.time()
+        # print("Robot Outline Time: ", t23 - t22)
+
         # Remove points that are behind another point
         unique_points = np.delete(unique_points, indices_to_remove, axis=0)
-        theta_objects = np.delete(theta_objects, indices_to_remove)
-        hypo = np.delete(hypo, indices_to_remove)
 
         # # Display the unique points
         # marker_array = MarkerArray()
@@ -296,6 +347,11 @@ class Map:
 
         # Only unique points in perceptual field
         perceptual_field_indx = np.unique(perceptual_field_indx, axis=0)
+        
+        # Remove indx that are outside the map
+        indx = np.where(np.logical_or(perceptual_field_indx[:, 0] >= self.width, perceptual_field_indx[:, 1] >= self.height))[0]
+        perceptual_field_indx = np.delete(perceptual_field_indx, indx, axis=0)
+
         perceptual_field_coords = np.array(perceptual_field_indx) * self.resolution
 
         # Display the perceptual field
@@ -347,8 +403,9 @@ class Map:
         l[indx] = 0
         
         t3 = time.time()
+        # print("final processing time: ", t3 - t23)
 
-        self.new_map_as_np.l[perceptual_field_indx[:, 1].astype(int), perceptual_field_indx[:, 0].astype(int)] += l
+        self.new_map_as_np.l[perceptual_field_indx[:, 1].astype(int), perceptual_field_indx[:, 0].astype(int)] += l 
 
         # Now set robot locations to lfree
         self.new_map_as_np.l[robot_outline_y_indx, robot_outline_x_indx] += 2*self.l_free
@@ -370,7 +427,9 @@ class Map:
 
         
         # print("Intermediate Time taken: ", t2 - t1)
+        # print("Processing Time taken: ", t3 - t2)
         # print("Total Time taken: ", t3 - t1)
+        # print(" ")
 
     def cmd_vel_callback(self, msg):
         if np.abs(msg.angular.z) > 0.125:
