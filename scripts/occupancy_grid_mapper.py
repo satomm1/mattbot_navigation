@@ -425,11 +425,11 @@ class Map:
         combined_map_data = np.maximum(combined_map_data, self.cone_map)
         combined_map_data = np.maximum(combined_map_data, self.person_static_map)
 
-        # We only care about the person_moving_map if withing 2 meters of us:
-        x_min = int((camera_location[0] - 1)/self.resolution)
-        x_max = int((camera_location[0] + 1)/self.resolution)
-        y_min = int((camera_location[1] - 1)/self.resolution)
-        y_max = int((camera_location[1] + 1)/self.resolution)
+        # We only care about the person_moving_map if within 2 meters of us:
+        x_min = max([int((camera_location[0] - 1)/self.resolution), 0])
+        x_max = min([int((camera_location[0] + 1)/self.resolution), self.width])
+        y_min = max([int((camera_location[1] - 1)/self.resolution), 0])
+        y_max = min([int((camera_location[1] + 1)/self.resolution), self.height])
         combined_map_data[y_min:y_max, x_min:x_max] = np.maximum(combined_map_data[y_min:y_max, x_min:x_max], self.person_moving_map[y_min:y_max, x_min:x_max])
 
         # new_map_binary = np.where(self.new_map_as_np.probs.flatten() > 0.85)[0]
