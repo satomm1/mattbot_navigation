@@ -672,10 +672,12 @@ class Map:
             is_static = person.static
             is_exited = person.exited
 
-            x_min = int((x - width/2)/self.resolution)
-            x_max = int((x + width/2)/self.resolution)
-            y_min = int((y - width/2)/self.resolution)
-            y_max = int((y + width/2)/self.resolution)
+            width = max([min([width, 0.15]), 0.45])
+
+            x_min = max([int((x - width/2)/self.resolution), 0])
+            x_max = min([int((x + width/2)/self.resolution), self.width])
+            y_min = max([int((y - width/2)/self.resolution), 0])
+            y_max = min([int((y + width/2)/self.resolution), self.height])
 
             # Get the previous location
             already_exists = False
@@ -693,17 +695,15 @@ class Map:
                 self.person_dict.pop(person_id)
             elif already_exists:
                 if is_static:
-                    if [x_min_p, x_max_p, y_min_p, y_max_p] != [x_min, x_max, y_min, y_max]:
-                        # Only do anything if the person has moved
                         
-                        # Clear Previous maps
-                        if is_static_p:
-                            self.person_static_map[y_min_p:y_max_p, x_min_p:x_max_p] = 0
-                        else:
-                            self.person_moving_map[y_min_p:y_max_p, x_min_p:x_max_p] = 0
+                    # Clear Previous maps
+                    if is_static_p:
+                        self.person_static_map[y_min_p:y_max_p, x_min_p:x_max_p] = 0
+                    else:
+                        self.person_moving_map[y_min_p:y_max_p, x_min_p:x_max_p] = 0
 
-                        # Update new maps
-                        self.person_static_map[y_min:y_max, x_min:x_max] = 100
+                    # Update new maps
+                    self.person_static_map[y_min:y_max, x_min:x_max] = 100
                 else: # Not static
 
                     # Clear Previous maps
