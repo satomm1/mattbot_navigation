@@ -42,11 +42,13 @@ class StochOccupancyGrid2D(object):
 
 class Map:
 
-    def __init__(self, camera_height=0.216, total_height=0.5, robot_d=0.6):
+    def __init__(self):
 
-        self.camera_height = camera_height
-        self.total_height = total_height
-        self.robot_d = robot_d
+        self.camera_height = rospy.get_param('camera_height', 0.216)
+        self.total_height = rospy.get_param('total_height', 0.5)
+        self.robot_d = rospy.get_param('robot_d', 0.6)
+        self.camera_inverted = rospy.get_param('camera_inverted', False)
+        self.is_test = rospy.get_param('is_test', False)
 
         # Tuning parameters for the inverse range sensor model
         self.alpha = 0.2   # 0.1 meters
@@ -59,7 +61,13 @@ class Map:
 
         # Get current map created from LIDAR SLAM
         self.map_msg = rospy.wait_for_message("/map", OccupancyGrid)
-        self.map_mod_msg = rospy.wait_for_message("/map_mod", OccupancyGrid)
+
+        if not self.is_test:
+            self.map_mod_msg = rospy.wait_for_message("/map_mod", OccupancyGrid)
+        else:
+            self.map_mod_msg = OccupancyGrid()
+            self.map_mod_msg.data = [-1]*len(self.map_msg.data)
+
         self.new_map = OccupancyGrid()
         self.new_map.header = self.map_msg.header
         self.new_map.info = self.map_msg.info
@@ -95,10 +103,12 @@ class Map:
         self.cy = camera_info[1, 2]
 
         # Log-Probabilities to add or remove from the map 
-        self.l_occ = 0.4
-        self.l_free = np.log(0.35/0.65)
+        self.l_occ = 0.6
+        self.l_free = -1  # np.log(0.35/0.85)
 
         self.is_turning = False
+
+        self.no_see_radius = self.camera_height / np.tan(0.7941248)  # Orbecc has 45.5 degrees vertical FOV, can't see this distance so don't update
 
         self.proposed_objects = []
         self.detected_objects = []
@@ -196,10 +206,11 @@ class Map:
         # Get data from msg into an numpy array
         data = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)))
         dist = np.sqrt(data[:, 0]**2 + data[:, 2]**2)
-        height = -data[:, 1] + self.camera_height        
-        
+
+        height = data[:, 1] + self.camera_height  
+
         # Get only the points that are within the height and distance range
-        indices = np.where(np.logical_and(height <= self.total_height+0.5, dist < 4))[0]
+        indices = np.where(np.logical_and(np.logical_and(height <= self.total_height+0.1, dist < 4), height >= 0.01))[0]
         points_np = data[indices, :]
         
         # point_list = []
@@ -221,9 +232,12 @@ class Map:
         if points_np.shape[0] == 0:
             return
         
-        x_local = points_np[:, 0]
-        y_local = points_np[:, 2]
+        if self.camera_inverted:
+            x_local = -points_np[:, 0]
+        else:
+            x_local = points_np[:, 0]
 
+        y_local = points_np[:, 2]
 
         t2 = time.time()
 
@@ -240,24 +254,34 @@ class Map:
         angle_indx = 0
         angle = min_angle
         max_dist = hypo[sorted_indx[0]]
+        min_dist = hypo[sorted_indx[0]]
 
         x_global = []
         y_global = []
 
+        # Get global coordinates of the points
+        # For every angle from the camera, only consider the point of minimum distance (reduce computation time)
         for i in range(1, len(sorted_indx)):
             
             angle_diff = theta_objects[sorted_indx[i]] - angle
             if angle_diff > 0.01:
-                x_global.append(camera_location[0] + np.cos(camera_location[2] - theta_objects[sorted_indx[angle_indx]]) * max_dist)
-                y_global.append(camera_location[1] + np.sin(camera_location[2] - theta_objects[sorted_indx[angle_indx]]) * max_dist)
+                # x_global.append(camera_location[0] + np.cos(camera_location[2] - theta_objects[sorted_indx[angle_indx]]) * max_dist)
+                # y_global.append(camera_location[1] + np.sin(camera_location[2] - theta_objects[sorted_indx[angle_indx]]) * max_dist)
+
+                x_global.append(camera_location[0] + np.cos(camera_location[2] - theta_objects[sorted_indx[angle_indx]]) * min_dist)
+                y_global.append(camera_location[1] + np.sin(camera_location[2] - theta_objects[sorted_indx[angle_indx]]) * min_dist)
 
                 if i < len(sorted_indx)-1:
                     angle = theta_objects[sorted_indx[i]]
                     max_dist = hypo[sorted_indx[i]]
+                    min_dist = hypo[sorted_indx[i]]
                     angle_indx = i
             else:
-                if hypo[sorted_indx[i]] > max_dist:
-                    max_dist = hypo[sorted_indx[i]]
+                # if hypo[sorted_indx[i]] > max_dist:
+                #     max_dist = hypo[sorted_indx[i]]
+                #     angle_indx = i
+                if hypo[sorted_indx[i]] < min_dist:
+                    min_dist = hypo[sorted_indx[i]]
                     angle_indx = i
 
         x_global = np.array(x_global)
@@ -397,13 +421,15 @@ class Map:
         l[indx] = self.l_occ
 
         # Ignore any really close points
-        indx = np.where(r < 0.075)[0]
-        l[indx] = self.l_free
+        # indx = np.where(r < 0.075)[0]
+        # l[indx] = self.l_free
         
         # Unknown space
         indx = np.where(np.logical_or(r > 8, r > r_objects[k] + self.alpha/2))[0]
         l[indx] = 0
         indx = np.where(np.abs(phi - phi_objects[k]) > self.beta/2)[0]
+        l[indx] = 0
+        indx = np.where(np.logical_and(r < self.no_see_radius, r_objects[k] >= self.no_see_radius))[0]
         l[indx] = 0
         
         t3 = time.time()
@@ -725,8 +751,9 @@ class Map:
                 self.person_dict[person_id] = [x_min, x_max, y_min, y_max, is_static]
 
     def run(self):
-        while not self.is_localized:
-            rospy.sleep(1)
+        if not self.is_test:
+            while not self.is_localized:
+                rospy.sleep(1)
 
         self.sensor_objects = dict()
         self.num_removed_objects = 0
