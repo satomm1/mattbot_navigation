@@ -6,7 +6,7 @@ from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from visualization_msgs.msg import Marker, MarkerArray
 import tf
 import sensor_msgs.point_cloud2 as pc2
-from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray
+from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray, Person, PersonArray
 
 import time
 
@@ -109,7 +109,11 @@ class Map:
         self.new_cone_publisher = rospy.Publisher('/new_cone_map', DetectedObject, queue_size=10)
 
         self.object_publisher = rospy.Publisher('/object_array', MarkerArray, queue_size=10)
-        
+
+        self.person_static_map = np.ones((self.height, self.width))*-1  # Map for tracking people
+        self.person_moving_map = np.ones((self.height, self.width))*-1  # Map for tracking people
+        self.person_dict = dict()  # Dictionary for tracking people
+        self.person_subscriber = rospy.Subscriber('/person', PersonArray, self.person_callback, queue_size=10) 
 
     def localized_callback(self, msg):
         self.is_localized = msg.data   
@@ -415,14 +419,22 @@ class Map:
         self.new_map_publisher.publish(self.new_map)
 
         # combined_map_data = np.array(self.map_msg.data)
-        map_data = np.array(self.map_msg.data)
-        mod_data = np.array(self.map_mod_msg.data)
+        map_data = np.array(self.map_msg.data).reshape(self.height, self.width)
+        mod_data = np.array(self.map_mod_msg.data).reshape(self.height, self.width)
         combined_map_data = np.maximum(map_data, mod_data)
-        combined_map_data = np.maximum(combined_map_data, self.cone_map.flatten())
+        combined_map_data = np.maximum(combined_map_data, self.cone_map)
+        combined_map_data = np.maximum(combined_map_data, self.person_static_map)
+
+        # We only care about the person_moving_map if within 2 meters of us:
+        x_min = max([int((camera_location[0] - 1)/self.resolution), 0])
+        x_max = min([int((camera_location[0] + 1)/self.resolution), self.width])
+        y_min = max([int((camera_location[1] - 1)/self.resolution), 0])
+        y_max = min([int((camera_location[1] + 1)/self.resolution), self.height])
+        combined_map_data[y_min:y_max, x_min:x_max] = np.maximum(combined_map_data[y_min:y_max, x_min:x_max], self.person_moving_map[y_min:y_max, x_min:x_max])
 
         # new_map_binary = np.where(self.new_map_as_np.probs.flatten() > 0.85)[0]
         # combined_map_data[new_map_binary] = 100
-        self.combined_map.data = combined_map_data.astype(int).tolist()
+        self.combined_map.data = combined_map_data.flatten().astype(int).tolist()
         self.combined_map_publisher.publish(self.combined_map) 
 
         
@@ -649,6 +661,68 @@ class Map:
 
         # Update the sensor objects
         self.sensor_objects[sensor_id] = new_object_list
+
+    def person_callback(self, msg):        
+        person_array = msg.persons
+        for person in person_array:
+            person_id = person.id
+            x = person.pose.position.x
+            y = person.pose.position.y
+            width = person.width
+            is_static = person.static
+            is_exited = person.exited
+
+            width = max([min([width, 0.15]), 0.45])
+
+            x_min = max([int((x - width/2)/self.resolution), 0])
+            x_max = min([int((x + width/2)/self.resolution), self.width])
+            y_min = max([int((y - width/2)/self.resolution), 0])
+            y_max = min([int((y + width/2)/self.resolution), self.height])
+
+            # Get the previous location
+            already_exists = False
+            if person_id in list(self.person_dict.keys()):
+                x_min_p, x_max_p, y_min_p, y_max_p, is_static_p = self.person_dict[person_id]
+                already_exists = True
+
+
+            if is_exited:
+                if is_static_p:
+                    self.person_static_map[y_min_p:y_max_p, x_min_p:x_max_p] = 0
+                else:
+                    self.person_moving_map[y_min_p:y_max_p, x_min_p:x_max_p] = 0
+
+                self.person_dict.pop(person_id)
+            elif already_exists:
+                if is_static:
+                        
+                    # Clear Previous maps
+                    if is_static_p:
+                        self.person_static_map[y_min_p:y_max_p, x_min_p:x_max_p] = 0
+                    else:
+                        self.person_moving_map[y_min_p:y_max_p, x_min_p:x_max_p] = 0
+
+                    # Update new maps
+                    self.person_static_map[y_min:y_max, x_min:x_max] = 100
+                else: # Not static
+
+                    # Clear Previous maps
+                    if is_static_p:
+                        self.person_static_map[y_min_p:y_max_p, x_min_p:x_max_p] = 0
+                    else:
+                        self.person_moving_map[y_min_p:y_max_p, x_min_p:x_max_p] = 0
+                    
+                    # Update new maps
+                    self.person_moving_map[y_min:y_max, x_min:x_max] = 100
+
+                # Update the dictionary
+                self.person_dict[person_id] = [x_min, x_max, y_min, y_max, is_static]
+            else:
+                if is_static:
+                    self.person_static_map[y_min:y_max, x_min:x_max] = 100
+                else:
+                    self.person_moving_map[y_min:y_max, x_min:x_max] = 100
+                self.person_dict[person_id] = [x_min, x_max, y_min, y_max, is_static]
 
     def run(self):
         while not self.is_localized:
