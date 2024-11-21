@@ -229,7 +229,7 @@ class Map:
         height = data[:, 1] + self.camera_height  
 
         # Get only the points that are within the height and distance range
-        indices = np.where(np.logical_and(np.logical_and(height <= self.total_height+0.1, dist < 4), height >= 0.01))[0]
+        indices = np.where(np.logical_and(np.logical_and(height <= self.total_height+0.2, dist < 4), height >= 0.1))[0]
         points_np = data[indices, :]
 
         # If no points at all, return immediately
