@@ -40,6 +40,25 @@ class StochOccupancyGrid2D(object):
     def recalculate_probs(self):
         self.probs = 1 - 1/(1+np.exp(self.l))
 
+    def decay_l(self):
+        indx = np.where(np.abs(self.l) < 2)
+        self.l[indx] = 0.85*self.l[indx]
+    
+    def set_occupied(self, x, y):
+        x = np.asarray(x)
+        y = np.asarray(y)
+        
+        # Create a mask for indices where l > 1
+        mask = self.l[y, x] >= 1
+        
+        # Update values where the mask is True
+        self.l[y[mask], x[mask]] += 3
+        # Ensure we never go more than 10
+        self.l[y[mask], x[mask]] = np.minimum(self.l[y[mask], x[mask]], 10)
+        
+        # Update values where the mask is False
+        self.l[y[~mask], x[~mask]] = 1.2
+
 class Map:
 
     def __init__(self):
@@ -406,8 +425,11 @@ class Map:
         indx = np.where(np.logical_and(r_objects[k] <= 8, np.abs(r - r_objects[k]) < self.alpha/2))[0]
         l[indx] = self.l_occ
         # Set all unique_points to occupied
-        self.new_map_as_np.l[unique_points[:, 1].astype(int), unique_points[:, 0].astype(int)] += 1.5*self.l_occ
-        # l[unique_points] = self.l_occ
+        valid_indices = (unique_points[:, 1].astype(int) >= 0) & (unique_points[:, 1].astype(int) < self.new_map_as_np.l.shape[0]) & \
+                        (unique_points[:, 0].astype(int) >= 0) & (unique_points[:, 0].astype(int) < self.new_map_as_np.l.shape[1])
+        valid_unique_points = unique_points[valid_indices]
+        # self.new_map_as_np.l[valid_unique_points[:, 1].astype(int), valid_unique_points[:, 0].astype(int)] += 2 * self.l_occ
+        self.new_map_as_np.set_occupied(valid_unique_points[:, 0].astype(int), valid_unique_points[:, 1].astype(int))
 
         # Ignore any really close points
         # indx = np.where(r < 0.075)[0]
@@ -432,6 +454,7 @@ class Map:
         self.new_map_as_np.recalculate_probs()
         self.new_map.data = (self.new_map_as_np.probs.flatten()*100).astype(int).tolist()
         self.new_map_publisher.publish(self.new_map)
+        self.new_map_as_np.decay_l()  # Decay the l values
 
         # combined_map_data = np.array(self.map_msg.data)
         map_data = np.array(self.map_msg.data).reshape(self.height, self.width)
