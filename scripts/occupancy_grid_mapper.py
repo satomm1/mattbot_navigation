@@ -300,10 +300,11 @@ class Map:
             field, ignore = self.perceptual_field(camera_x_indx, camera_y_indx, unique_points[i, 0], unique_points[i, 1], unique_points[:, 0], unique_points[:, 1])
             
             # Since have multiple height levels, we need to remove points that are behind another point
-            if ignore:
-                indices_to_remove.append(i)
-            else:
-                perceptual_field_indx.extend(field)
+            # if ignore:
+            #     indices_to_remove.append(i)
+            # else:
+            #     perceptual_field_indx.extend(field)
+            perceptual_field_indx.extend(field)
 
         t22 = time.time()
         # print("Perceptual Field Time: ", t22 - t21)
