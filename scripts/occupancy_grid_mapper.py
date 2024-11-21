@@ -212,21 +212,6 @@ class Map:
         # Get only the points that are within the height and distance range
         indices = np.where(np.logical_and(np.logical_and(height <= self.total_height+0.1, dist < 4), height >= 0.01))[0]
         points_np = data[indices, :]
-        
-        # point_list = []
-        # height_list = []
-        # for point in reversed(list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))):
-        #     height = -point[1]+self.camera_height
-        #     height_list.append(height)
-        #     dist = np.sqrt(point[0]**2 + point[2]**2)
-
-        #     if height <= self.total_height+0.5 and dist < 4:
-        #         point_list.append([point[0], point[1], point[2]])
-        #     else: # Points in general increase in height, so can stop adding as soon as we reach the total height
-        #         break
-
-        # # x/y/z in camera frame (z=depth from camera)
-        # points_np = np.array(point_list)
 
         # If no points at all, return immediately
         if points_np.shape[0] == 0:
