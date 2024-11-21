@@ -405,6 +405,9 @@ class Map:
         # Occupied space
         indx = np.where(np.logical_and(r_objects[k] <= 8, np.abs(r - r_objects[k]) < self.alpha/2))[0]
         l[indx] = self.l_occ
+        # Set all unique_points to occupied
+        self.new_map_as_np.l[unique_points[:, 1].astype(int), unique_points[:, 0].astype(int)] += 1.5*self.l_occ
+        # l[unique_points] = self.l_occ
 
         # Ignore any really close points
         # indx = np.where(r < 0.075)[0]
