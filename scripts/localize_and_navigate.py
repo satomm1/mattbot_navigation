@@ -1226,7 +1226,7 @@ class Navigator:
         while not self.is_localized:
             # rotate until we get a valid position
             cmd_vel = Twist()
-            cmd_vel.angular.z = 1
+            cmd_vel.angular.z = 1.5
             self.nav_vel_pub.publish(cmd_vel)
 
             rate.sleep()
