@@ -731,7 +731,7 @@ class Navigator:
         x_g_proposed = msg.x
         y_g_proposed = msg.y
 
-        if not self.occupancy.is_free((x_g_proposed, y_g_proposed)):
+        if self.occupancy is not None and not self.occupancy.is_free((x_g_proposed, y_g_proposed)):
             rospy.loginfo("Not a valid goal")
             return
         
