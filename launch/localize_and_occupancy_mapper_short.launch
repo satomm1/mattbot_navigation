@@ -1,0 +1,19 @@
+<!-- localize_and_occupancy_mapper_tall.launch -->
+<launch>
+
+  <param name="map_name" value="/navigation_map" />
+  <param name="camera_height" type="double" value="0.216" />
+  <param name="total_height" type="double" value="0.5" />
+  <param name="camera_inverted" type="bool" value="false" />
+  <param name="is_test" type="bool" value="true" />
+
+  <!-- Launch the occupancy grid mapper -->
+  <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
+    
+  </node>
+
+  <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_map.py" output="screen">
+
+  </node>
+
+</launch>

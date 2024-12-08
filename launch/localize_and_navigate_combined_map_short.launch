@@ -2,9 +2,9 @@
 <launch>
 
   <param name="map_name" value="/navigation_map" />
-  <param name="camera_height" value=0.216 />
-  <param name="total_height" value=0.5 />
-  <param name="camera_inverted" value="false" />
+  <param name="camera_height" type="double" value="0.216" />
+  <param name="total_height" type="double" value="0.5" />
+  <param name="camera_inverted" type="bool" value="false" />
 
   <!-- Launch the occupancy grid mapper -->
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
