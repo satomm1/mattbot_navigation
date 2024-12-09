@@ -415,6 +415,13 @@ class TrajectoryTracker:
         V = np.clip(V, -self.V_max, self.V_max)
         om = np.clip(om, -self.om_max, self.om_max)
 
+        # If near the end of the trajectory, slow down so we don't stop abruptly
+        x_goal, _, _, y_goal, _, _ = self.get_desired_state(self.traj_times[-1])
+        dist = np.sqrt((x - x_goal) ** 2 + (y - y_goal) ** 2)
+        if dist < 1:
+            new_V_max = 0.25+0.25*dist # Slow down linearly starting at 0.5V_max to 0.25V_max
+            V = np.clip(V, -new_V_max, new_V_max)
+
         # save the commands that were applied and the time
         self.t_prev = t
         self.V_prev = V
