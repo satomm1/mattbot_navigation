@@ -639,6 +639,7 @@ class Navigator:
         rospy.Subscriber("/cmd_nav", Pose2D, self.cmd_nav_callback)
         rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.rviz_goal_callback)
         rospy.Subscriber("/external_goal", Pose2D, self.external_goal_callback)
+        rospy.Subscriber("/voice_goal", Pose2D, self.external_goal_callback)
         rospy.Subscriber("/path_from_agent", AgentPath, self.path_from_agent_callback)
         rospy.Subscriber("/agent_location", AgentLocation, self.agent_location_callback)
         # rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
