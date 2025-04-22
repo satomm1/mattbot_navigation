@@ -4,6 +4,7 @@ from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import Twist, Pose
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from visualization_msgs.msg import Marker, MarkerArray
+from mattbot_dds.msg import MapUpdate
 import tf
 import sensor_msgs.point_cloud2 as pc2
 from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray, Person, PersonArray
@@ -86,6 +87,9 @@ class Map:
         else:
             self.map_mod_msg = OccupancyGrid()
             self.map_mod_msg.data = [-1]*len(self.map_msg.data)
+        
+        # Subscribe to map updates
+        self.map_update_subscriber = rospy.Subscriber('/map_update', MapUpdate, self.map_update_callback, queue_size=10)
 
         self.new_map = OccupancyGrid()
         self.new_map.header = self.map_msg.header
@@ -486,6 +490,27 @@ class Map:
             self.is_turning = True
         else:
             self.is_turning = False
+
+    def map_update_callback(self, msg):
+        # Get the values from the message
+        x = msg.x
+        y = msg.y
+        width = msg.width
+        occupancy = msg.occupancy
+
+        # Get the indices of the map
+        x_center = int(x / self.resolution)
+        y_center = int(y / self.resolution)
+        radius = int((width / 2) / self.resolution)
+
+        # Update the map with the occupancy values
+        for i in range(-radius, radius + 1):
+            for j in range(-radius, radius + 1):
+                if i**2 + j**2 <= radius**2:
+                    x_idx = x_center + i
+                    y_idx = y_center + j
+                    if 0 <= x_idx < self.width and 0 <= y_idx < self.height:
+                        self.map_mod_msg.data[y_idx * self.width + x_idx] = occupancy
 
     def detected_objects_callback(self, msg):
         object_array = msg.objects

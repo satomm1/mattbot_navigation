@@ -921,9 +921,9 @@ class Navigator:
             elif self.mode == Mode.TRACK:
                 if self.near_goal():
                     self.switch_mode(Mode.PARK)
-                elif not self.close_to_plan_start():
+                elif not self.close_to_plan_start():  
                     rospy.loginfo("replanning because far from start")
-                    self.replan()
+                    self.replan()  # we are far from the start of the plan, so replan in case map has changed
                 elif (
                     rospy.get_rostime() - self.current_plan_start_time
                 ).to_sec() > self.current_plan_duration:
