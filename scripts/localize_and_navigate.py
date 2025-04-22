@@ -17,7 +17,7 @@ from enum import Enum
 import requests
 import os
 
-from navigator_utils import TrajectoryTracker, PoseController, HeadingController, wrapToPi, StochOccupancyGrid2D, AStar, compute_smoothed_traj
+from navigation_utils import TrajectoryTracker, PoseController, HeadingController, wrapToPi, StochOccupancyGrid2D, AStar, compute_smoothed_traj
 
 V_PREV_THRES = 0.0001
 
