@@ -3,7 +3,7 @@ import scipy.interpolate
 
 from navigation_utils.trackers import TrajectoryTracker,  PoseController, HeadingController
 from navigation_utils.grids import DetOccupancyGrid2D, StochOccupancyGrid2D
-from navigation_utils.search import AStarPlanner
+from navigation_utils.search import AStar
 
 def wrapToPi(a):
     if isinstance(a, list):

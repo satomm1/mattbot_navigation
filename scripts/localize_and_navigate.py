@@ -886,6 +886,6 @@ class Navigator:
 if __name__ == "__main__":
     nav = Navigator()
     rospy.on_shutdown(nav.shutdown_callback)
-    time.sleep(5)  # Give time for everything to set up
+    time.sleep(10)  # Give time for everything to set up
     nav.localize()  # rotate to localize
     nav.run()  # run the main loop
