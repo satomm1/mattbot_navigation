@@ -261,6 +261,16 @@ class Navigator:
             print(e)
     
     def external_goal_callback(self, msg):
+
+        # Stop the bot
+        if self.mode != Mode.IDLE:
+            cmd_vel = Twist()
+            cmd_vel.linear.x = 0.0
+            cmd_vel.angular.z = 0.0
+            self.nav_vel_pub.publish(cmd_vel)
+
+            self.switch_mode(Mode.IDLE)
+
         x_g_proposed = msg.x
         y_g_proposed = msg.y
 
