@@ -520,7 +520,7 @@ class Map:
         for obj in object_array:
 
             # Temporary while we figure out what we want to do
-            if obj.class_name != "cone":
+            if obj.class_name == "unknown" or obj.class_name == "person":
                 continue
 
             already_exists = False
@@ -576,7 +576,7 @@ class Map:
                             self.object_marker_array.markers.append(marker)
 
                             cone_object = DetectedObject()
-                            cone_object.class_name = "cone"
+                            cone_object.class_name = obj.class_name  # "cone"
                             cone_object.pose.position.x = x
                             cone_object.pose.position.y = y
                             cone_object.pose.position.z = 0.0
