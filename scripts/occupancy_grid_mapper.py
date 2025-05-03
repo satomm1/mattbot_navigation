@@ -8,6 +8,7 @@ from mattbot_dds.msg import MapUpdate
 import tf
 import sensor_msgs.point_cloud2 as pc2
 from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray, Person, PersonArray
+from image_detection_with_unknowns.msg import LabeledObject, LabeledObjectArray
 
 import time
 
@@ -512,6 +513,19 @@ class Map:
                     if 0 <= x_idx < self.width and 0 <= y_idx < self.height:
                         self.map_mod_msg.data[y_idx * self.width + x_idx] = occupancy
 
+    def labeled_callback(self, msg):
+        # convert message to a DetectedObjectArray then call self.detected_objects_callback
+
+        new_msg = DetectedObjectArray()
+        for obj in msg.objects:
+            detected_obj = DetectedObject()
+            detected_obj.class_name = obj.class_name
+            detected_obj.pose = obj.pose
+            detected_obj.width = obj.width
+            new_msg.objects.append(detected_obj)
+
+        self.detected_objects_callback(new_msg)
+
     def detected_objects_callback(self, msg):
         object_array = msg.objects
         new_proposed_objects = []
@@ -800,6 +814,7 @@ class Map:
         self.detected_object_subscriber = rospy.Subscriber('/detected_objects', DetectedObjectArray, self.detected_objects_callback, queue_size=10)
         self.object_from_agent_subscriber = rospy.Subscriber('/object_from_agent', DetectedObject, self.object_from_agent_callback, queue_size=10)
         self.object_from_sensor_subscriber = rospy.Subscriber('/object_from_sensor', DetectedObjectArray, self.object_from_sensor_callback, queue_size=10)
+        self.labeled_sub = rospy.Subscriber("/labeled_unknown_objects", LabeledObjectArray, self.labeled_callback, queue_size=10)
         rospy.spin()
 
     def shutdown(self):
