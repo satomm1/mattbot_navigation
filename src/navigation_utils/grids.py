@@ -32,6 +32,17 @@ class StochOccupancyGrid2D(object):
         self.thresh = thresh
         self.robot_d=robot_d
 
+    def __add__(self, other):
+        if not isinstance(other, StochOccupancyGrid2D):
+            raise TypeError("Can only add another StochOccupancyGrid2D instance")
+        if self.width != other.width or self.height != other.height:
+            raise ValueError("Grids must have the same dimensions to be added")
+        
+        new_probs = np.maximum(self.probs, other.probs)
+        return StochOccupancyGrid2D(self.resolution, self.width, self.height,
+                                    self.origin_x, self.origin_y,
+                                    self.window_size, new_probs, self.thresh, self.robot_d)
+
     def snap_to_grid(self, x):
         return (self.resolution*round(x[0]/self.resolution), self.resolution*round(x[1]/self.resolution))
 
@@ -67,3 +78,8 @@ class StochOccupancyGrid2D(object):
         p_total = np.prod(1. - np.maximum(prob_window / 100., 0.))
 
         return (1. - p_total) < self.thresh
+    
+    def update(self, new_probs):
+        if new_probs.shape != self.probs.shape:
+            raise ValueError("New probabilities must have the same shape as the existing grid")
+        self.probs = new_probs

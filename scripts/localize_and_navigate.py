@@ -67,6 +67,8 @@ class Navigator:
         self.occupancy = None
         self.occupancy_updated = False
 
+        self.person_occupancy = None
+
         self.server_url = server_url
         self.stopped_robot_location_query = """
                                             {
@@ -159,6 +161,9 @@ class Navigator:
         map_name = rospy.get_param('map_name', '/map')
         # map_name = "/map"
 
+        # Distance to closest person --- determines if we should slow down or stop
+        self.distance_to_person = np.inf
+
         rospy.Subscriber(map_name, OccupancyGrid, self.map_callback)
         rospy.Subscriber("/map_metadata", MapMetaData, self.map_md_callback)
         rospy.Subscriber("/cmd_nav", Pose2D, self.cmd_nav_callback)
@@ -167,7 +172,7 @@ class Navigator:
         rospy.Subscriber("/voice_goal", Pose2D, self.external_goal_callback)
         rospy.Subscriber("/path_from_agent", AgentPath, self.path_from_agent_callback)
         rospy.Subscriber("/agent_location", AgentLocation, self.agent_location_callback)
-        # rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
+        rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
         self.localized_sub = rospy.Subscriber("/localized", Bool, self.localized_callback)
 
         self.has_stopped = False
@@ -228,6 +233,17 @@ class Navigator:
                 5,
                 self.map_probs,
             )
+
+            self.person_occupancy = StochOccupancyGrid2D(
+                self.map_resolution,
+                self.map_width,
+                self.map_height,
+                self.map_origin[0],
+                self.map_origin[1],
+                5,
+                np.zeros((self.map_width * self.map_height,)),  # initialize with zeros     
+            )
+
             if self.x_g is not None:
                 # if we have a goal to plan to, replan
                 pass
@@ -287,43 +303,74 @@ class Navigator:
         """
         receives detected objects and updates the map
         """
-        # self.detected_objects = []
+        # Get the distance to the closest person
+        closest_person_dist = np.inf
+        person_probs = np.zeros((self.map_height, self.map_width))
+        for obj in msg.objects:
+            if obj.class_name != "person":
+                continue
 
-        num_existing_objects = len(self.detected_objects)
-        indx_matching_objects = []
-
-        object_array = msg.objects
-        for obj in object_array:
             x = obj.pose.position.x
             y = obj.pose.position.y
-            w = obj.width
 
-            object_already_exists = False
-            for i in range(len(self.detected_objects)):
-                if np.linalg.norm(np.array([x - self.detected_objects[i][0], y - self.detected_objects[i][1]]) < 0.2):
-                    self.detected_objects[i] = (x, y, w, 0)
-                    object_already_exists = True
-                    indx_matching_objects.append(i)
-                    break
+            # assume person occupies a circle of radius 0.3m
+            radius = 0.3
+            grid_x = int((x - self.map_origin[0]) / self.map_resolution)
+            grid_y = int((y - self.map_origin[1]) / self.map_resolution)
+            grid_x = np.clip(grid_x, 0, self.map_width - 1)
+            grid_y = np.clip(grid_y, 0, self.map_height - 1)
+            # Update the person occupancy grid
+            for i in range(-self.person_occupancy.window_size//2, self.person_occupancy.window_size//2 + 1):
+                for j in range(-self.person_occupancy.window_size//2, self.person_occupancy.window_size//2 + 1):
+                    if (0 <= grid_x + i < self.map_width) and (0 <= grid_y + j < self.map_height):
+                        dist = np.sqrt(i**2 + j**2) * self.map_resolution
+                        if dist <= radius:
+                            person_probs[grid_y + j, grid_x + i] = 1.0  # Mark as occupied
+
+            dist_to_person = np.linalg.norm(np.array([x - self.x, y - self.y]))
+            if dist_to_person < closest_person_dist:
+                closest_person_dist = dist_to_person
+        self.distance_to_person = closest_person_dist
+
+        self.person_occupancy.update(person_probs)
+
+        # # self.detected_objects = []
+
+        # num_existing_objects = len(self.detected_objects)
+        # indx_matching_objects = []
+
+        # object_array = msg.objects
+        # for obj in object_array:
+        #     x = obj.pose.position.x
+        #     y = obj.pose.position.y
+        #     w = obj.width
+
+        #     object_already_exists = False
+        #     for i in range(len(self.detected_objects)):
+        #         if np.linalg.norm(np.array([x - self.detected_objects[i][0], y - self.detected_objects[i][1]]) < 0.2):
+        #             self.detected_objects[i] = (x, y, w, 0)
+        #             object_already_exists = True
+        #             indx_matching_objects.append(i)
+        #             break
             
-            if not object_already_exists:
-                self.detected_objects.append((x, y, w, 0))
+        #     if not object_already_exists:
+        #         self.detected_objects.append((x, y, w, 0))
 
-        # Increment the counter for objects that were not detected
-        for i in range(num_existing_objects):
-            if i not in indx_matching_objects:
-                self.detected_objects[i] = (self.detected_objects[i][0], self.detected_objects[i][1], self.detected_objects[i][2], self.detected_objects[i][3] + 1)
+        # # Increment the counter for objects that were not detected
+        # for i in range(num_existing_objects):
+        #     if i not in indx_matching_objects:
+        #         self.detected_objects[i] = (self.detected_objects[i][0], self.detected_objects[i][1], self.detected_objects[i][2], self.detected_objects[i][3] + 1)
         
-        # Remove objects that were not detected for a certain number of frames
-        self.detected_objects = [obj for obj in self.detected_objects if obj[3] < 60]
+        # # Remove objects that were not detected for a certain number of frames
+        # self.detected_objects = [obj for obj in self.detected_objects if obj[3] < 60]
 
             
-            # Add to list if doesn't already exist
-            # if not any(
-            #     np.linalg.norm(np.array([x - existing_obj[0], y - existing_obj[1]]) < 0.2)
-            #     for existing_obj in self.detected_objects
-            # ):
-            #     self.detected_objects.append((x, y, w, 0))
+        #     # Add to list if doesn't already exist
+        #     # if not any(
+        #     #     np.linalg.norm(np.array([x - existing_obj[0], y - existing_obj[1]]) < 0.2)
+        #     #     for existing_obj in self.detected_objects
+        #     # ):
+        #     #     self.detected_objects.append((x, y, w, 0))
 
 
     def localized_callback(self, msg):
@@ -379,6 +426,29 @@ class Navigator:
         cmd_vel.linear.x = 0.0
         cmd_vel.angular.z = 0.0
         self.nav_vel_pub.publish(cmd_vel)
+
+    def modify_velocity_for_person(self, V, om):
+        """
+        Modifies the velocity based on the distance to the closest person.
+        If the distance is less than a threshold, it slows down or stops the robot.
+        """
+        if self.distance_to_person < 1:
+            # Slow down
+            V *= 0.5
+            om *= 0.5
+        elif self.distance_to_person < 0.5:
+            # Stop
+            V = 0.0
+            om = 0.0
+            
+            self.robot_stopped_by_person = True
+            self.switch_mode(Mode.IDLE)
+        elif self.robot_stopped_by_person:
+            # If we were stopped by a person, we can start moving again
+            self.robot_stopped_by_person = False
+            self.replan()
+
+        return V, om
 
     def near_goal(self):
         """
@@ -507,6 +577,9 @@ class Navigator:
             V, om = self.traj_controller.compute_control(
                 self.x, self.y, self.theta, t
             )
+
+            # Check if we need to modify the velocity for a person
+            V, om = self.modify_velocity_for_person(V, om)
         elif self.mode == Mode.ALIGN:
             V, om = self.heading_controller.compute_control(
                 self.x, self.y, self.theta, t
@@ -626,12 +699,15 @@ class Navigator:
             agent_x, agent_y, agent_theta, _ = self.other_agents_locations[agent_id]
             robots_x.append(agent_x)
             robots_y.append(agent_y)
+
+        combined_occupancy = self.occupancy + self.person_occupancy
+
         problem = AStar(
             state_min,
             state_max,
             x_init,
             x_goal,
-            self.occupancy,
+            combined_occupancy,
             self.plan_resolution,
             robots_x=robots_x,
             robots_y=robots_y,
