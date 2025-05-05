@@ -68,6 +68,8 @@ class Navigator:
         self.occupancy_updated = False
 
         self.person_occupancy = None
+        self.robot_stopped_by_person = False
+        self.person_in_path = False
 
         self.server_url = server_url
         self.stopped_robot_location_query = """
@@ -101,7 +103,7 @@ class Navigator:
         self.om_max = 3  # maximum angular velocity
         self.om_heading = 1.3  # angular velocity for heading controller
 
-        self.v_des = 0.5  # desired cruising velocity
+        self.v_des = 0.4  # desired cruising velocity
         self.theta_start_thresh = 0.05  # threshold in theta to start moving forward when path-following
         self.start_pos_thresh = (
             0.2  # threshold to be far enough into the plan to recompute it
@@ -299,6 +301,20 @@ class Navigator:
         self.theta_g = msg.theta
         self.replan()
 
+    def person_intersect_path(self):
+        # Use the self.person_occupancy to check if the path intersects with a person
+        person_probs = self.person_occupancy.get_probs()
+        path = self.current_plan
+
+        for point in path:
+            grid_x = int((point[0] - self.map_origin[0]) / self.map_resolution)
+            grid_y = int((point[1] - self.map_origin[1]) / self.map_resolution)
+            if (0 <= grid_x < self.map_width) and (0 <= grid_y < self.map_height):
+                if person_probs[grid_y, grid_x] > 0.5:  # Assuming a threshold of 0.5
+                    return True
+
+        return False
+
     def detected_objects_callback(self, msg):
         """
         receives detected objects and updates the map
@@ -306,6 +322,7 @@ class Navigator:
         # Get the distance to the closest person
         closest_person_dist = np.inf
         person_probs = np.zeros((self.map_height, self.map_width))
+
         for obj in msg.objects:
             if obj.class_name != "person":
                 continue
@@ -328,11 +345,18 @@ class Navigator:
                             person_probs[grid_y + j, grid_x + i] = 1.0  # Mark as occupied
 
             dist_to_person = np.linalg.norm(np.array([x - self.x, y - self.y]))
+
+            
+
+            print("Detected person {} away from robot".format(dist_to_person))
+
             if dist_to_person < closest_person_dist:
                 closest_person_dist = dist_to_person
         self.distance_to_person = closest_person_dist
 
         self.person_occupancy.update(person_probs)
+
+        self.person_in_path = self.person_intersect_path()
 
         # # self.detected_objects = []
 
@@ -432,17 +456,16 @@ class Navigator:
         Modifies the velocity based on the distance to the closest person.
         If the distance is less than a threshold, it slows down or stops the robot.
         """
-        if self.distance_to_person < 1:
-            # Slow down
-            V *= 0.5
-            om *= 0.5
-        elif self.distance_to_person < 0.5:
+        if self.distance_to_person < 1.6 and self.person_in_path:
             # Stop
             V = 0.0
             om = 0.0
             
             self.robot_stopped_by_person = True
-            self.switch_mode(Mode.IDLE)
+        elif self.distance_to_person < 2.5:
+            # Slow down
+            V *= 0.5
+            om *= 0.5
         elif self.robot_stopped_by_person:
             # If we were stopped by a person, we can start moving again
             self.robot_stopped_by_person = False

@@ -83,3 +83,6 @@ class StochOccupancyGrid2D(object):
         if new_probs.shape != self.probs.shape:
             raise ValueError("New probabilities must have the same shape as the existing grid")
         self.probs = new_probs
+
+    def get_probs(self):
+        return self.probs
