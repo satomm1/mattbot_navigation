@@ -1,4 +1,5 @@
 import rospy
+import rospkg
 from std_msgs.msg import Bool
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import Twist, Pose
@@ -14,6 +15,8 @@ import time
 
 import numpy as np
 from matplotlib import pyplot as plt
+import os
+import json
 
 from navigation_utils import StochOccupancyGrid2D
 
@@ -64,6 +67,33 @@ class Map:
                                            self.new_map.info.origin.position.y, 
                                                                              5,                     
                                                              self.new_map.data)
+
+        # Load the saved occupancy grid 
+        rospack = rospkg.RosPack()
+        package_path = rospack.get_path('mattbot_navigation')
+        
+        print("\n\n****************")
+        try:
+            with open(os.path.join(package_path, 'maps', 'occupancy_grid_map.json'), 'r') as f:
+                map_data = json.load(f)
+
+            map_data = map_data.get('data', {}).get('map', {})
+            occupancy = map_data.get('occupancy')
+            resolution = map_data.get('resolution')
+            width = map_data.get('width')
+            height = map_data.get('height')
+
+            if height == self.height and width == self.width and resolution == self.resolution:
+                self.new_map_as_np.l = np.array(occupancy).reshape((height, width))
+                self.new_map_as_np.recalculate_probs()
+
+                print("Loaded occupancy grid map from file.")
+            else:
+                print("No matching occupancy grid found.")
+        except FileNotFoundError:
+            print("No valid occupancy grid found.")
+
+        print("\n\n")
 
         # Publish the map
         self.new_map_publisher = rospy.Publisher('/new_map', OccupancyGrid, queue_size=10)
@@ -776,6 +806,27 @@ class Map:
 
     def shutdown(self):
         rospy.loginfo("Shutting down Occupancy Grid Mapper")
+        
+        # Only save if self.new_map_as_np is not all zeros
+        if np.sum(np.abs(self.new_map_as_np.l)) == 0:
+            return
+
+        # Save the occupancy grid map to a file
+        occ_grid_dict = dict()
+        occ_grid_dict['map'] = dict()
+        occ_grid_dict['map']['occupancy'] = self.new_map_as_np.l.flatten().tolist()
+        occ_grid_dict['map']['resolution'] = self.resolution
+        occ_grid_dict['map']['width'] = self.width
+        occ_grid_dict['map']['height'] = self.height
+
+        occ_grid_data_dict = dict()
+        occ_grid_data_dict['data'] = occ_grid_dict
+
+        rospack = rospkg.RosPack()
+        package_path = rospack.get_path('mattbot_navigation')
+        
+        with open(os.path.join(package_path, 'maps', 'occupancy_grid_map.json'), 'w') as f:
+            f.write(json.dumps(occ_grid_data_dict))
         
 
 if __name__ == '__main__':
