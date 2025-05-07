@@ -70,6 +70,10 @@ class Navigator:
         self.person_occupancy = None
         self.robot_stopped_by_person = False
         self.person_in_path = False
+        self.person_list1 = []
+        self.person_list2 = []
+        self.person_list3 = []
+        self.stopped_for_person_time = rospy.get_rostime().to_sec()
 
         self.server_url = server_url
         self.stopped_robot_location_query = """
@@ -319,6 +323,12 @@ class Navigator:
         """
         receives detected objects and updates the map
         """
+
+        # Each detection stays for 3 frames
+        self.person_list3 = self.person_list2
+        self.person_list2 = self.person_list1
+        self.person_list1 = []
+
         # Get the distance to the closest person
         closest_person_dist = np.inf
         person_probs = np.zeros((self.map_height, self.map_width))
@@ -329,7 +339,9 @@ class Navigator:
 
             x = obj.pose.position.x
             y = obj.pose.position.y
+            self.person_list1.append((x, y))
 
+        for (x,y) in self.person_list1 + self.person_list2 + self.person_list3:
             # assume person occupies a circle of radius 0.3m
             radius = 0.3
             grid_x = int((x - self.map_origin[0]) / self.map_resolution)
@@ -345,10 +357,6 @@ class Navigator:
                             person_probs[grid_y + j, grid_x + i] = 1.0  # Mark as occupied
 
             dist_to_person = np.linalg.norm(np.array([x - self.x, y - self.y]))
-
-            
-
-            print("Detected person {} away from robot".format(dist_to_person))
 
             if dist_to_person < closest_person_dist:
                 closest_person_dist = dist_to_person
@@ -461,6 +469,11 @@ class Navigator:
             V = 0.0
             om = 0.0
             
+            # Keep track of how long we've been stopped
+            if not self.robot_stopped_by_person:
+                self.stopped_for_person_time = rospy.get_rostime().to_sec()
+                print("Stopping for person")
+
             self.robot_stopped_by_person = True
         elif self.distance_to_person < 2.5:
             # Slow down
@@ -469,6 +482,9 @@ class Navigator:
         elif self.robot_stopped_by_person:
             # If we were stopped by a person, we can start moving again
             self.robot_stopped_by_person = False
+
+            print("Resuming motion after stopping for person")
+
             self.replan()
 
         return V, om
@@ -608,7 +624,7 @@ class Navigator:
                 self.x, self.y, self.theta, t
             )
         elif self.mode == Mode.BACKING:
-            V = -0.4
+            V = -0.3
             om = 0.0
         else:
             V = 0.0
@@ -950,7 +966,7 @@ class Navigator:
 
                     # Now replan
                     self.replan()
-                elif len(self.waypoints) > 0:
+                elif len(self.waypoints) > 0 and not self.robot_stopped_by_person:
                     if current_time - self.current_plan_start_time.to_sec() > self.waypoints[0][2]:
                         print("******************************************")
                         print("Backing up because haven't reached waypoint")
@@ -961,6 +977,20 @@ class Navigator:
                     elif np.linalg.norm(np.array([self.x - self.waypoints[0][0], self.y - self.waypoints[0][1]])) < 0.35:
                         print("Waypoint reached")
                         self.waypoints.pop(0)  # Remove the first waypoint since we are close to it
+                elif self.robot_stopped_by_person and current_time - self.stopped_for_person_time > 5:
+
+                    print("******************************************")
+                    print("Replanning because person in path")
+                    print("******************************************")
+
+                    # Stop attempting current plan
+                    self.switch_mode(Mode.IDLE)
+
+                    self.robot_stopped_by_person = False
+                    
+                    # Try to replan
+                    self.replan()
+
                 elif (rospy.get_rostime() - self.current_plan_start_time).to_sec() > self.current_plan_duration:
                     rospy.loginfo("replanning because out of time")
                     self.replan()  # we aren't near the goal but we thought we should have been, so replan
