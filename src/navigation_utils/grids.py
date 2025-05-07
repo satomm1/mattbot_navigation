@@ -27,6 +27,7 @@ class StochOccupancyGrid2D(object):
         self.origin_x = origin_x
         self.origin_y = origin_y
         self.probs = np.reshape(np.asarray(probs), (height, width))
+        self.l = np.zeros((height, width))
         self.window_size = 10 # window_size
         # print(window_size)
         self.thresh = thresh
@@ -45,6 +46,34 @@ class StochOccupancyGrid2D(object):
 
     def snap_to_grid(self, x):
         return (self.resolution*round(x[0]/self.resolution), self.resolution*round(x[1]/self.resolution))
+
+    def snap_to_grid1(self, x):
+        return (self.resolution * np.round(x[0] / self.resolution), self.resolution * np.round(x[1] / self.resolution))
+
+    def get_index(self, x):
+        return (np.round((x[0]-self.origin_x)/self.resolution), np.round((x[1]-self.origin_y)/self.resolution))
+
+    def recalculate_probs(self):
+        self.probs = 1 - 1/(1+np.exp(self.l))
+
+    def decay_l(self):
+        indx = np.where(np.abs(self.l) < 2)
+        self.l[indx] = 0.85*self.l[indx]
+
+    def set_occupied(self, x, y):
+        x = np.asarray(x)
+        y = np.asarray(y)
+        
+        # Create a mask for indices where l > 1
+        mask = self.l[y, x] >= 1
+        
+        # Update values where the mask is True
+        self.l[y[mask], x[mask]] += 3
+        # Ensure we never go more than 10
+        self.l[y[mask], x[mask]] = np.minimum(self.l[y[mask], x[mask]], 10)
+        
+        # Update values where the mask is False
+        self.l[y[~mask], x[~mask]] = 1.2
 
     def is_free(self, state):
         # combine the probabilities of each cell by assuming independence
