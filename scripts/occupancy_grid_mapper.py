@@ -462,8 +462,9 @@ class Map:
         y_max = min([int((camera_location[1] + 1)/self.resolution), self.height])
         combined_map_data[y_min:y_max, x_min:x_max] = np.maximum(combined_map_data[y_min:y_max, x_min:x_max], self.person_moving_map[y_min:y_max, x_min:x_max])
 
-        # new_map_binary = np.where(self.new_map_as_np.probs.flatten() > 0.85)[0]
-        # combined_map_data[new_map_binary] = 100
+        combined_map_data = combined_map_data.flatten()
+        new_map_binary = np.where(self.new_map_as_np.probs.flatten() > 0.85)[0]
+        combined_map_data[new_map_binary] = 100
         self.combined_map.data = combined_map_data.flatten().astype(int).tolist()
         self.combined_map_publisher.publish(self.combined_map) 
 
