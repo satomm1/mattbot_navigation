@@ -102,6 +102,8 @@ class Navigator:
         self.current_plan_duration = 0
         self.plan_start = [0.0, 0.0]
 
+        self.times_planned_failed = 0
+
         # Robot limits
         self.v_max = 0.7  # maximum velocity
         self.om_max = 3  # maximum angular velocity
@@ -759,11 +761,21 @@ class Navigator:
         success = problem.solve()
         if not success and self.mode == Mode.IDLE:
             rospy.loginfo("Planning failed")
-            self.x_g += np.random.normal(0,0.05)
-            self.y_g += np.random.normal(0,0.05)
-            self.replan()
+            self.times_planned_failed += 1
+
+            if self.times_planned_failed > 5:
+                rospy.loginfo("Planning failed too many times, stopping")
+                self.x_g = None
+                self.y_g = None
+                self.theta_g = None
+                self.switch_mode(Mode.IDLE)
+            else:
+                self.x_g += np.random.normal(0,0.05)
+                self.y_g += np.random.normal(0,0.05)
+                self.replan()
             return
         else:
+            self.times_planned_failed = 0
             rospy.loginfo("Planning Succeeded")
             planned_path = problem.path
 
