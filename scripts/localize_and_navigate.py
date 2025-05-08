@@ -765,6 +765,8 @@ class Navigator:
 
             if self.times_planned_failed > 5:
                 rospy.loginfo("Planning failed too many times, stopping")
+                self.times_planned_failed = 0
+
                 self.x_g = None
                 self.y_g = None
                 self.theta_g = None
