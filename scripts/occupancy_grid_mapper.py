@@ -24,9 +24,6 @@ from navigation_utils import StochOccupancyGrid2D
 class Map:
 
     def __init__(self):
-
-        self.camera_height = rospy.get_param('camera_height', 0.216)
-        self.total_height = rospy.get_param('total_height', 0.5)
         self.robot_d = rospy.get_param('robot_d', 0.6)
         self.camera_inverted = rospy.get_param('camera_inverted', False)
         self.is_test = rospy.get_param('is_test', False)
@@ -113,6 +110,26 @@ class Map:
         self.cx = camera_info[0, 2]
         self.cy = camera_info[1, 2]
 
+        # Get the camera to base transform
+        self.camera_offset_x = None
+        self.camera_offset_y = None
+        self.camera_offset_z = None
+        while self.camera_offset_x is None or self.camera_offset_y is None or self.camera_offset_z is None:
+            (self.camera_offset_x, self.camera_offset_y, self.camera_offset_z) = self.get_camera_to_base_transform()
+            rospy.sleep(0.1)
+
+        # Get the camera height
+        self.camera_height = None
+        while self.camera_height is None:
+            self.camera_height = self.get_camera_height()
+            rospy.sleep(0.1)
+
+        # Get the total height of the robot
+        self.total_height = None
+        while self.total_height is None:
+            self.total_height = self.get_total_height()
+            rospy.sleep(0.1)
+
         # Log-Probabilities to add or remove from the map 
         self.l_occ = 0.6
         self.l_free = -1  # np.log(0.35/0.85)
@@ -135,6 +152,46 @@ class Map:
         self.person_moving_map = np.ones((self.height, self.width))*-1  # Map for tracking people
         self.person_dict = dict()  # Dictionary for tracking people
         self.person_subscriber = rospy.Subscriber('/person', PersonArray, self.person_callback, queue_size=10) 
+
+    def get_camera_to_base_transform(self):
+        """
+        Get the transform from the camera to the base link.
+        Returns:
+            (translation, rotation): translation and rotation of the camera in the base frame
+        """
+        try:
+            (translation, _) = self.trans_listener.lookupTransform("/base_link", "/camera_link", rospy.Time(0))
+            x = translation[0]
+            y = translation[1]
+            z = translation[2]
+            return x, y, z
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            print("No location yet...", e)
+            return None, None, None
+        
+    def get_camera_height(self):
+        """
+        Get the height of the camera from the base_footprint.
+        """
+        try:
+            (translation, _) = self.trans_listener.lookupTransform("/base_footprint", "/camera_link", rospy.Time(0))
+            z = translation[2]
+            return z
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            print("No location yet...", e)
+            return None
+        
+    def get_total_height(self):
+        """
+        Get the transform from the laser_frame to base_footprint.
+        """
+        try:
+            (translation, _) = self.trans_listener.lookupTransform("/base_footprint", "/laser_frame", rospy.Time(0))
+            z = translation[2]
+            return z
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            print("No location yet...", e)
+            return None
 
     def localized_callback(self, msg):
         self.is_localized = msg.data   
@@ -194,25 +251,19 @@ class Map:
         if self.is_turning:
             return
 
-        # Get current position of the camera immediately so that it is as close to the point cloud as possible
+        # Get current position of the robot immediately so that it is as close to the point cloud as possible
         try:
-            (translation, rotation) = self.trans_listener.lookupTransform("/map", "/camera_link", rospy.Time(0))
-            camera_x = translation[0]
-            camera_y = translation[1]
+            (translation, rotation) = self.trans_listener.lookupTransform("/map", "/base_link", rospy.Time(0))
+            robot_x = translation[0]
+            robot_y = translation[1]
             euler = tf.transformations.euler_from_quaternion(rotation)
-            camera_theta = euler[2]
-
-            camera_location = (camera_x, camera_y, camera_theta)
-            camera_offset = 0.127
-            robot_location = (camera_x - camera_offset*np.cos(camera_theta), camera_y - camera_offset*np.sin(camera_theta), camera_theta)
-
+            robot_theta = euler[2]
+            robot_location = (robot_x, robot_y, robot_theta)
+            camera_location = (robot_x + self.camera_offset_x*np.cos(robot_theta), robot_y + self.camera_offset_x*np.sin(robot_theta), robot_theta)
         except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
             print("No location yet...", e)
             # Location not available yet
             return
-
-
-        t1 = time.time()
 
         # Get data from msg into an numpy array
         data = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)))
@@ -232,12 +283,7 @@ class Map:
             x_local = -points_np[:, 0]
         else:
             x_local = points_np[:, 0]
-
         y_local = points_np[:, 2]
-
-        t2 = time.time()
-
-        # print("Time taken to get points: ", t2 - t1)
 
         # Now map local coordinates to global coordinates
         theta_objects = np.arctan2(x_local, y_local)
