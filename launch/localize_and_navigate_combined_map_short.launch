@@ -2,8 +2,6 @@
 <launch>
 
   <param name="map_name" value="/navigation_map" />
-  <param name="camera_height" type="double" value="0.216" />
-  <param name="total_height" type="double" value="0.5" />
   <param name="camera_inverted" type="bool" value="false" />
 
   <!-- Launch the occupancy grid mapper -->
