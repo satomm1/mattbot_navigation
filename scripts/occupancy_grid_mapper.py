@@ -92,11 +92,11 @@ class Map:
 
         print("\n\n")
 
-        # Publish the map
+        # Publish the occupancy grid map
         self.new_map_publisher = rospy.Publisher('/new_map', OccupancyGrid, queue_size=10)
         self.new_map_publisher.publish(self.new_map)
 
-        # Prepare the combined map and the publisher
+        # Prepare the combined map and the publisher (contains objects + occupancy grid map)
         self.combined_map = OccupancyGrid()
         self.combined_map.header = self.map_msg.header
         self.combined_map.info = self.map_msg.info
@@ -143,10 +143,9 @@ class Map:
         self.num_detected_objects = 0
         self.object_marker_array = MarkerArray()
 
-        self.cone_map = np.ones((self.height, self.width))*-1
-        self.new_cone_publisher = rospy.Publisher('/new_cone_map', DetectedObject, queue_size=10)
-
-        self.object_publisher = rospy.Publisher('/object_array', MarkerArray, queue_size=10)
+        self.detected_object_map = np.ones((self.height, self.width))*-1
+        self.confirmed_object_publisher = rospy.Publisher('/confirmed_objects', DetectedObject, queue_size=10)
+        self.object_marker_publisher = rospy.Publisher('/object_array', MarkerArray, queue_size=10)
 
         self.person_static_map = np.ones((self.height, self.width))*-1  # Map for tracking people
         self.person_moving_map = np.ones((self.height, self.width))*-1  # Map for tracking people
@@ -301,6 +300,7 @@ class Map:
         x_global = []
         y_global = []
 
+        # TODO: Vectorize
         # Get global coordinates of the points
         # For every angle from the camera, only consider the point of minimum distance (reduce computation time)
         for i in range(1, len(sorted_indx)):
@@ -395,21 +395,7 @@ class Map:
         # marker_array = MarkerArray()
         # i = 0
         # for j in range(unique_points.shape[0]):
-        #     marker = Marker()
-        #     marker.header.frame_id = "map"
-        #     marker.type = Marker.SPHERE
-        #     marker.action = Marker.ADD
-        #     marker.id = i
-        #     marker.scale.x = 0.1
-        #     marker.scale.y = 0.1
-        #     marker.scale.z = 0.1
-        #     marker.color.a = 0.5
-        #     marker.color.r = 0.0
-        #     marker.color.g = 1.0
-        #     marker.color.b = 0.0
-        #     marker.pose.position.x = unique_points[j, 0] * self.resolution
-        #     marker.pose.position.y = unique_points[j, 1] * self.resolution
-        #     marker.pose.position.z = 0.1
+        #     marker = self.get_marker(unique_points[j, 0]*self.resolution, unique_points[j, 1]*self.resolution, i, r=0.0, g=1.0, b=0.0)
         #     marker_array.markers.append(marker)
         #     i += 1
 
@@ -428,21 +414,7 @@ class Map:
         # Display the perceptual field
         # marker_array = MarkerArray()
         # for j in range(perceptual_field_coords.shape[0]):
-        #     marker = Marker()
-        #     marker.header.frame_id = "map"
-        #     marker.type = Marker.SPHERE
-        #     marker.action = Marker.ADD
-        #     marker.id = i
-        #     marker.scale.x = 0.05
-        #     marker.scale.y = 0.05
-        #     marker.scale.z = 0.05
-        #     marker.color.a = 1.0
-        #     marker.color.r = 1.0
-        #     marker.color.g = 0.0
-        #     marker.color.b = 0.0
-        #     marker.pose.position.x = perceptual_field_coords[j, 0]
-        #     marker.pose.position.y = perceptual_field_coords[j, 1]
-        #     marker.pose.position.z = 0.1
+        #     marker = self.get_marker(perceptual_field_coords[j, 0], perceptual_field_coords[j, 1], i, scale=0.05, r=1.0, g=0.0, b=0.0)
         #     marker_array.markers.append(marker)
         #     i += 1
         # marker_arr_pub.publish(marker_array)
@@ -497,9 +469,9 @@ class Map:
         # combined_map_data = np.array(self.map_msg.data)
         map_data = np.array(self.map_msg.data).reshape(self.height, self.width)
         mod_data = np.array(self.map_mod_msg.data).reshape(self.height, self.width)
-        combined_map_data = np.maximum(map_data, mod_data)
-        combined_map_data = np.maximum(combined_map_data, self.cone_map)
-        combined_map_data = np.maximum(combined_map_data, self.person_static_map)
+        combined_map_data = np.maximum(map_data, mod_data)  # Combine the original map and the modified map
+        combined_map_data = np.maximum(combined_map_data, self.detected_object_map)  # Combine with the detected object map
+        combined_map_data = np.maximum(combined_map_data, self.person_static_map)  # Combine with the person static map
 
         # We only care about the person_moving_map if within 2 meters of us:
         x_min = max([int((camera_location[0] - 1)/self.resolution), 0])
@@ -562,36 +534,45 @@ class Map:
 
     def detected_objects_callback(self, msg):
         object_array = msg.objects
-        new_proposed_objects = []
-        objs_to_pop = []
 
+        # iterate through all objects
         for obj in object_array:
 
             # Temporary while we figure out what we want to do
             if obj.class_name == "unknown" or obj.class_name == "person":
                 continue
 
+            # Check if the object already exists in the detected objects
             already_exists = False
             x = obj.pose.position.x
             y = obj.pose.position.y
-
             for detected_obj in self.detected_objects:
                 if np.sqrt((detected_obj[0] - x)**2 + (detected_obj[1] - y)**2) < obj.width:
                     already_exists = True
                     break
 
+            # If the object does not already exist, check if it matches with any proposed object
+            # A proposed object is an object that has been seen before but not yet confirmed
+            # We require an object to be seen at least 5 times before it is confirmed
+            # The format of the proposed_objects is [x, y, width, num_seen, num_removed, is_confirmed, class_name]
             if not already_exists:
 
                 match_proposed = False
                 # Check if we match with any proposed object
-                for ii in range(len(self.proposed_objects)-1, -1, -1):
+                for ii in range(len(self.proposed_objects)-1, -1, -1):  # Iterate backwards to allow popping
                     proposed_obj = self.proposed_objects[ii]
-                    if np.sqrt((proposed_obj[0] - x)**2 + (proposed_obj[1] - y)**2) < obj.width/2:
+                    
+                    # Check if object class matches
+                    if proposed_obj[6] != obj.class_name:
+                        continue
 
+                    if np.sqrt((proposed_obj[0] - x)**2 + (proposed_obj[1] - y)**2) < obj.width/2:
+                        # We have matched with a proposed object
                         self.proposed_objects[ii][3] += 1
                         self.proposed_objects[ii][5] = True
-                        if self.proposed_objects[ii][3] > 5:
 
+                        # If the proposed object has been seen enough times, we confirm it
+                        if self.proposed_objects[ii][3] > 5:
                             match_proposed = True
                             self.proposed_objects.pop(ii)
 
@@ -600,43 +581,33 @@ class Map:
                             self.num_detected_objects += 1
                             print("Number of detected objects: ", self.num_detected_objects - self.num_removed_objects)
 
+                            # Block out area in map based on the width of the object
                             x_min = int((x - obj.width/2)/self.resolution)
                             x_max = int((x + obj.width/2)/self.resolution)
                             y_min = int((y - obj.width/2)/self.resolution)
                             y_max = int((y + obj.width/2)/self.resolution)
-                            self.cone_map[y_min:y_max, x_min:x_max] = 100
+                            self.detected_object_map[y_min:y_max, x_min:x_max] = 100
 
-                            marker = Marker()
-                            marker.header.frame_id = "map"
-                            marker.type = Marker.SPHERE
-                            marker.action = Marker.ADD
-                            marker.id = self.num_detected_objects
-                            marker.scale.x = 0.1
-                            marker.scale.y = 0.1
-                            marker.scale.z = 0.1
-                            marker.color.a = 1.0
-                            marker.color.r = 0.0
-                            marker.color.g = 1.0
-                            marker.color.b = 0.0
-                            marker.pose.position.x = x
-                            marker.pose.position.y = y
-                            marker.pose.position.z = 0.1
+                            # Create a marker for the object to show in RViz
+                            marker = self.get_marker(x, y, self.num_detected_objects)
                             self.object_marker_array.markers.append(marker)
 
-                            cone_object = DetectedObject()
-                            cone_object.class_name = obj.class_name  # "cone"
-                            cone_object.pose.position.x = x
-                            cone_object.pose.position.y = y
-                            cone_object.pose.position.z = 0.0
-                            cone_object.pose.orientation.w = 1
-                            cone_object.width = obj.width
-                            self.new_cone_publisher.publish(cone_object)
+                            # Publish the confirmed object
+                            confirmed_object = DetectedObject()
+                            confirmed_object.class_name = obj.class_name
+                            confirmed_object.pose.position.x = x
+                            confirmed_object.pose.position.y = y
+                            confirmed_object.pose.position.z = 0.0
+                            confirmed_object.pose.orientation.w = 1
+                            confirmed_object.width = obj.width
+                            self.confirmed_object_publisher.publish(confirmed_object)
 
                             break
                 
                 if not match_proposed:
-                    self.proposed_objects.append([x, y, obj.width, 0, 0, True])
+                    self.proposed_objects.append([x, y, obj.width, 0, 0, True, obj.class_name])
 
+        # Remove proposed objects that have not been confirmed after 10 iterations
         for ii in range(len(self.proposed_objects)-1, -1, -1):
             if self.proposed_objects[ii][5] == False:
                 self.proposed_objects[ii][4] += 1
@@ -645,17 +616,20 @@ class Map:
             else:
                 self.proposed_objects[ii][5] = False
 
-        self.object_publisher.publish(self.object_marker_array)
+        # Publish the object marker array
+        self.object_marker_publisher.publish(self.object_marker_array)
 
     def object_from_agent_callback(self, msg):
         x = msg.pose.position.x
         y = msg.pose.position.y
         width = msg.width
 
+        # Check if the object already exists in the detected objects
         for detected_obj in self.detected_objects:
             if np.sqrt((detected_obj[0] - x)**2 + (detected_obj[1] - y)**2) < width:
                 return
 
+        # If the object does not already exist, add it to the detected objects
         self.detected_objects.append([x, y, width])
         self.num_detected_objects += 1
         print("Added object from other agent")
@@ -665,25 +639,12 @@ class Map:
         x_max = int((x + width/2)/self.resolution)
         y_min = int((y - width/2)/self.resolution)
         y_max = int((y + width/2)/self.resolution)
-        self.cone_map[y_min:y_max, x_min:x_max] = 100
+        self.detected_object_map[y_min:y_max, x_min:x_max] = 100
 
-        marker = Marker()
-        marker.header.frame_id = "map"
-        marker.type = Marker.SPHERE
-        marker.action = Marker.ADD
-        marker.id = self.num_detected_objects
-        marker.scale.x = 0.1
-        marker.scale.y = 0.1
-        marker.scale.z = 0.1
-        marker.color.a = 1.0
-        marker.color.r = 0.0
-        marker.color.g = 1.0
-        marker.color.b = 0.0
-        marker.pose.position.x = x
-        marker.pose.position.y = y
-        marker.pose.position.z = 0.1
+        # Create a marker for the object to show in RViz
+        marker = self.get_marker(x, y, self.num_detected_objects)
         self.object_marker_array.markers.append(marker)     
-        self.object_publisher.publish(self.object_marker_array)
+        self.object_marker_publisher.publish(self.object_marker_array)
 
     def object_from_sensor_callback(self, msg):
         object_array = msg.objects
@@ -700,11 +661,14 @@ class Map:
 
             new_object_list.append([x, y, width])
 
+            # Check if the object already exists in the detected objects
             obj_exists = False
             for detected_obj in self.detected_objects:
                 if np.sqrt((detected_obj[0] - x)**2 + (detected_obj[1] - y)**2) < width:
                     obj_exists = True
 
+
+            # Keep track of objects sensed by this sensor
             obj_num = 0
             if sensor_id in list(self.sensor_objects.keys()):
                 for sens_obj in self.sensor_objects[sensor_id]:
@@ -713,6 +677,7 @@ class Map:
                         break
                     obj_num += 1
 
+            # If the object does not already exist, add it to the detected objects
             if not obj_exists:
                 self.detected_objects.append([x, y, width])
                 self.num_detected_objects += 1
@@ -723,25 +688,11 @@ class Map:
                 x_max = int((x + width/2)/self.resolution)
                 y_min = int((y - width/2)/self.resolution)
                 y_max = int((y + width/2)/self.resolution)
-                self.cone_map[y_min:y_max, x_min:x_max] = 100
+                self.detected_object_map[y_min:y_max, x_min:x_max] = 100
 
-                marker = Marker()
-                marker.header.frame_id = "map"
-                marker.type = Marker.SPHERE
-                marker.action = Marker.ADD
-                marker.id = self.num_detected_objects
-                marker.scale.x = 0.1
-                marker.scale.y = 0.1
-                marker.scale.z = 0.1
-                marker.color.a = 1.0
-                marker.color.r = 0.0
-                marker.color.g = 1.0
-                marker.color.b = 0.0
-                marker.pose.position.x = x
-                marker.pose.position.y = y
-                marker.pose.position.z = 0.1
+                marker = self.get_marker(x, y, self.num_detected_objects)
                 self.object_marker_array.markers.append(marker)     
-        self.object_publisher.publish(self.object_marker_array)
+        self.object_marker_publisher.publish(self.object_marker_array)
 
         # Remove the objects that were not sensed
         if sensor_id in list(self.sensor_objects.keys()):
@@ -756,7 +707,7 @@ class Map:
                             x_max = int((obj[0] + obj[2]/2)/self.resolution)
                             y_min = int((obj[1] - obj[2]/2)/self.resolution)
                             y_max = int((obj[1] + obj[2]/2)/self.resolution)
-                            self.cone_map[y_min:y_max, x_min:x_max] = 0
+                            self.detected_object_map[y_min:y_max, x_min:x_max] = -1
                             break
                     # Remove the marker
                     print("Removed object from sensor")
@@ -768,10 +719,32 @@ class Map:
                         if np.sqrt((marker.pose.position.x - old_x)**2 + (marker.pose.position.y - old_y)**2) < old_width:
                             self.object_marker_array.markers[j].action = Marker.DELETE
                             break
-                    self.object_publisher.publish(self.object_marker_array)
+                    self.object_marker_publisher.publish(self.object_marker_array)
 
         # Update the sensor objects
         self.sensor_objects[sensor_id] = new_object_list
+
+    def get_marker(self, x, y, id, scale=0.1, r=0.0, g=1.0, b=0.0):
+        """
+        Create a marker for the detected object at position (x, y).
+        """
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.id = id
+        marker.scale.x = scale
+        marker.scale.y = scale
+        marker.scale.z = scale
+        marker.color.a = 1.0
+        marker.color.r = r
+        marker.color.g = g
+        marker.color.b = b
+        marker.pose.position.x = x
+        marker.pose.position.y = y
+        marker.pose.position.z = 0.1
+
+        return marker
 
     def person_callback(self, msg):        
         person_array = msg.persons
