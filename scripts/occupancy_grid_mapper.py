@@ -344,7 +344,7 @@ class Map:
         unique_points, unique_indx = np.unique(np.column_stack((x_global_indx, y_global_indx)), axis=0, return_index=True)
 
         # Get camera indices
-        (camera_x, camera_y) = self.new_map_as_np.snap_to_grid((camera_x, camera_y))
+        (camera_x, camera_y) = self.new_map_as_np.snap_to_grid((camera_location[0], camera_location[1]))
         (camera_x_indx, camera_y_indx) = self.new_map_as_np.get_index((camera_x, camera_y))
 
         t21 = time.time()
