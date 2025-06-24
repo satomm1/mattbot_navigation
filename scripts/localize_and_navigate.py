@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import time
 import rospy
 from nav_msgs.msg import OccupancyGrid, MapMetaData, Path
 from geometry_msgs.msg import Twist, Pose2D, PoseStamped
@@ -9,6 +8,8 @@ from visualization_msgs.msg import Marker, MarkerArray
 from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray
 from mattbot_dds.msg import AgentPath, AgentLocation
 import tf
+
+import time
 import numpy as np
 from numpy import linalg
 import scipy.interpolate
@@ -26,21 +27,24 @@ RHO_THRES = 0.05
 ALPHA_THRES = 0.1
 DELTA_THRES = 0.1
 
+PERSON_STOP_DISTANCE = 1.6  # distance to closest person at which we stop the robot
+PERSON_SLOW_DISTANCE = 2.5  # distance to closest person at which we slow down the robot
+
 class Mode(Enum):
-    IDLE = 0
-    ALIGN = 1
-    TRACK = 2
-    PARK = 3
-    BACKING = 4       
-   
+    IDLE = 0        # not moving, waiting for a goal
+    LOCALIZING = 1  # localizing the robot
+    ALIGN = 2       # aligning to start heading of the path
+    TRACK = 3       # tracking the path (following the trajectory)
+    PARK = 4        # parking the robot (moving to a specific pose)
+    BACKING = 5     # backing up when stuck
 
 class Navigator:
     """
-    This node handles point to point turtlebot motion, avoiding obstacles.
+    This node handles point to point mattbot motion, avoiding obstacles.
     It is the sole node that should publish to cmd_vel
     """
 
-    def __init__(self, server_url='http://192.168.50.2:8000/graphql'):
+    def __init__(self):
         rospy.init_node("mattbot_navigator", anonymous=True)
         self.mode = Mode.IDLE
 
@@ -75,23 +79,10 @@ class Navigator:
         self.person_list3 = []
         self.stopped_for_person_time = rospy.get_rostime().to_sec()
 
-        self.server_url = server_url
-        self.stopped_robot_location_query = """
-                                            {
-                                                stoppedRobotPositions {
-                                                    id
-                                                    x
-                                                    y
-                                                    theta 
-                                                }
-                                            }
-                                            """
-
-        self.other_agents_paths = dict()
         self.other_agents_goals = dict()
         self.other_agents_at_goal = []
-        self.other_agents_static = []
-        self.other_agents_locations = dict()
+        self.other_agents_static = []  # list of agent ID's that are static (not moving)
+        self.other_agents_locations = dict()  # agent ID -> [x, y, theta, time]
                                             
         # plan parameters
         self.plan_resolution = 0.1
@@ -167,7 +158,6 @@ class Navigator:
 
         # Get map parameter to determine what map to use
         map_name = rospy.get_param('map_name', '/map')
-        # map_name = "/map"
 
         # Distance to closest person --- determines if we should slow down or stop
         self.distance_to_person = np.inf
@@ -178,9 +168,7 @@ class Navigator:
         rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.rviz_goal_callback)
         rospy.Subscriber("/external_goal", Pose2D, self.external_goal_callback)
         rospy.Subscriber("/voice_goal", Pose2D, self.external_goal_callback)
-        rospy.Subscriber("/path_from_agent", AgentPath, self.path_from_agent_callback)
         rospy.Subscriber("/agent_location", AgentLocation, self.agent_location_callback)
-        rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
         self.localized_sub = rospy.Subscriber("/localized", Bool, self.localized_callback)
 
         self.has_stopped = False
@@ -188,14 +176,7 @@ class Navigator:
         self.waypoints = []
         self.backing_start_time = 0
 
-    def dyn_cfg_callback(self, config, level):
-        rospy.loginfo(
-            "Reconfigure Request: k1:{k1}, k2:{k2}, k3:{k3}".format(**config)
-        )
-        self.pose_controller.k1 = config["k1"]
-        self.pose_controller.k2 = config["k2"]
-        self.pose_controller.k3 = config["k3"]
-        return config
+        self.switch_mode(Mode.LOCALIZING)
 
     def cmd_nav_callback(self, data):
         """
@@ -211,6 +192,65 @@ class Navigator:
             self.y_g = data.y
             self.theta_g = data.theta
             self.replan()
+
+    def external_goal_callback(self, msg):
+        """
+        Callback for external goals, such as from voice commands or from DDS
+        """
+        # Make sure the goal is different from the current goal
+        if (
+            self.x_g is not None
+            and self.y_g is not None
+            and self.theta_g is not None
+            and (msg.x == self.x_g and msg.y == self.y_g and msg.theta == self.theta_g)
+        ):
+            rospy.loginfo("External goal is the same as current goal, ignoring")
+            return
+
+        # Stop the bot
+        if self.mode != Mode.IDLE:
+            cmd_vel = Twist()
+            cmd_vel.linear.x = 0.0
+            cmd_vel.angular.z = 0.0
+            self.nav_vel_pub.publish(cmd_vel)
+
+            self.switch_mode(Mode.IDLE)
+
+        # Make sure we have an occupancy grid and that the goal is valid
+        if self.occupancy is not None and not self.occupancy.is_free((msg.x, msg.y)):
+            rospy.loginfo("Not a valid goal")
+            return
+        
+        # Update the goal
+        self.x_g = msg.x
+        self.y_g = msg.y
+        self.theta_g = msg.theta
+        self.replan()
+
+    def rviz_goal_callback(self, msg):
+        """
+        Callback for RViz goals, transforms the goal to the map frame and checks if it is valid
+        """
+        
+        print("RViz goal received")
+        origin_frame = "map"
+        try:
+            nav_pose_origin = self.trans_listener.transformPose(origin_frame, msg)
+            x_g_proposed = nav_pose_origin.pose.position.x
+            y_g_proposed = nav_pose_origin.pose.position.y            
+            quaternion = (nav_pose_origin.pose.orientation.x, nav_pose_origin.pose.orientation.y, nav_pose_origin.pose.orientation.z, nav_pose_origin.pose.orientation.w)
+            euler = tf.transformations.euler_from_quaternion(quaternion)
+
+            # Send goal to the external goal callback for processing
+            new_msg = Pose2D()
+            new_msg.x = x_g_proposed
+            new_msg.y = y_g_proposed
+            new_msg.theta = euler[2]
+            self.external_goal_callback(new_msg)
+
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+            print("RVIZ Goal exception:")
+            print(e)
 
     def map_md_callback(self, msg):
         """
@@ -242,200 +282,34 @@ class Navigator:
                 self.map_probs,
             )
 
-            self.person_occupancy = StochOccupancyGrid2D(
-                self.map_resolution,
-                self.map_width,
-                self.map_height,
-                self.map_origin[0],
-                self.map_origin[1],
-                5,
-                np.zeros((self.map_width * self.map_height,)),  # initialize with zeros     
-            )
-
-            if self.x_g is not None:
-                # if we have a goal to plan to, replan
-                pass
-                # rospy.loginfo("replanning because of new map")
-                # self.replan()  # new map, need to replan
-
-    def rviz_goal_callback(self, msg):
-        print("RViz goal received")
-        origin_frame = "map"
-        try:
-            nav_pose_origin = self.trans_listener.transformPose(origin_frame, msg)
-            x_g_proposed = nav_pose_origin.pose.position.x
-            y_g_proposed = nav_pose_origin.pose.position.y
-
-            if not self.occupancy.is_free((x_g_proposed, y_g_proposed)):
-                rospy.loginfo("Not a valid goal")
-                return
-            
-            self.x_g = x_g_proposed
-            self.y_g = y_g_proposed
-
-            quaternion = (nav_pose_origin.pose.orientation.x, nav_pose_origin.pose.orientation.y, nav_pose_origin.pose.orientation.z, nav_pose_origin.pose.orientation.w)
-            euler = tf.transformations.euler_from_quaternion(quaternion)
-            self.theta_g = euler[2]
-            print(self.x_g)
-            print(self.y_g)
-            print(self.theta_g)
-            self.replan()
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
-            print("RVIZ Goal exception:")
-            print(e)
-    
-    def external_goal_callback(self, msg):
-
-        # Stop the bot
-        if self.mode != Mode.IDLE:
-            cmd_vel = Twist()
-            cmd_vel.linear.x = 0.0
-            cmd_vel.angular.z = 0.0
-            self.nav_vel_pub.publish(cmd_vel)
-
-            self.switch_mode(Mode.IDLE)
-
-        x_g_proposed = msg.x
-        y_g_proposed = msg.y
-
-        if self.occupancy is not None and not self.occupancy.is_free((x_g_proposed, y_g_proposed)):
-            rospy.loginfo("Not a valid goal")
-            return
-        
-        self.x_g = x_g_proposed
-        self.y_g = y_g_proposed
-        self.theta_g = msg.theta
-        self.replan()
-
-    def person_intersect_path(self):
-        # Use the self.person_occupancy to check if the path intersects with a person
-        person_probs = self.person_occupancy.get_probs()
-        path = self.current_plan
-
-        for point in path:
-            grid_x = int((point[0] - self.map_origin[0]) / self.map_resolution)
-            grid_y = int((point[1] - self.map_origin[1]) / self.map_resolution)
-            if (0 <= grid_x < self.map_width) and (0 <= grid_y < self.map_height):
-                if person_probs[grid_y, grid_x] > 0.5:  # Assuming a threshold of 0.5
-                    return True
-
-        return False
-
-    def detected_objects_callback(self, msg):
-        """
-        receives detected objects and updates the map
-        """
-
-        # Each detection stays for 3 frames
-        self.person_list3 = self.person_list2
-        self.person_list2 = self.person_list1
-        self.person_list1 = []
-
-        # Get the distance to the closest person
-        closest_person_dist = np.inf
-        person_probs = np.zeros((self.map_height, self.map_width))
-
-        for obj in msg.objects:
-            if obj.class_name != "person":
-                continue
-
-            x = obj.pose.position.x
-            y = obj.pose.position.y
-            self.person_list1.append((x, y))
-
-        for (x,y) in self.person_list1 + self.person_list2 + self.person_list3:
-            # assume person occupies a circle of radius 0.3m
-            radius = 0.3
-            grid_x = int((x - self.map_origin[0]) / self.map_resolution)
-            grid_y = int((y - self.map_origin[1]) / self.map_resolution)
-            grid_x = np.clip(grid_x, 0, self.map_width - 1)
-            grid_y = np.clip(grid_y, 0, self.map_height - 1)
-            # Update the person occupancy grid
-            for i in range(-self.person_occupancy.window_size//2, self.person_occupancy.window_size//2 + 1):
-                for j in range(-self.person_occupancy.window_size//2, self.person_occupancy.window_size//2 + 1):
-                    if (0 <= grid_x + i < self.map_width) and (0 <= grid_y + j < self.map_height):
-                        dist = np.sqrt(i**2 + j**2) * self.map_resolution
-                        if dist <= radius:
-                            person_probs[grid_y + j, grid_x + i] = 1.0  # Mark as occupied
-
-            dist_to_person = np.linalg.norm(np.array([x - self.x, y - self.y]))
-
-            if dist_to_person < closest_person_dist:
-                closest_person_dist = dist_to_person
-        self.distance_to_person = closest_person_dist
-
-        self.person_occupancy.update(person_probs)
-
-        self.person_in_path = self.person_intersect_path()
-
-        # # self.detected_objects = []
-
-        # num_existing_objects = len(self.detected_objects)
-        # indx_matching_objects = []
-
-        # object_array = msg.objects
-        # for obj in object_array:
-        #     x = obj.pose.position.x
-        #     y = obj.pose.position.y
-        #     w = obj.width
-
-        #     object_already_exists = False
-        #     for i in range(len(self.detected_objects)):
-        #         if np.linalg.norm(np.array([x - self.detected_objects[i][0], y - self.detected_objects[i][1]]) < 0.2):
-        #             self.detected_objects[i] = (x, y, w, 0)
-        #             object_already_exists = True
-        #             indx_matching_objects.append(i)
-        #             break
-            
-        #     if not object_already_exists:
-        #         self.detected_objects.append((x, y, w, 0))
-
-        # # Increment the counter for objects that were not detected
-        # for i in range(num_existing_objects):
-        #     if i not in indx_matching_objects:
-        #         self.detected_objects[i] = (self.detected_objects[i][0], self.detected_objects[i][1], self.detected_objects[i][2], self.detected_objects[i][3] + 1)
-        
-        # # Remove objects that were not detected for a certain number of frames
-        # self.detected_objects = [obj for obj in self.detected_objects if obj[3] < 60]
-
-            
-        #     # Add to list if doesn't already exist
-        #     # if not any(
-        #     #     np.linalg.norm(np.array([x - existing_obj[0], y - existing_obj[1]]) < 0.2)
-        #     #     for existing_obj in self.detected_objects
-        #     # ):
-        #     #     self.detected_objects.append((x, y, w, 0))
-
+            if self.person_occupancy is None:
+                self.person_occupancy = StochOccupancyGrid2D(
+                    self.map_resolution,
+                    self.map_width,
+                    self.map_height,
+                    self.map_origin[0],
+                    self.map_origin[1],
+                    5,
+                    np.zeros((self.map_width * self.map_height,)),  # initialize with zeros     
+                )
 
     def localized_callback(self, msg):
         self.is_localized = msg.data
 
-    def path_from_agent_callback(self, msg):
-        """
-        receives path from agent and updates the map
-        """
-        agent_id = msg.agentID.data
-        path = msg.path
-        goal = [path.poses[-1].pose.position.x, path.poses[-1].pose.position.y]
-        self.other_agents_paths[agent_id] = path
-        self.other_agents_goals[agent_id] = goal
-
-        # Agent not at goal
-        if agent_id in self.other_agents_at_goal:
-            self.other_agents_at_goal.remove(agent_id)
-
-        print("received new path from agent")
-
     def agent_location_callback(self, msg):
-        
-
+        """
+        Callback for /agent_location topic.
+        Updates the location of other agents and checks if they are static.
+        """
         current_time = rospy.get_rostime()
         agent_id = msg.agentID.data
 
+        # Keep track of the previous pose of the agent (if it exists)
         prev_pose = None
         if agent_id in self.other_agents_locations:
             prev_pose = self.other_agents_locations[agent_id]
 
+        # Get agent's pose and time
         agent_pose = msg.pose
         x = agent_pose.position.x
         y = agent_pose.position.y
@@ -444,6 +318,7 @@ class Navigator:
         theta = euler[2]
         self.other_agents_locations[agent_id] = [x, y, theta, current_time]
 
+        # Check if agent is moving
         if prev_pose is not None:
             if np.linalg.norm(np.array([x - prev_pose[0], y - prev_pose[1]]) < 0.1) and np.abs(theta - prev_pose[2]) < 0.1:
                 if agent_id not in self.other_agents_static:
@@ -452,44 +327,22 @@ class Navigator:
                 if agent_id in self.other_agents_static:
                     self.other_agents_static.remove(agent_id)
 
-    def shutdown_callback(self):
+    def aligned(self):
         """
-        publishes zero velocities upon rospy shutdown
+        returns whether robot is aligned with starting direction of path
+        (enough to switch to tracking controller)
         """
-        cmd_vel = Twist()
-        cmd_vel.linear.x = 0.0
-        cmd_vel.angular.z = 0.0
-        self.nav_vel_pub.publish(cmd_vel)
+        return (
+            abs(wrapToPi(self.theta - self.th_init)) < self.theta_start_thresh
+        )
 
-    def modify_velocity_for_person(self, V, om):
+    def aligned_goal(self):
         """
-        Modifies the velocity based on the distance to the closest person.
-        If the distance is less than a threshold, it slows down or stops the robot.
+        returns whether robot is aligned with goal direction
         """
-        if self.distance_to_person < 1.6 and self.person_in_path:
-            # Stop
-            V = 0.0
-            om = 0.0
-            
-            # Keep track of how long we've been stopped
-            if not self.robot_stopped_by_person:
-                self.stopped_for_person_time = rospy.get_rostime().to_sec()
-                print("Stopping for person")
-
-            self.robot_stopped_by_person = True
-        elif self.distance_to_person < 2.5:
-            # Slow down
-            V *= 0.5
-            om *= 0.5
-        elif self.robot_stopped_by_person:
-            # If we were stopped by a person, we can start moving again
-            self.robot_stopped_by_person = False
-
-            print("Resuming motion after stopping for person")
-
-            self.replan()
-
-        return V, om
+        return (
+            abs(wrapToPi(self.theta - self.theta_g)) < self.theta_goal_thresh
+        )
 
     def near_goal(self):
         """
@@ -511,8 +364,8 @@ class Navigator:
             < self.at_thresh
             and abs(wrapToPi(self.theta - self.theta_g)) < self.at_thresh_theta
         )
-
-    def aligned(self):
+    
+    def aligned_start(self):
         """
         returns whether robot is aligned with starting direction of path
         (enough to switch to tracking controller)
@@ -528,7 +381,7 @@ class Navigator:
         return (
             abs(wrapToPi(self.theta - self.theta_g)) < self.theta_goal_thresh
         )
-
+    
     def close_to_plan_start(self):
         return (
             abs(self.x - self.plan_start[0]) < self.start_pos_thresh
@@ -546,6 +399,112 @@ class Navigator:
         self.mode = new_mode
         self.state_pub.publish(self.mode.value)
 
+    def person_intersect_path(self):
+        """
+        Use the self.person_occupancy to check if the path intersects with a person
+        """
+        person_probs = self.person_occupancy.get_probs()
+        path = self.current_plan
+
+        for point in path:
+            grid_x = int((point[0] - self.map_origin[0]) / self.map_resolution)
+            grid_y = int((point[1] - self.map_origin[1]) / self.map_resolution)
+            if (0 <= grid_x < self.map_width) and (0 <= grid_y < self.map_height):
+                if person_probs[grid_y, grid_x] > 0.5:  # Assuming a threshold of 0.5
+                    return True
+
+        return False
+    
+    def detected_objects_callback(self, msg):
+        """
+        receives detected objects, only looks at people and stores their location in the 
+        self.person_occupancy occupancy grid map
+        """
+
+        # Each detection stays valid for 3 frames
+        self.person_list3 = self.person_list2  # 2 frames ago
+        self.person_list2 = self.person_list1
+        self.person_list1 = []  # Most recent --- now
+
+        # Get the distance to the closest person
+        closest_person_dist = np.inf
+        person_probs = np.zeros((self.map_height, self.map_width))
+
+        for obj in msg.objects:
+            if obj.class_name != "person":
+                continue
+
+            x = obj.pose.position.x
+            y = obj.pose.position.y
+            self.person_list1.append((x, y))
+
+        for (x,y) in self.person_list1 + self.person_list2 + self.person_list3: 
+            radius = 0.3  # assume person occupies a circle of radius 0.3m
+
+            # Get x,y coordinates in terms of gird coordinates
+            grid_x = int((x - self.map_origin[0]) / self.map_resolution)
+            grid_y = int((y - self.map_origin[1]) / self.map_resolution)
+
+            # make sure coordinates are within map
+            grid_x = np.clip(grid_x, 0, self.map_width - 1)
+            grid_y = np.clip(grid_y, 0, self.map_height - 1)
+
+            # Update the person occupancy grid
+            # TODO Vectorize this
+            for i in range(-self.person_occupancy.window_size//2, self.person_occupancy.window_size//2 + 1):
+                for j in range(-self.person_occupancy.window_size//2, self.person_occupancy.window_size//2 + 1):
+                    if (0 <= grid_x + i < self.map_width) and (0 <= grid_y + j < self.map_height):
+                        dist = np.sqrt(i**2 + j**2) * self.map_resolution
+                        if dist <= radius:
+                            person_probs[grid_y + j, grid_x + i] = 1.0  # Mark as occupied
+
+            dist_to_person = np.linalg.norm(np.array([x - self.x, y - self.y]))
+
+            if dist_to_person < closest_person_dist:
+                closest_person_dist = dist_to_person
+        self.distance_to_person = closest_person_dist
+
+        self.person_occupancy.update(person_probs)
+
+        self.person_in_path = self.person_intersect_path()
+
+    def modify_velocity_for_person(self, V, om):
+        """
+        Modifies the velocity based on the distance to the closest person.
+        If the distance is less than a threshold, it slows down or stops the robot.
+        """
+        if self.distance_to_person < PERSON_STOP_DISTANCE and self.person_in_path:
+            # Stop
+            V = 0.0
+            om = 0.0
+            
+            # Keep track of how long we've been stopped
+            if not self.robot_stopped_by_person:
+                self.stopped_for_person_time = rospy.get_rostime().to_sec()
+                print("Stopping for person")
+
+            self.robot_stopped_by_person = True
+        elif self.distance_to_person < PERSON_SLOW_DISTANCE:
+            # Slow down
+            V *= 0.5
+            om *= 0.5
+        elif self.robot_stopped_by_person:
+            # If we were stopped by a person, we can start moving again
+            self.robot_stopped_by_person = False
+
+            print("Resuming motion after stopping for person")
+
+            self.replan()
+
+        return V, om
+    
+    def path_still_valid(self, path):
+        for point in path:
+            if not self.occupancy.is_free(point):
+                print("Path no longer valid...")
+                return False
+        return True
+    
     def publish_planned_path(self, path, publisher):
         # publish planned plan for visualization
         path_msg = Path()
@@ -576,115 +535,10 @@ class Navigator:
             path_msg.poses.append(pose_st)
         publisher.publish(path_msg)
 
-    def path_intersects_obstacle(self, path):
-        for point in path:
-            for obj in self.detected_objects:
-                x_obj, y_obj, obj_diameter, _ = obj
-                distance = np.sqrt((point[0] - x_obj)**2 + (point[1] - y_obj)**2)
-                if distance <= obj_diameter/2 + 0.3: # 0.3 is the radius of the robot
-                    obj_x = []
-                    obj_y = []
-                    obj_d = []
-                    for obj in self.detected_objects:
-                        obj_x.append(obj[0])
-                        obj_y.append(obj[1])
-                        obj_d.append(obj[2])
-                    return True, obj_x, obj_y, obj_d
-        return False, [], [], []
-
-    def path_still_valid(self, path):
-        for point in path:
-            if not self.occupancy.is_free(point):
-                print("Path no longer valid...")
-                print(point)
-                return False
-        return True
-
-    def publish_control(self):
-        """
-        Runs appropriate controller depending on the mode. Assumes all controllers
-        are all properly set up / with the correct goals loaded
-        """
-        t = self.get_current_plan_time()
-
-        if self.mode == Mode.PARK:
-            # V, om = self.pose_controller.compute_control(
-            #     self.x, self.y, self.theta, t
-            # )
-            V, om = self.heading_controller.compute_control(
-                self.x, self.y, self.theta, t
-            )
-        elif self.mode == Mode.TRACK:
-            V, om = self.traj_controller.compute_control(
-                self.x, self.y, self.theta, t
-            )
-
-            # Check if we need to modify the velocity for a person
-            V, om = self.modify_velocity_for_person(V, om)
-        elif self.mode == Mode.ALIGN:
-            V, om = self.heading_controller.compute_control(
-                self.x, self.y, self.theta, t
-            )
-        elif self.mode == Mode.BACKING:
-            V = -0.3
-            om = 0.0
-        else:
-            V = 0.0
-            om = 0.0
-
-        self.prev_om = om
-
-        cmd_vel = Twist()
-        cmd_vel.linear.x = V
-        cmd_vel.angular.z = om
-        self.nav_vel_pub.publish(cmd_vel)
-
     def get_current_plan_time(self):
-
+        # returns the time since the current plan started
         t = (rospy.get_rostime() - self.current_plan_start_time).to_sec()
         return max(0.0, t)  # clip negative time to 0
-
-    def get_stopped_robot_locations(self):
-        # Query using graphql
-        response = requests.post(self.server_url, json={'query': self.stopped_robot_location_query})
-        data = response.json()
-
-        # Extract the data
-        position_data = data.get('data', {}).get('stoppedRobotPositions', {})
-        x = []
-        y = []
-        theta = []
-
-        my_id = int(os.environ.get('ROBOT_ID'))
-        for robot in position_data:
-            if robot.get('id') != my_id:
-                x.append(robot.get('x'))
-                y.append(robot.get('y'))
-                theta.append(robot.get('theta'))
-        return x, y, theta
-
-    def paths_intersect(self, planned_path, planned_times, other_path):
-        current_time = rospy.get_rostime()
-        for pose in other_path.poses:
-            other_time = pose.header.stamp
-
-            # Time already passed
-            if other_time < current_time:
-                continue
-
-            for ii in range(len(planned_path)):
-                planned_time = planned_times[ii] + current_time
-                
-                # Times are close enough
-                if np.abs(planned_time.to_sec() - other_time.to_sec()) < 0.5:
-                    point = planned_path[ii]
-                    distance = np.sqrt((point[0] - pose.pose.position.x)**2 + (point[1] - pose.pose.position.y)**2)
-
-                    # Agents are close enough
-                    if distance < 0.5:
-                        return True
-                    
-        return False
 
     def replan(self, obj_x=[], obj_y=[], obj_d=[]):
         """
@@ -703,59 +557,31 @@ class Navigator:
                 "Navigator: replanning canceled, waiting for occupancy map."
             )
             self.switch_mode(Mode.IDLE)
-            return
+            return  
+        elif self.mode == Mode.TRACK:
+            return  # don't replan if we are already tracking a plan
 
         current_time = rospy.get_rostime()
-        # Remove old paths
-        agents_to_remove = []
-        for agent_id, path in self.other_agents_paths.items():
-            if len(path.poses) == 0:
-                continue
-            
-            goal_time = path.poses[-1].header.stamp
-            if goal_time < current_time:
-                agents_to_remove.append(agent_id)
-                continue
-        for agent_id in agents_to_remove:
-            del self.other_agents_paths[agent_id]
-
-        # # Check if other robot goals are close to ours
-        # for agent_id, goal in self.other_agents_goals.items():
-        #     if np.linalg.norm(np.array([self.x_g - goal[0], self.y_g - goal[1]]) < 0.5):
-        #         # rospy.loginfo("Other agent is close to our goal. Waiting for them to move.")
-        #         # self.switch_mode(Mode.IDLE)
-        #         continue
-        #         # TODO: 
-
+ 
         # Attempt to plan a path
         state_min = self.snap_to_grid((-self.plan_horizon, -self.plan_horizon))
         state_max = self.snap_to_grid((self.plan_horizon, self.plan_horizon))
         x_init = self.snap_to_grid((self.x, self.y))
         self.plan_start = x_init
         x_goal = self.snap_to_grid((self.x_g, self.y_g))
-        # robots_x, robots_y, robots_theta = self.get_stopped_robot_locations()
-        robots_x = []
-        robots_y = []
+
+        # Get locations of agents who are static
+        robots_x = []  # list of x coordinates of other agents who are static
+        robots_y = []  # list of y coordinates of other agents who are static
         for agent_id in self.other_agents_static:
-            agent_x, agent_y, agent_theta, _ = self.other_agents_locations[agent_id]
+            agent_x, agent_y, _, _ = self.other_agents_locations[agent_id]
             robots_x.append(agent_x)
             robots_y.append(agent_y)
 
-        combined_occupancy = self.occupancy + self.person_occupancy
+        combined_occupancy = self.occupancy
 
-        problem = AStar(
-            state_min,
-            state_max,
-            x_init,
-            x_goal,
-            combined_occupancy,
-            self.plan_resolution,
-            robots_x=robots_x,
-            robots_y=robots_y,
-            obj_x=obj_x,
-            obj_y=obj_y,
-            obj_d=obj_d
-        )
+        problem = AStar(state_min, state_max, x_init, x_goal, combined_occupancy, self.plan_resolution,
+            robots_x=robots_x, robots_y=robots_y, obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
 
         rospy.loginfo("Navigator: computing navigation plan")
         success = problem.solve()
@@ -796,53 +622,11 @@ class Navigator:
             planned_path, self.v_des, self.spline_deg, self.spline_alpha, self.traj_dt
         )
 
-        # If currently tracking a trajectory, check whether new trajectory will take more time to follow
-        if self.mode == Mode.TRACK:
-            t_remaining_curr = (
-                self.current_plan_duration - self.get_current_plan_time()
-            )
-
-            # Estimate duration of new trajectory
-            th_init_new = traj_new[0, 2]
-            th_err = wrapToPi(th_init_new - self.theta)
-            t_init_align = abs(th_err / self.om_max)
-            t_remaining_new = t_init_align + t_new[-1]
-
-            if self.replanning_from_object:
-                self.publish_planned_path(planned_path, self.nav_planned_path_pub)
-                self.publish_smoothed_path(traj_new, self.nav_smoothed_path_pub, times=t_new)
-
-                self.pose_controller.load_goal(self.x_g, self.y_g, self.theta_g)
-                self.traj_controller.load_traj(t_new, traj_new)
-                self.current_plan = traj_new
-                self.unsmoothed_plan = planned_path
-
-                self.current_plan_start_time = rospy.get_rostime()
-                self.current_plan_duration = t_new[-1]
-
-                self.th_init = traj_new[0, 2]
-                self.heading_controller.load_goal(self.th_init)
-
-                if not self.aligned():
-                    rospy.loginfo("Not aligned with start direction")
-                    self.switch_mode(Mode.ALIGN)
-                    return
-
-                rospy.loginfo("Ready to track")
-                self.switch_mode(Mode.TRACK)
-            elif t_remaining_new > t_remaining_curr:
-                rospy.loginfo(
-                    "New plan rejected (longer duration than current plan)"
-                )
-                # self.publish_smoothed_path(
-                #     traj_new, self.nav_smoothed_path_rej_pub
-                # )
-                return
-
-        # Otherwise follow the new plan
+        # Publish the new plan
         self.publish_planned_path(planned_path, self.nav_planned_path_pub)
         self.publish_smoothed_path(traj_new, self.nav_smoothed_path_pub, times=t_new)
 
+        # Load the new trajectory into the controllers
         self.pose_controller.load_goal(self.x_g, self.y_g, self.theta_g)
         self.traj_controller.load_traj(t_new, traj_new)
         self.current_plan = traj_new
@@ -860,7 +644,6 @@ class Navigator:
         th_init_new = traj_new[0, 2]
         th_err = wrapToPi(th_init_new - self.theta)
         t_init_align = abs(th_err / self.om_max)
-        current_time = rospy.get_rostime().to_sec()
         for i in range(20, len(traj_new), 20):
             self.waypoints.append([traj_new[i, 0], traj_new[i, 1], t_new[i]+2])  # +2 to add a buffer +t_init_align+current_time
             marker = Marker()
@@ -886,49 +669,67 @@ class Navigator:
             rospy.loginfo("Not aligned with start direction")
             self.switch_mode(Mode.ALIGN)
             return
+        else:
+            rospy.loginfo("Ready to track")
+            self.switch_mode(Mode.TRACK)
 
-        rospy.loginfo("Ready to track")
-        self.switch_mode(Mode.TRACK)
-
-    def localize(self):
+    def publish_control(self):
         """
-        Rotates slowly to localize the robot
+        Runs appropriate controller depending on the mode. Assumes all controllers
+        are all properly set up / with the correct goals loaded
         """
-        rate = rospy.Rate(10)  # 10 Hz
-        while not self.is_localized:
-            # rotate until we get a valid position
-            cmd_vel = Twist()
-            cmd_vel.angular.z = 1.5
-            self.nav_vel_pub.publish(cmd_vel)
+        t = self.get_current_plan_time()
 
-            rate.sleep()
+        if self.mode == Mode.PARK:
+            V, om = self.heading_controller.compute_control(
+                self.x, self.y, self.theta, t
+            )
+        elif self.mode == Mode.TRACK:
+            V, om = self.traj_controller.compute_control(
+                self.x, self.y, self.theta, t
+            )
 
-        # Display message that we have localized
-        rospy.loginfo("Navigator: localized")
+            # Check if we need to modify the velocity for a person
+            V, om = self.modify_velocity_for_person(V, om)
+        elif self.mode == Mode.ALIGN:
+            V, om = self.heading_controller.compute_control(
+                self.x, self.y, self.theta, t
+            )
+        elif self.mode == Mode.BACKING:
+            V = -0.3
+            om = 0.0
+        elif self.mode == Mode.LOCALIZING:
+            V = 0.0
+            om = 1.5
+        else:
+            V = 0.0
+            om = 0.0
 
-        # Unsubscribe from the localized topic
-        self.is_localized = True
-        self.localized_sub.unregister()
-        self.localized_sub = None
+        self.prev_om = om
 
-        # Now that we are localized, we can stop the robot
         cmd_vel = Twist()
-        cmd_vel.angular.z = 0.0
+        cmd_vel.linear.x = V
+        cmd_vel.angular.z = om
         self.nav_vel_pub.publish(cmd_vel)
-
+    
     def run(self):
+        """
+        Main loop of the navigator node.
+        """
+
         rate = rospy.Rate(10)  # 10 Hz
         while not rospy.is_shutdown():
         
             # try to get state information to update self.x, self.y, self.theta
             try:
-                (translation, rotation) = self.trans_listener.lookupTransform(
-                    "/map", "/base_footprint", rospy.Time(0)
-                )
-                self.x = translation[0]
-                self.y = translation[1]
-                euler = tf.transformations.euler_from_quaternion(rotation)
-                self.theta = euler[2]
+                if self.mode != Mode.LOCALIZING:
+                    (translation, rotation) = self.trans_listener.lookupTransform(
+                        "/map", "/base_footprint", rospy.Time(0)
+                    )
+                    self.x = translation[0]
+                    self.y = translation[1]
+                    euler = tf.transformations.euler_from_quaternion(rotation)
+                    self.theta = euler[2]
             except (
                 tf.LookupException,
                 tf.ConnectivityException,
@@ -942,37 +743,37 @@ class Navigator:
 
             self.replanning_from_object = False
 
+            # If not localized, switch to LOCALIZING mode
+            if not self.is_localized and self.mode != Mode.LOCALIZING:
+                rospy.loginfo("Navigator: not localized, switching to LOCALIZING mode")
+                self.switch_mode(Mode.LOCALIZING)
+
             # STATE MACHINE LOGIC
             # some transitions handled by callbacks
             if self.mode == Mode.IDLE:
                 pass
+            elif self.mode == Mode.LOCALIZING:
+                # if we are localized, switch to ALIGN mode
+                if self.is_localized:
+                    rospy.loginfo("Navigator: localized, ready for navigation")
+                    self.switch_mode(Mode.IDLE)
             elif self.mode == Mode.ALIGN:
                 if self.aligned():
                     self.current_plan_start_time = rospy.get_rostime()
                     self.switch_mode(Mode.TRACK)
             elif self.mode == Mode.TRACK:
-                path_blocked, obj_x, obj_y, obj_d = self.path_intersects_obstacle(self.current_plan)
                 current_time = rospy.get_rostime().to_sec()
                 if self.near_goal():
+                    # We are close to goal ---> Switch to pose controller
                     self.heading_controller.load_goal(self.theta_g)
                     print("Setting theta goal to", self.theta_g)
-                    self.switch_mode(Mode.PARK)
-                # elif not self.close_to_plan_start():
-                #     rospy.loginfo("replanning because far from start")
-                #     self.replan()
-                
-                elif(path_blocked):
-                    rospy.loginfo("replanning because path intersects obstacle")
-                    # set controls to zero
-                    self.replanning_from_object = True
-                    self.replan(obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
-                elif(not self.path_still_valid(self.unsmoothed_plan)):
+                    self.switch_mode(Mode.PARK)                
+                elif(not self.path_still_valid(self.current_plan)):
+                    # Path no longer valid ---> replan
                     rospy.loginfo("replanning because path is no longer valid")
-                    # self.replanning_from_object = True
-                    # self.replan()
 
-                    self.switch_mode(Mode.IDLE)
                     # Stop the robot
+                    self.switch_mode(Mode.IDLE)
                     cmd_vel = Twist()
                     cmd_vel.linear.x = 0.0
                     cmd_vel.angular.z = 0.0
@@ -981,17 +782,18 @@ class Navigator:
                     # Now replan
                     self.replan()
                 elif len(self.waypoints) > 0 and not self.robot_stopped_by_person:
+                    # If we have waypoints, check if we have reached them in time
                     if current_time - self.current_plan_start_time.to_sec() > self.waypoints[0][2]:
                         print("******************************************")
                         print("Backing up because haven't reached waypoint")
                         print("******************************************")
-                        # self.replan()
                         self.backing_start_time = current_time
                         self.switch_mode(Mode.BACKING)
                     elif np.linalg.norm(np.array([self.x - self.waypoints[0][0], self.y - self.waypoints[0][1]])) < 0.35:
                         print("Waypoint reached")
                         self.waypoints.pop(0)  # Remove the first waypoint since we are close to it
                 elif self.robot_stopped_by_person and current_time - self.stopped_for_person_time > 5:
+                    # If we have been stopped by a person for more than 5 seconds, replan
 
                     print("******************************************")
                     print("Replanning because person in path")
@@ -1007,6 +809,10 @@ class Navigator:
 
                 elif (rospy.get_rostime() - self.current_plan_start_time).to_sec() > self.current_plan_duration:
                     rospy.loginfo("replanning because out of time")
+
+                    # Stop attempting current plan
+                    self.switch_mode(Mode.IDLE)
+
                     self.replan()  # we aren't near the goal but we thought we should have been, so replan
             elif self.mode == Mode.PARK:
                 # Reached goal: forget goal coordinates and stop
@@ -1033,12 +839,18 @@ class Navigator:
 
             self.publish_control()
             rate.sleep()
-            # time.sleep(0.01)
 
+    def shutdown_callback(self):
+        """
+        publishes zero velocities upon rospy shutdown
+        """
+        cmd_vel = Twist()
+        cmd_vel.linear.x = 0.0
+        cmd_vel.angular.z = 0.0
+        self.nav_vel_pub.publish(cmd_vel)
 
 if __name__ == "__main__":
     nav = Navigator()
     rospy.on_shutdown(nav.shutdown_callback)
     time.sleep(10)  # Give time for everything to set up
-    nav.localize()  # rotate to localize
     nav.run()  # run the main loop
