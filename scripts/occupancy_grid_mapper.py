@@ -9,7 +9,7 @@ from mattbot_dds.msg import MapUpdate
 import tf
 import sensor_msgs.point_cloud2 as pc2
 from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray, Person, PersonArray
-from image_detection_with_unknowns.msg import LabeledObject, LabeledObjectArray
+from mattbot_image_detection.msg import LabeledObject, LabeledObjectArray
 
 import time
 
@@ -271,7 +271,7 @@ class Map:
         height = data[:, 1] + self.camera_height  
 
         # Get only the points that are within the height and distance range
-        indices = np.where(np.logical_and(np.logical_and(height <= self.total_height+0.2, dist < 4), height >= 0.1))[0]
+        indices = np.where(np.logical_and(np.logical_and(height <= self.total_height+0.2, dist < 3), height >= 0.1))[0]
         points_np = data[indices, :]
 
         # If no points at all, return immediately
@@ -480,9 +480,9 @@ class Map:
         y_max = min([int((camera_location[1] + 1)/self.resolution), self.height])
         combined_map_data[y_min:y_max, x_min:x_max] = np.maximum(combined_map_data[y_min:y_max, x_min:x_max], self.person_moving_map[y_min:y_max, x_min:x_max])
 
-        combined_map_data = combined_map_data.flatten()
-        new_map_binary = np.where(self.new_map_as_np.probs.flatten() > 0.85)[0]
-        combined_map_data[new_map_binary] = 100
+        # combined_map_data = combined_map_data.flatten()
+        # new_map_binary = np.where(self.new_map_as_np.probs.flatten() > 0.85)[0]
+        # combined_map_data[new_map_binary] = 100
         self.combined_map.data = combined_map_data.flatten().astype(int).tolist()
         self.combined_map_publisher.publish(self.combined_map) 
 
