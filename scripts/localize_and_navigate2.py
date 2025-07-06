@@ -211,6 +211,10 @@ class Navigator:
             rospy.loginfo("External goal is the same as current goal, ignoring")
             return
 
+        if self.mode == Mode.WAITING_FOR_INIT or self.mode == Mode.LOCALIZING:
+            # Ignore external goals
+            return
+
         # Stop the bot
         if self.mode != Mode.IDLE:
             cmd_vel = Twist()
