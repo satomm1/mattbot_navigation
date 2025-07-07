@@ -33,11 +33,12 @@ PERSON_SLOW_DISTANCE = 2.5  # distance to closest person at which we slow down t
 class Mode(Enum):
     IDLE = 0        # not moving, waiting for a goal
     LOCALIZING = 1  # localizing the robot
-    ALIGN = 2       # aligning to start heading of the path
-    TRACK = 3       # tracking the path (following the trajectory)
-    PARK = 4        # parking the robot (moving to a specific pose)
-    BACKING = 5     # backing up when stuck
-    WAITING_FOR_INIT = 6
+    LOCALIZING2 = 2
+    ALIGN = 3       # aligning to start heading of the path
+    TRACK = 4       # tracking the path (following the trajectory)
+    PARK = 5       # parking the robot (moving to a specific pose)
+    BACKING = 6     # backing up when stuck
+    WAITING_FOR_INIT = 7
 
 class Navigator:
     """
@@ -744,6 +745,14 @@ class Navigator:
         elif self.mode == Mode.LOCALIZING:
             V = 0.0
             om = 1.5
+        elif self.mode == Mode.LOCALIZING2:
+            if self.localize_begin_time is not None and rospy.get_rostime() - self.localize_begin_time < rospy.Duration(2):
+                # If we are still localizing, use a high angular velocity to align
+                V = 0.0
+                om = 0.0
+            else:
+                V = 0.0
+                om = -1.5
         elif self.mode == Mode.WAITING_FOR_INIT:
             V = 0.0
             om = 0.0
@@ -808,6 +817,12 @@ class Navigator:
             elif self.mode == Mode.LOCALIZING:
                 # if time spent localizing > 10 sec, switch to ALIGN mode
                 if self.localize_begin_time is not None and rospy.get_rostime() - self.localize_begin_time > rospy.Duration(10):
+                    self.localize_begin_time = rospy.get_rostime()
+                    
+                    self.switch_mode(Mode.LOCALIZING2)
+            elif self.mode == Mode.LOCALIZING2:
+                # if time spent localizing > 8 sec, switch to ALIGN mode
+                if self.localize_begin_time is not None and rospy.get_rostime() - self.localize_begin_time > rospy.Duration(5):
                     rospy.loginfo("Navigator: localized, ready for navigation")
                     self.is_localized = True
                     self.localized_pub.publish(True)
