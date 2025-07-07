@@ -73,6 +73,7 @@ class Navigator:
         self.map_probs = []
         self.occupancy = None
         self.occupancy_updated = False
+        self.object_occupancy = None
 
         self.person_occupancy = None
         self.robot_stopped_by_person = False
@@ -167,6 +168,7 @@ class Navigator:
 
         rospy.Subscriber(map_name, OccupancyGrid, self.map_callback)
         rospy.Subscriber("/map_metadata", MapMetaData, self.map_md_callback)
+        rospy.Subscriber("/object_map", OccupancyGrid, self.object_map_callback)
         rospy.Subscriber("/cmd_nav", Pose2D, self.cmd_nav_callback)
         rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.rviz_goal_callback)
         rospy.Subscriber("/external_goal", Pose2D, self.external_goal_callback)
@@ -290,6 +292,17 @@ class Navigator:
                 self.map_probs,
             )
 
+            if self.object_occupancy is None:
+                self.object_occupancy = StochOccupancyGrid2D(
+                    self.map_resolution,
+                    self.map_width,
+                    self.map_height,
+                    self.map_origin[0],
+                    self.map_origin[1],
+                    5,
+                    np.zeros((self.map_width * self.map_height,)),  # initialize with zeros
+                )
+
             if self.person_occupancy is None:
                 self.person_occupancy = StochOccupancyGrid2D(
                     self.map_resolution,
@@ -300,6 +313,24 @@ class Navigator:
                     5,
                     np.zeros((self.map_width * self.map_height,)),  # initialize with zeros     
                 )
+
+    def object_map_callback(self, msg):
+        if (
+            self.map_width > 0
+            and self.map_height > 0
+            and len(self.map_probs) > 0
+        ):
+            print()
+
+            self.object_occupancy = StochOccupancyGrid2D(
+                self.map_resolution,
+                self.map_width,
+                self.map_height,
+                self.map_origin[0],
+                self.map_origin[1],
+                5,
+                msg.data,
+            )
 
     def initial_pose_callback(self, msg):
         """
@@ -512,7 +543,7 @@ class Navigator:
     
     def path_still_valid(self, path):
         for point in path:
-            if not self.occupancy.is_free(point):
+            if not self.object_occupancy.is_free(point):
                 print("Path no longer valid...")
                 return False
         return True
@@ -792,19 +823,19 @@ class Navigator:
                     self.heading_controller.load_goal(self.theta_g)
                     print("Setting theta goal to", self.theta_g)
                     self.switch_mode(Mode.PARK)                
-                # elif(not self.path_still_valid(self.current_plan)):
-                #     # Path no longer valid ---> replan
-                #     rospy.loginfo("replanning because path is no longer valid")
+                elif(not self.path_still_valid(self.current_plan)):
+                    # Path no longer valid ---> replan
+                    rospy.loginfo("replanning because path is no longer valid")
 
-                #     # Stop the robot
-                #     self.switch_mode(Mode.IDLE)
-                #     cmd_vel = Twist()
-                #     cmd_vel.linear.x = 0.0
-                #     cmd_vel.angular.z = 0.0
-                #     self.nav_vel_pub.publish(cmd_vel)
+                    # Stop the robot
+                    self.switch_mode(Mode.IDLE)
+                    cmd_vel = Twist()
+                    cmd_vel.linear.x = 0.0
+                    cmd_vel.angular.z = 0.0
+                    self.nav_vel_pub.publish(cmd_vel)
 
-                #     # Now replan
-                #     self.replan()
+                    # Now replan
+                    self.replan()
                 elif len(self.waypoints) > 0 and not self.robot_stopped_by_person:
                     # If we have waypoints, check if we have reached them in time
                     if current_time - self.current_plan_start_time.to_sec() > self.waypoints[0][2]:

@@ -101,6 +101,7 @@ class Map:
         self.combined_map.header = self.map_msg.header
         self.combined_map.info = self.map_msg.info
         self.combined_map_publisher = rospy.Publisher('/navigation_map', OccupancyGrid, queue_size=10)
+        self.object_map_publisher = rospy.Publisher('/object_map', OccupancyGrid, queue_size=10)
 
         camera_info_msg = rospy.wait_for_message("/camera/color/camera_info", CameraInfo)
         camera_info = camera_info_msg.K
@@ -602,6 +603,10 @@ class Map:
                             confirmed_object.width = obj.width
                             self.confirmed_object_publisher.publish(confirmed_object)
 
+                            # Publish updated map
+                            map_data = self.detected_object_map.flatten().astype(int).tolist()
+                            self.object_map_publisher.publish(OccupancyGrid(header=self.map_msg.header, info=self.map_msg.info, data=map_data))
+
                             break
                 
                 if not match_proposed:
@@ -645,6 +650,10 @@ class Map:
         marker = self.get_marker(x, y, self.num_detected_objects)
         self.object_marker_array.markers.append(marker)     
         self.object_marker_publisher.publish(self.object_marker_array)
+
+        # Publish updated map
+        map_data = self.detected_object_map.flatten().astype(int).tolist()
+        self.object_map_publisher.publish(OccupancyGrid(header=self.map_msg.header, info=self.map_msg.info, data=map_data))
 
     def object_from_sensor_callback(self, msg):
         object_array = msg.objects
@@ -690,6 +699,10 @@ class Map:
                 y_max = int((y + width/2)/self.resolution)
                 self.detected_object_map[y_min:y_max, x_min:x_max] = 100
 
+                # Publish updated map
+                map_data = self.detected_object_map.flatten().astype(int).tolist()
+                self.object_map_publisher.publish(OccupancyGrid(header=self.map_msg.header, info=self.map_msg.info, data=map_data))
+
                 marker = self.get_marker(x, y, self.num_detected_objects)
                 self.object_marker_array.markers.append(marker)     
         self.object_marker_publisher.publish(self.object_marker_array)
@@ -708,6 +721,11 @@ class Map:
                             y_min = int((obj[1] - obj[2]/2)/self.resolution)
                             y_max = int((obj[1] + obj[2]/2)/self.resolution)
                             self.detected_object_map[y_min:y_max, x_min:x_max] = -1
+
+                            # Publish updated map
+                            map_data = self.detected_object_map.flatten().astype(int).tolist()
+                            self.object_map_publisher.publish(OccupancyGrid(header=self.map_msg.header, info=self.map_msg.info, data=map_data))
+                            
                             break
                     # Remove the marker
                     print("Removed object from sensor")
