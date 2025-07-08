@@ -186,6 +186,9 @@ class Navigator:
 
         self.switch_mode(Mode.WAITING_FOR_INIT)
 
+        self.url='http://127.0.0.1:5000/gemini'
+
+
     def cmd_nav_callback(self, data):
         """
         loads in goal if different from current goal, and replans
@@ -529,6 +532,12 @@ class Navigator:
             if not self.robot_stopped_by_person:
                 self.stopped_for_person_time = rospy.get_rostime().to_sec()
                 print("Stopping for person")
+
+                data = {'query': "Excuse Me!", 'query_type': 'print_to_screen'}
+                try:
+                    response = requests.post(self.url, json=data)
+                except requests.exceptions.RequestException as e:
+                    print(f"Error sending request: {e}")
 
             self.robot_stopped_by_person = True
         elif self.distance_to_person < PERSON_SLOW_DISTANCE:
