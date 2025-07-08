@@ -176,6 +176,7 @@ class Navigator:
         rospy.Subscriber("/voice_goal", Pose2D, self.external_goal_callback)
         rospy.Subscriber("/agent_location", AgentLocation, self.agent_location_callback)
         rospy.Subscriber("/initialpose", PoseWithCovarianceStamped, self.initial_pose_callback)
+        rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
         self.localized_pub = rospy.Publisher("/localized", Bool, queue_size=10)
 
         self.has_stopped = False
@@ -482,6 +483,8 @@ class Navigator:
             y = obj.pose.position.y
             self.person_list1.append((x, y))
 
+        if self.person_occupancy is not None:
+
         for (x,y) in self.person_list1 + self.person_list2 + self.person_list3: 
             radius = 0.3  # assume person occupies a circle of radius 0.3m
 
@@ -529,6 +532,7 @@ class Navigator:
 
             self.robot_stopped_by_person = True
         elif self.distance_to_person < PERSON_SLOW_DISTANCE:
+            print("Slowing down for person")
             # Slow down
             V *= 0.5
             om *= 0.5
