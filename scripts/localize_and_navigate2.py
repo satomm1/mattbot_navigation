@@ -39,6 +39,8 @@ class Mode(Enum):
     PARK = 5       # parking the robot (moving to a specific pose)
     BACKING = 6     # backing up when stuck
     WAITING_FOR_INIT = 7
+    RELOCALIZING = 8
+    STOPPED_FOR_PERSON = 9
 
 class Navigator:
     """
@@ -488,35 +490,59 @@ class Navigator:
 
         if self.person_occupancy is not None:
 
-        for (x,y) in self.person_list1 + self.person_list2 + self.person_list3: 
-            radius = 0.3  # assume person occupies a circle of radius 0.3m
+            for (x,y) in self.person_list1 + self.person_list2 + self.person_list3: 
+                radius = 0.3  # assume person occupies a circle of radius 0.3m
 
-            # Get x,y coordinates in terms of gird coordinates
-            grid_x = int((x - self.map_origin[0]) / self.map_resolution)
-            grid_y = int((y - self.map_origin[1]) / self.map_resolution)
+                # Get x,y coordinates in terms of gird coordinates
+                grid_x = int((x - self.map_origin[0]) / self.map_resolution)
+                grid_y = int((y - self.map_origin[1]) / self.map_resolution)
 
-            # make sure coordinates are within map
-            grid_x = np.clip(grid_x, 0, self.map_width - 1)
-            grid_y = np.clip(grid_y, 0, self.map_height - 1)
+                # make sure coordinates are within map
+                grid_x = np.clip(grid_x, 0, self.map_width - 1)
+                grid_y = np.clip(grid_y, 0, self.map_height - 1)
 
-            # Update the person occupancy grid
-            # TODO Vectorize this
-            for i in range(-self.person_occupancy.window_size//2, self.person_occupancy.window_size//2 + 1):
-                for j in range(-self.person_occupancy.window_size//2, self.person_occupancy.window_size//2 + 1):
-                    if (0 <= grid_x + i < self.map_width) and (0 <= grid_y + j < self.map_height):
-                        dist = np.sqrt(i**2 + j**2) * self.map_resolution
-                        if dist <= radius:
-                            person_probs[grid_y + j, grid_x + i] = 1.0  # Mark as occupied
+                # Update the person occupancy grid
+                # TODO Vectorize this
+                # for i in range(-self.person_occupancy.window_size//2, self.person_occupancy.window_size//2 + 1):
+                #     for j in range(-self.person_occupancy.window_size//2, self.person_occupancy.window_size//2 + 1):
+                #         if (0 <= grid_x + i < self.map_width) and (0 <= grid_y + j < self.map_height):
+                #             dist = np.sqrt(i**2 + j**2) * self.map_resolution
+                #             if dist <= radius:
+                #                 person_probs[grid_y + j, grid_x + i] = 1.0  # Mark as occupied
 
-            dist_to_person = np.linalg.norm(np.array([x - self.x, y - self.y]))
+                # Create a grid of coordinates centered at the person
+                window_size = self.person_occupancy.window_size
+                i_coords, j_coords = np.meshgrid(
+                    np.arange(-window_size//2, window_size//2 + 1),
+                    np.arange(-window_size//2, window_size//2 + 1)
+                )
+                
+                # Calculate the grid positions
+                grid_x_coords = grid_x + i_coords
+                grid_y_coords = grid_y + j_coords
+                
+                # Calculate distances from center (person position)
+                distances = np.sqrt(i_coords**2 + j_coords**2) * self.map_resolution
+                
+                # Create a mask for valid positions (within map bounds and within radius)
+                valid_mask = (
+                    (grid_x_coords >= 0) & (grid_x_coords < self.map_width) &
+                    (grid_y_coords >= 0) & (grid_y_coords < self.map_height) &
+                    (distances <= radius)
+                )
+                
+                # Update the occupancy grid for valid positions
+                person_probs[grid_y_coords[valid_mask], grid_x_coords[valid_mask]] = 1.0
 
-            if dist_to_person < closest_person_dist:
-                closest_person_dist = dist_to_person
-        self.distance_to_person = closest_person_dist
+                dist_to_person = np.linalg.norm(np.array([x - self.x, y - self.y]))
 
-        self.person_occupancy.update(person_probs)
+                if dist_to_person < closest_person_dist:
+                    closest_person_dist = dist_to_person
+            self.distance_to_person = closest_person_dist
 
-        self.person_in_path = self.person_intersect_path()
+            self.person_occupancy.update(person_probs)
+
+            self.person_in_path = self.person_intersect_path()
 
     def modify_velocity_for_person(self, V, om):
         """
@@ -538,6 +564,8 @@ class Navigator:
                     response = requests.post(self.url, json=data)
                 except requests.exceptions.RequestException as e:
                     print(f"Error sending request: {e}")
+
+                self.switch_mode(Mode.STOPPED_FOR_PERSON)
 
             self.robot_stopped_by_person = True
         elif self.distance_to_person < PERSON_SLOW_DISTANCE:
@@ -769,6 +797,10 @@ class Navigator:
         elif self.mode == Mode.WAITING_FOR_INIT:
             V = 0.0
             om = 0.0
+        elif self.mode == Mode.STOPPED_FOR_PERSON:
+            # If we are stopped for a person, we don't want to move
+            V = 0.0
+            om = 0.0
         else:
             V = 0.0
             om = 0.0
@@ -875,21 +907,6 @@ class Navigator:
                     elif np.linalg.norm(np.array([self.x - self.waypoints[0][0], self.y - self.waypoints[0][1]])) < 0.35:
                         print("Waypoint reached")
                         self.waypoints.pop(0)  # Remove the first waypoint since we are close to it
-                elif self.robot_stopped_by_person and current_time - self.stopped_for_person_time > 5:
-                    # If we have been stopped by a person for more than 5 seconds, replan
-
-                    print("******************************************")
-                    print("Replanning because person in path")
-                    print("******************************************")
-
-                    # Stop attempting current plan
-                    self.switch_mode(Mode.IDLE)
-
-                    self.robot_stopped_by_person = False
-                    
-                    # Try to replan
-                    self.replan()
-
                 elif (rospy.get_rostime() - self.current_plan_start_time).to_sec() > self.current_plan_duration:
                     rospy.loginfo("replanning because out of time")
 
@@ -908,6 +925,23 @@ class Navigator:
                 print("Backing Up")
                 current_time = rospy.get_rostime().to_sec()
                 if current_time - self.backing_start_time > 1:
+                    # self.switch_mode(Mode.IDLE)
+
+                    # # Stop moving
+                    # cmd_vel = Twist()
+                    # cmd_vel.linear.x = 0.0
+                    # cmd_vel.angular.z = 0.0
+                    # self.nav_vel_pub.publish(cmd_vel)
+
+                    # # Now replan
+                    # print("Replanning after backing up")
+                    # self.replan()
+
+                    self.relocalizing_start_time = current_time
+                    self.switch_mode(Mode.RELOCALIZING)
+            elif self.mode == Mode.RELOCALIZING:
+                current_time = rospy.get_rostime().to_sec()
+                if current_time - self.relocalizing_start_time > 5:
                     self.switch_mode(Mode.IDLE)
                     
                     # Stop moving
@@ -916,8 +950,25 @@ class Navigator:
                     cmd_vel.angular.z = 0.0
                     self.nav_vel_pub.publish(cmd_vel)
 
-                    # Now replan
-                    print("Replanning after backing up")
+                    self.replan()
+            elif self.mode == Mode.STOPPED_FOR_PERSON:
+                current_time = rospy.get_rostime().to_sec()
+                if current_time - self.stopped_for_person_time > 5:
+                    # If we have been stopped by a person for more than 5 seconds, replan
+                    print("******************************************")
+                    print("Replanning because person in path")
+                    print("******************************************")
+
+                    self.switch_mode(Mode.IDLE)
+                    self.robot_stopped_by_person = False
+                    self.replan()
+                elif self.distance_to_person > PERSON_STOP_DISTANCE:
+                    print("******************************************")
+                    print("Replanning because person no longer in path")
+                    print("******************************************")
+                    
+                    self.switch_mode(Mode.IDLE)
+                    self.robot_stopped_by_person = False
                     self.replan()
 
             self.publish_control()
