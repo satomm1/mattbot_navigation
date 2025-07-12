@@ -98,8 +98,7 @@ class Navigator:
 
         self.other_agents_goals = dict()
         self.other_agents_at_goal = []
-        
-        self.other_agents_locations = dict()  # agent ID -> [x, y, theta, time]
+    
                                             
         # plan parameters
         self.plan_resolution = 0.1
@@ -714,13 +713,13 @@ class Navigator:
         robots_x = []  # list of x coordinates of other agents who are static
         robots_y = []  # list of y coordinates of other agents who are static
         for agent_id in self.other_agents_static:
-            agent_x, agent_y = self.other_agents_locs[agent_id]
+            agent_x, agent_y = self.other_agent_locs[agent_id]
             robots_x.append(agent_x)
             robots_y.append(agent_y)
 
         # Get agents who are in path and avoid them
         for agent_id in self.agents_in_path:
-            agent_x, agent_y = self.other_agents_locs[agent_id]
+            agent_x, agent_y = self.other_agent_locs[agent_id]
             robots_x.append(agent_x)
             robots_y.append(agent_y)
 
