@@ -89,14 +89,16 @@ class Navigator:
         self.stopped_for_person_time = rospy.get_rostime().to_sec()
 
         self.other_agent_locs = dict()
-        self.robot_stopped_by_agent = False
-        self.agent_in_path = False
         self.other_agent_time_dict = dict()  # agent ID -> time of last update
         self.agents_in_path = []  # list of agent ID's that are in the path
+        self.other_agents_not_static = []  # list of agent ID's that are not static (moving)
+        self.other_agents_static = []  # list of agent ID's that are static (not moving)
+        self.my_id = int(os.environ.get('ROBOT_ID', '0'))  # Get the robot ID from environment variable
+        self.stopped_for_agents = False
 
         self.other_agents_goals = dict()
         self.other_agents_at_goal = []
-        self.other_agents_static = []  # list of agent ID's that are static (not moving)
+        
         self.other_agents_locations = dict()  # agent ID -> [x, y, theta, time]
                                             
         # plan parameters
@@ -381,16 +383,16 @@ class Navigator:
         self.other_agent_time_dict[agent_id] = current_time.to_sec()
         self.other_agent_locs[agent_id] = (msg.pose.position.x, msg.pose.position.y)
 
-        # Keep track of the previous pose of the agent (if it exists)
-        prev_pose = None
-        if agent_id in self.other_agents_locations:
-            prev_pose = self.other_agents_locations[agent_id]
-
         # Check if static and update the static list
         if agent_id not in self.other_agents_static and msg.isStatic.data:
             self.other_agents_static.append(agent_id)
         elif agent_id in self.other_agents_static and not msg.isStatic.data:
             self.other_agents_static.remove(agent_id)
+
+        if agent_id in self.other_agents_not_static and msg.isStatic.data:
+            self.other_agents_not_static.remove(agent_id)
+        elif agent_id not in self.other_agents_not_static and not msg.isStatic.data:
+            self.other_agents_not_static.append(agent_id)
 
     def aligned(self):
         """
@@ -712,7 +714,13 @@ class Navigator:
         robots_x = []  # list of x coordinates of other agents who are static
         robots_y = []  # list of y coordinates of other agents who are static
         for agent_id in self.other_agents_static:
-            agent_x, agent_y, _, _ = self.other_agents_locations[agent_id]
+            agent_x, agent_y = self.other_agents_locs[agent_id]
+            robots_x.append(agent_x)
+            robots_y.append(agent_y)
+
+        # Get agents who are in path and avoid them
+        for agent_id in self.agents_in_path:
+            agent_x, agent_y = self.other_agents_locs[agent_id]
             robots_x.append(agent_x)
             robots_y.append(agent_y)
 
@@ -984,6 +992,7 @@ class Navigator:
                 elif self.agent_intersect_path():
                     self.switch_mode(Mode.STOPPED_FOR_AGENT)
                     print("Agent in Path---Stopping")
+                    self.stopped_for_agents = True
                 elif (rospy.get_rostime() - self.current_plan_start_time).to_sec() > self.current_plan_duration:
                     rospy.loginfo("replanning because out of time")
 
@@ -1049,6 +1058,38 @@ class Navigator:
                     self.replan()
 
             elif self.mode == Mode.STOPPED_FOR_AGENT:
+
+                if not self.agent_intersect_path():
+                    # If there are no agents in the path, we can replan
+                    print("******************************************")
+                    print("Replanning because agent no longer in path")
+                    print("******************************************")
+
+                    self.switch_mode(Mode.IDLE)
+                    self.replan()
+                else:
+                    # Get intersection of agents in path and agents that are not static
+                    moving_agents_in_path = set(self.agents_in_path).intersection(set(self.other_agents_not_static))
+                    if len(moving_agents_in_path) == 0:
+                        # No moving agents, replan around the static agents:
+                        print("******************************************")
+                        print("Replanning because no moving agents in path")
+                        print("******************************************")
+                        self.switch_mode(Mode.IDLE)
+                        self.replan()
+                    else:
+                        # We have moving agents in the path, the smallest agent_id has priority
+                        # and we will wait for it to move
+                        lowest_agent_id = min(moving_agents_in_path)
+                        if self.my_id <= lowest_agent_id:
+                            # If we are the lowest agent, we can replan
+                            print("******************************************")
+                            print("Replanning because we are the lowest agent in path")
+                            print("******************************************")
+
+                            self.switch_mode(Mode.IDLE)
+                            self.replan()
+
                 # TODO
                 pass
 
