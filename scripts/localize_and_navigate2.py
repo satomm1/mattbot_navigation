@@ -92,6 +92,7 @@ class Navigator:
         self.robot_stopped_by_agent = False
         self.agent_in_path = False
         self.other_agent_time_dict = dict()  # agent ID -> time of last update
+        self.agents_in_path = []  # list of agent ID's that are in the path
 
         self.other_agents_goals = dict()
         self.other_agents_at_goal = []
@@ -380,29 +381,16 @@ class Navigator:
         self.other_agent_time_dict[agent_id] = current_time.to_sec()
         self.other_agent_locs[agent_id] = (msg.pose.position.x, msg.pose.position.y)
 
-
         # Keep track of the previous pose of the agent (if it exists)
         prev_pose = None
         if agent_id in self.other_agents_locations:
             prev_pose = self.other_agents_locations[agent_id]
 
-        # Get agent's pose and time
-        agent_pose = msg.pose
-        x = agent_pose.position.x
-        y = agent_pose.position.y
-        quaternion = (agent_pose.orientation.x, agent_pose.orientation.y, agent_pose.orientation.z, agent_pose.orientation.w)
-        euler = tf.transformations.euler_from_quaternion(quaternion)
-        theta = euler[2]
-        self.other_agents_locations[agent_id] = [x, y, theta, current_time]
-
-        # Check if agent is moving
-        if prev_pose is not None:
-            if np.linalg.norm(np.array([x - prev_pose[0], y - prev_pose[1]]) < 0.1) and np.abs(theta - prev_pose[2]) < 0.1:
-                if agent_id not in self.other_agents_static:
-                    self.other_agents_static.append(agent_id)
-            else: 
-                if agent_id in self.other_agents_static:
-                    self.other_agents_static.remove(agent_id)
+        # Check if static and update the static list
+        if agent_id not in self.other_agents_static and msg.isStatic.data:
+            self.other_agents_static.append(agent_id)
+        elif agent_id in self.other_agents_static and not msg.isStatic.data:
+            self.other_agents_static.remove(agent_id)
 
     def aligned(self):
         """
@@ -496,27 +484,39 @@ class Navigator:
         # First remove any invalid agents (time too long ago)
         current_time = rospy.get_rostime().to_sec()
         invalid_agents = []
-        for agent_id in list(self.other_agents_locations.keys()):
+        close_agents = []
+        for agent_id in list(self.other_agent_locs.keys()):
             if (current_time - self.other_agent_time_dict[agent_id]) > 5.0:
                 invalid_agents.append(agent_id)
-        
+            else:
+                agent_x, agent_y = self.other_agent_locs[agent_id]
+                dist_to_agent = np.linalg.norm(np.array([self.x - agent_x, self.y - agent_y]))
+                if dist_to_agent < 1.6:
+                    close_agents.append(agent_id)
+
+        # Remove invalid agents from the dictionaries
         for agent_id in invalid_agents:
-            self.other_agents_locations.pop(agent_id)
+            self.other_agent_locs.pop(agent_id)
             self.other_agent_time_dict.pop(agent_id)
 
-        agent_locations = []
-        for agent_id in list(self.other_agents_locations.keys()):
-            agent_x, agent_y = self.other_agents_locations[agent_id]
-            agent_locations.append((agent_x, agent_y))
-
+       
+        # Check if any of the close agents are in the path
         path = self.current_plan
+        agents_in_path = []
         for point in path:
-            point_x, point_y = point
-            for agent_x, agent_y in agent_locations:
-                if (point_x - agent_x) ** 2 + (point_y - agent_y) ** 2 < 2:
-                    return True
+            point_x = point[0]
+            point_y = point[1]
+            for agent_id in close_agents:
+                agent_x, agent_y, = self.other_agent_locs[agent_id]
+                grid_x = int((point_x - self.map_origin[0]) / self.map_resolution)
+                grid_y = int((point_y - self.map_origin[1]) / self.map_resolution)
 
-        return False
+                dist_to_agent = np.linalg.norm(np.array([point_x - agent_x, point_y - agent_y]))
+                if dist_to_agent < 0.35:
+                    agents_in_path.append(agent_id)
+
+        self.agents_in_path = agents_in_path
+        return len(agents_in_path) > 0  # Return True if any agents are in the path
 
     def detected_objects_callback(self, msg):
         """
