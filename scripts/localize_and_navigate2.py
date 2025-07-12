@@ -8,6 +8,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray
 from mattbot_dds.msg import AgentPath, AgentLocation
 import tf
+from dynamic_reconfigure.client import Client
 
 import time
 import numpy as np
@@ -41,6 +42,7 @@ class Mode(Enum):
     WAITING_FOR_INIT = 7
     RELOCALIZING = 8
     STOPPED_FOR_PERSON = 9
+    STOPPED_FOR_AGENT = 10
 
 class Navigator:
     """
@@ -85,6 +87,11 @@ class Navigator:
         self.person_list2 = []
         self.person_list3 = []
         self.stopped_for_person_time = rospy.get_rostime().to_sec()
+
+        self.other_agent_locs = dict()
+        self.robot_stopped_by_agent = False
+        self.agent_in_path = False
+        self.other_agent_time_dict = dict()  # agent ID -> time of last update
 
         self.other_agents_goals = dict()
         self.other_agents_at_goal = []
@@ -178,6 +185,7 @@ class Navigator:
         rospy.Subscriber("/voice_goal", Pose2D, self.external_goal_callback)
         rospy.Subscriber("/agent_location", AgentLocation, self.agent_location_callback)
         rospy.Subscriber("/initialpose", PoseWithCovarianceStamped, self.initial_pose_callback)
+        rospy.Subscriber("/lost_localization", Bool, self.lost_localization_callback)
         rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
         self.localized_pub = rospy.Publisher("/localized", Bool, queue_size=10)
 
@@ -346,6 +354,21 @@ class Navigator:
         rospy.loginfo("Navigator: Initial pose received")
         self.received_initial_pose = True
 
+        if self.mode == Mode.TRACK:
+            self.backing_start_time = rospy.get_rostime().to_sec()
+            self.switch_mode(Mode.BACKING)
+
+    def lost_localization_callback(self, msg):
+        self.backing_start_time = rospy.get_rostime().to_sec()
+        self.switch_mode(Mode.BACKING)
+
+
+        # if self.localized and msg.data:
+        #     rospy.loginfo("Navigator: Lost localization")
+        #     self.localized = False
+        #     self.received_initial_pose = False
+        #     self.switch_mode(Mode.WAITING_FOR_INIT)
+
     def agent_location_callback(self, msg):
         """
         Callback for /agent_location topic.
@@ -353,6 +376,10 @@ class Navigator:
         """
         current_time = rospy.get_rostime()
         agent_id = msg.agentID.data
+
+        self.other_agent_time_dict[agent_id] = current_time.to_sec()
+        self.other_agent_locs[agent_id] = (msg.pose.position.x, msg.pose.position.y)
+
 
         # Keep track of the previous pose of the agent (if it exists)
         prev_pose = None
@@ -464,7 +491,33 @@ class Navigator:
                     return True
 
         return False
-    
+
+    def agent_intersect_path(self):
+        # First remove any invalid agents (time too long ago)
+        current_time = rospy.get_rostime().to_sec()
+        invalid_agents = []
+        for agent_id in list(self.other_agents_locations.keys()):
+            if (current_time - self.other_agent_time_dict[agent_id]) > 5.0:
+                invalid_agents.append(agent_id)
+        
+        for agent_id in invalid_agents:
+            self.other_agents_locations.pop(agent_id)
+            self.other_agent_time_dict.pop(agent_id)
+
+        agent_locations = []
+        for agent_id in list(self.other_agents_locations.keys()):
+            agent_x, agent_y = self.other_agents_locations[agent_id]
+            agent_locations.append((agent_x, agent_y))
+
+        path = self.current_plan
+        for point in path:
+            point_x, point_y = point
+            for agent_x, agent_y in agent_locations:
+                if (point_x - agent_x) ** 2 + (point_y - agent_y) ** 2 < 2:
+                    return True
+
+        return False
+
     def detected_objects_callback(self, msg):
         """
         receives detected objects, only looks at people and stores their location in the 
@@ -801,6 +854,10 @@ class Navigator:
             # If we are stopped for a person, we don't want to move
             V = 0.0
             om = 0.0
+        elif self.mode == Mode.STOPPED_FOR_AGENT:
+            # If we are stopped for an agent, we don't want to move
+            V = 0.0
+            om = 0.0
         else:
             V = 0.0
             om = 0.0
@@ -872,6 +929,23 @@ class Navigator:
                     self.is_localized = True
                     self.localized_pub.publish(True)
                     self.switch_mode(Mode.IDLE)
+
+                    client = Client('amcl', timeout=30)
+                    # Get current configuration
+                    config = client.get_configuration()
+                    rospy.loginfo("Current configuration: %s", config)
+
+                    # Update parameters to emphasize sensor measurements
+                    params = {
+                        # Measurement model parameters
+                        'laser_z_hit': 0.95,            # Increase hit weight (default ~0.7)
+                        'laser_z_rand': 0.05,          # Decrease random weight (default ~0.2)
+                        'laser_sigma_hit': 0.01,        # Decrease sigma for higher confidence
+                        'odom_alpha2': 0.8,
+                        # 'odom_alpha4': 0.8,
+                    }
+                    client.update_configuration(params)
+
             elif self.mode == Mode.ALIGN:
                 if self.aligned():
                     self.current_plan_start_time = rospy.get_rostime()
@@ -907,6 +981,9 @@ class Navigator:
                     elif np.linalg.norm(np.array([self.x - self.waypoints[0][0], self.y - self.waypoints[0][1]])) < 0.35:
                         print("Waypoint reached")
                         self.waypoints.pop(0)  # Remove the first waypoint since we are close to it
+                elif self.agent_intersect_path():
+                    self.switch_mode(Mode.STOPPED_FOR_AGENT)
+                    print("Agent in Path---Stopping")
                 elif (rospy.get_rostime() - self.current_plan_start_time).to_sec() > self.current_plan_duration:
                     rospy.loginfo("replanning because out of time")
 
@@ -970,6 +1047,10 @@ class Navigator:
                     self.switch_mode(Mode.IDLE)
                     self.robot_stopped_by_person = False
                     self.replan()
+
+            elif self.mode == Mode.STOPPED_FOR_AGENT:
+                # TODO
+                pass
 
             self.publish_control()
             rate.sleep()
