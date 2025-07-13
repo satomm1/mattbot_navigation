@@ -99,6 +99,7 @@ class Navigator:
         self.other_agents_goals = dict()
         self.other_agents_at_goal = []
     
+        self.backing_from_bad_localization = False
                                             
         # plan parameters
         self.plan_resolution = 0.1
@@ -186,10 +187,12 @@ class Navigator:
         rospy.Subscriber("/external_goal", Pose2D, self.external_goal_callback)
         rospy.Subscriber("/voice_goal", Pose2D, self.external_goal_callback)
         rospy.Subscriber("/agent_location", AgentLocation, self.agent_location_callback)
-        rospy.Subscriber("/initialpose", PoseWithCovarianceStamped, self.initial_pose_callback)
+        rospy.Subscriber("/initialpose_relocalize", PoseWithCovarianceStamped, self.initial_pose_relocalize_callback)
+        self.initialpose_subscriber = rospy.Subscriber("/initialpose", PoseWithCovarianceStamped, self.initial_pose_callback)
         rospy.Subscriber("/lost_localization", Bool, self.lost_localization_callback)
         rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
         self.localized_pub = rospy.Publisher("/localized", Bool, queue_size=10)
+        self.initialpose_pub = rospy.Publisher("/initialpose", PoseWithCovarianceStamped, queue_size=10)
 
         self.has_stopped = False
 
@@ -349,6 +352,17 @@ class Navigator:
                 msg.data,
             )
 
+    def initial_pose_relocalize_callback(self, msg):
+        """
+        Callback for initial pose, sets the robot's position and orientation
+        """        
+        # Only do anything if in tracking mode
+        if self.mode == Mode.TRACK:
+            self.initialpose_pub.publish(msg)
+            self.backing_start_time = rospy.get_rostime().to_sec()
+            self.backing_from_bad_localization = True
+            self.switch_mode(Mode.BACKING)
+
     def initial_pose_callback(self, msg):
         """
         Callback for initial pose, sets the robot's position and orientation
@@ -356,9 +370,10 @@ class Navigator:
         rospy.loginfo("Navigator: Initial pose received")
         self.received_initial_pose = True
 
-        if self.mode == Mode.TRACK:
-            self.backing_start_time = rospy.get_rostime().to_sec()
-            self.switch_mode(Mode.BACKING)
+        if self.initialpose_subscriber is not None:
+            self.initialpose_subscriber.unregister()
+            self.initialpose_subscriber = None
+
 
     def lost_localization_callback(self, msg):
         self.backing_start_time = rospy.get_rostime().to_sec()
@@ -455,10 +470,13 @@ class Navigator:
         )
 
     def snap_to_grid(self, x):
-        return (
-            self.plan_resolution * round(x[0] / self.plan_resolution),
-            self.plan_resolution * round(x[1] / self.plan_resolution),
-        )
+        try:
+            x0 = self.plan_resolution * round(x[0] / self.plan_resolution)
+            x1 = self.plan_resolution * round(x[1] / self.plan_resolution)
+            return (x0, x1)
+        except Exception as e:
+            rospy.logerr("Error snapping to grid: %s", e)
+            return x
 
     def switch_mode(self, new_mode):
         rospy.loginfo("Switching from %s -> %s", self.mode, new_mode)
@@ -492,7 +510,8 @@ class Navigator:
             else:
                 agent_x, agent_y = self.other_agent_locs[agent_id]
                 dist_to_agent = np.linalg.norm(np.array([self.x - agent_x, self.y - agent_y]))
-                if dist_to_agent < 1.6:
+                print("Dist to agent:", dist_to_agent)
+                if dist_to_agent < 2.5:
                     close_agents.append(agent_id)
 
         # Remove invalid agents from the dictionaries
@@ -500,6 +519,9 @@ class Navigator:
             self.other_agent_locs.pop(agent_id)
             self.other_agent_time_dict.pop(agent_id)
 
+        if len(close_agents) != 0:
+            print(f"*******Close agents: {close_agents}")
+            print("\n\n")
        
         # Check if any of the close agents are in the path
         path = self.current_plan
@@ -513,7 +535,7 @@ class Navigator:
                 grid_y = int((point_y - self.map_origin[1]) / self.map_resolution)
 
                 dist_to_agent = np.linalg.norm(np.array([point_x - agent_x, point_y - agent_y]))
-                if dist_to_agent < 0.35:
+                if dist_to_agent < 1:
                     agents_in_path.append(agent_id)
 
         self.agents_in_path = agents_in_path
@@ -843,7 +865,7 @@ class Navigator:
         elif self.mode == Mode.BACKING:
             V = -0.3
             om = 0.0
-        elif self.mode == Mode.LOCALIZING:
+        elif self.mode == Mode.LOCALIZING or self.mode == Mode.RELOCALIZING:
             V = 0.0
             om = 1.5
         elif self.mode == Mode.LOCALIZING2:
@@ -930,7 +952,7 @@ class Navigator:
                     
                     self.switch_mode(Mode.LOCALIZING2)
             elif self.mode == Mode.LOCALIZING2:
-                # if time spent localizing > 8 sec, switch to ALIGN mode
+                # if time spent localizing > 5 sec, switch to ALIGN mode
                 if self.localize_begin_time is not None and rospy.get_rostime() - self.localize_begin_time > rospy.Duration(5):
                     rospy.loginfo("Navigator: localized, ready for navigation")
                     self.is_localized = True
@@ -1010,23 +1032,36 @@ class Navigator:
                 print("Backing Up")
                 current_time = rospy.get_rostime().to_sec()
                 if current_time - self.backing_start_time > 1:
-                    # self.switch_mode(Mode.IDLE)
 
-                    # # Stop moving
-                    # cmd_vel = Twist()
-                    # cmd_vel.linear.x = 0.0
-                    # cmd_vel.angular.z = 0.0
-                    # self.nav_vel_pub.publish(cmd_vel)
+                    if False:  # self.backing_from_bad_localization:
+                        print("Backing up from bad localization")
+                        # Stop moving
+                        cmd_vel = Twist()
+                        cmd_vel.linear.x = 0.0
+                        cmd_vel.angular.z = 0.0
+                        self.nav_vel_pub.publish(cmd_vel)
 
-                    # # Now replan
-                    # print("Replanning after backing up")
-                    # self.replan()
+                        self.backing_from_bad_localization = False
+                        self.relocalizing_start_time = current_time
+                        self.switch_mode(Mode.RELOCALIZING)
+                    else:
+                        self.switch_mode(Mode.IDLE)
 
-                    self.relocalizing_start_time = current_time
-                    self.switch_mode(Mode.RELOCALIZING)
+                        # Stop moving
+                        cmd_vel = Twist()
+                        cmd_vel.linear.x = 0.0
+                        cmd_vel.angular.z = 0.0
+                        self.nav_vel_pub.publish(cmd_vel)
+
+                        # Now replan
+                        print("Replanning after backing up")
+                        self.replan()
+
+                    # self.relocalizing_start_time = current_time
+                    # self.switch_mode(Mode.RELOCALIZING)
             elif self.mode == Mode.RELOCALIZING:
                 current_time = rospy.get_rostime().to_sec()
-                if current_time - self.relocalizing_start_time > 5:
+                if current_time - self.relocalizing_start_time > 8:
                     self.switch_mode(Mode.IDLE)
                     
                     # Stop moving
