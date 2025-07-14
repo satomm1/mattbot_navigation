@@ -95,6 +95,7 @@ class Navigator:
         self.other_agents_static = []  # list of agent ID's that are static (not moving)
         self.my_id = int(os.environ.get('ROBOT_ID', '0'))  # Get the robot ID from environment variable
         self.stopped_for_agents = False
+        self.is_lowest_id = False
 
         self.other_agents_goals = dict()
         self.other_agents_at_goal = []
@@ -510,18 +511,13 @@ class Navigator:
             else:
                 agent_x, agent_y = self.other_agent_locs[agent_id]
                 dist_to_agent = np.linalg.norm(np.array([self.x - agent_x, self.y - agent_y]))
-                print("Dist to agent:", dist_to_agent)
-                if dist_to_agent < 2.5:
+                if dist_to_agent < 1.5:
                     close_agents.append(agent_id)
 
         # Remove invalid agents from the dictionaries
         for agent_id in invalid_agents:
             self.other_agent_locs.pop(agent_id)
             self.other_agent_time_dict.pop(agent_id)
-
-        if len(close_agents) != 0:
-            print(f"*******Close agents: {close_agents}")
-            print("\n\n")
        
         # Check if any of the close agents are in the path
         path = self.current_plan
@@ -539,6 +535,11 @@ class Navigator:
                     agents_in_path.append(agent_id)
 
         self.agents_in_path = agents_in_path
+        
+        # Reset is_lowest_id if there are no agents in the path
+        if len(self.agents_in_path) == 0:
+            self.is_lowest_id = False
+
         return len(agents_in_path) > 0  # Return True if any agents are in the path
 
     def detected_objects_callback(self, msg):
@@ -1010,17 +1011,19 @@ class Navigator:
                     elif np.linalg.norm(np.array([self.x - self.waypoints[0][0], self.y - self.waypoints[0][1]])) < 0.35:
                         print("Waypoint reached")
                         self.waypoints.pop(0)  # Remove the first waypoint since we are close to it
-                elif self.agent_intersect_path():
+                
+                if not self.is_lowest_id and self.agent_intersect_path():
                     self.switch_mode(Mode.STOPPED_FOR_AGENT)
                     print("Agent in Path---Stopping")
                     self.stopped_for_agents = True
-                elif (rospy.get_rostime() - self.current_plan_start_time).to_sec() > self.current_plan_duration:
+                
+                if (rospy.get_rostime() - self.current_plan_start_time).to_sec() > self.current_plan_duration:
                     rospy.loginfo("replanning because out of time")
 
                     # Stop attempting current plan
                     self.switch_mode(Mode.IDLE)
-
                     self.replan()  # we aren't near the goal but we thought we should have been, so replan
+                    
             elif self.mode == Mode.PARK:
                 # Reached goal: forget goal coordinates and stop
                 if self.aligned_goal():
@@ -1120,12 +1123,9 @@ class Navigator:
                             print("******************************************")
                             print("Replanning because we are the lowest agent in path")
                             print("******************************************")
-
+                            self.is_lowest_id = True
                             self.switch_mode(Mode.IDLE)
                             self.replan()
-
-                # TODO
-                pass
 
             self.publish_control()
             rate.sleep()
