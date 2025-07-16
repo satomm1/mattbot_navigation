@@ -4,6 +4,8 @@
   <param name="map_name" value="/navigation_map" />
   <param name="camera_inverted" type="bool" value="true" />
 
+  <arg name="patrol" default="false" />
+
   <!-- Launch the occupancy grid mapper -->
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
     
@@ -12,6 +14,10 @@
   <!-- Launch the navigator.py script -->
   <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate2.py" output="screen">
 
+  </node>
+
+  <!-- Launch the patrol.py script only if patrol is true -->
+  <node name="patrol_node" pkg="mattbot_navigation" type="patrol.py" output="screen" if="$(arg patrol)">
   </node>
 
 </launch>
