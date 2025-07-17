@@ -30,6 +30,7 @@ DELTA_THRES = 0.1
 
 PERSON_STOP_DISTANCE = 1.6  # distance to closest person at which we stop the robot
 PERSON_SLOW_DISTANCE = 2.5  # distance to closest person at which we slow down the robot
+OBJECT_STOP_DISTANCE = 1.5
 
 class Mode(Enum):
     IDLE = 0        # not moving, waiting for a goal
@@ -87,6 +88,14 @@ class Navigator:
         self.person_list2 = []
         self.person_list3 = []
         self.stopped_for_person_time = rospy.get_rostime().to_sec()
+
+        self.object_near_occupancy = None
+        self.robot_stopped_by_object = False
+        self.object_in_path = False
+        self.object_list1 = []  
+        self.object_list2 = []
+        self.object_list3 = []  # List to hold detected objects for the last three frames
+        self.stopped_for_object_time = rospy.get_rostime().to_sec()
 
         self.other_agent_locs = dict()
         self.other_agent_time_dict = dict()  # agent ID -> time of last update
@@ -335,6 +344,16 @@ class Navigator:
                     np.zeros((self.map_width * self.map_height,)),  # initialize with zeros     
                 )
 
+                self.object_near_occupancy = StochOccupancyGrid2D(
+                    self.map_resolution,
+                    self.map_width,
+                    self.map_height,
+                    self.map_origin[0],
+                    self.map_origin[1],
+                    5,
+                    np.zeros((self.map_width * self.map_height,)),  # initialize with zeros     
+                )
+
     def object_map_callback(self, msg):
         if (
             self.map_width > 0
@@ -500,6 +519,17 @@ class Navigator:
 
         return False
 
+    def object_intersect_path(self):
+        object_probs = self.object_near_occupancy.get_probs()
+        path = self.current_plan
+        for point in path:
+            grid_x = int((point[0] - self.map_origin[0]) / self.map_resolution)
+            grid_y = int((point[1] - self.map_origin[1]) / self.map_resolution)
+            if (0 <= grid_x < self.map_width) and (0 <= grid_y < self.map_height):
+                if object_probs[grid_y, grid_x] > 0.5:
+                    return True
+        return False
+
     def agent_intersect_path(self):
         # First remove any invalid agents (time too long ago)
         current_time = rospy.get_rostime().to_sec()
@@ -553,24 +583,33 @@ class Navigator:
         self.person_list2 = self.person_list1
         self.person_list1 = []  # Most recent --- now
 
+        self.object_list3 = self.object_list2  # 2 frames ago
+        self.object_list2 = self.object_list1
+        self.object_list1 = []  # Most recent --- now
+
         # Get the distance to the closest person
         closest_person_dist = np.inf
         person_probs = np.zeros((self.map_height, self.map_width))
 
-        for obj in msg.objects:
-            if obj.class_name != "person":
-                continue
+        closest_object_dist = np.inf
+        object_probs = np.zeros((self.map_height, self.map_width))
 
+        for obj in msg.objects:
             x = obj.pose.position.x
             y = obj.pose.position.y
-            self.person_list1.append((x, y))
+            width = obj.width
+
+            if obj.class_name == "person":
+                self.person_list1.append((x, y))
+            else:
+                self.object_list1.append((x, y, width))
 
         if self.person_occupancy is not None:
 
             for (x,y) in self.person_list1 + self.person_list2 + self.person_list3: 
                 radius = 0.3  # assume person occupies a circle of radius 0.3m
 
-                # Get x,y coordinates in terms of gird coordinates
+                # Get x,y coordinates in terms of grid coordinates
                 grid_x = int((x - self.map_origin[0]) / self.map_resolution)
                 grid_y = int((y - self.map_origin[1]) / self.map_resolution)
 
@@ -579,14 +618,6 @@ class Navigator:
                 grid_y = np.clip(grid_y, 0, self.map_height - 1)
 
                 # Update the person occupancy grid
-                # TODO Vectorize this
-                # for i in range(-self.person_occupancy.window_size//2, self.person_occupancy.window_size//2 + 1):
-                #     for j in range(-self.person_occupancy.window_size//2, self.person_occupancy.window_size//2 + 1):
-                #         if (0 <= grid_x + i < self.map_width) and (0 <= grid_y + j < self.map_height):
-                #             dist = np.sqrt(i**2 + j**2) * self.map_resolution
-                #             if dist <= radius:
-                #                 person_probs[grid_y + j, grid_x + i] = 1.0  # Mark as occupied
-
                 # Create a grid of coordinates centered at the person
                 window_size = self.person_occupancy.window_size
                 i_coords, j_coords = np.meshgrid(
@@ -616,10 +647,52 @@ class Navigator:
                 if dist_to_person < closest_person_dist:
                     closest_person_dist = dist_to_person
             self.distance_to_person = closest_person_dist
-
             self.person_occupancy.update(person_probs)
-
             self.person_in_path = self.person_intersect_path()
+
+            for (x,y,w) in self.object_list1 + self.object_list2 + self.object_list3:
+                radius = w / 2.0
+
+                # Get x,y coordinates in terms of grid coordinates
+                grid_x = int((x - self.map_origin[0]) / self.map_resolution)
+                grid_y = int((y - self.map_origin[1]) / self.map_resolution)
+
+                # make sure coordinates are within map
+                grid_x = np.clip(grid_x, 0, self.map_width - 1)
+                grid_y = np.clip(grid_y, 0, self.map_height - 1)
+
+                # Update the object near occupancy grid
+                # Create a grid of coordinates centered at the object
+                window_size = self.object_near_occupancy.window_size
+                i_coords, j_coords = np.meshgrid(
+                    np.arange(-window_size//2, window_size//2 + 1),
+                    np.arange(-window_size//2, window_size//2 + 1)
+                )
+                
+                # Calculate the grid positions
+                grid_x_coords = grid_x + i_coords
+                grid_y_coords = grid_y + j_coords
+
+                # Calculate distances from center (object position)
+                distances = np.sqrt(i_coords**2 + j_coords**2) * self.map_resolution
+                
+                # Create a mask for valid positions (within map bounds and within radius)
+                valid_mask = (
+                    (grid_x_coords >= 0) & (grid_x_coords < self.map_width) &
+                    (grid_y_coords >= 0) & (grid_y_coords < self.map_height) &
+                    (distances <= radius)
+                )
+                
+                # Update the occupancy grid for valid positions
+                object_probs[grid_y_coords[valid_mask], grid_x_coords[valid_mask]] = 1.0
+
+                dist_to_object = np.linalg.norm(np.array([x - self.x, y - self.y]))
+                if dist_to_object < closest_object_dist:
+                    closest_object_dist = dist_to_object
+
+            self.distance_to_object = closest_object_dist
+            self.object_near_occupancy.update(object_probs)
+            self.object_in_path = self.object_intersect_path()
 
     def modify_velocity_for_person(self, V, om):
         """
@@ -659,6 +732,16 @@ class Navigator:
             self.replan()
 
         return V, om
+
+    def replan_for_object(self):
+        """
+        Modifies the velocity based on the distance to the closest object.
+        If the distance is less than a threshold, it stops the robot.
+        """
+        if self.distance_to_object < OBJECT_STOP_DISTANCE and self.object_in_path:
+            return True
+        else:
+            return False
     
     def path_still_valid(self, path):
         for point in path:
@@ -1016,7 +1099,33 @@ class Navigator:
                     self.switch_mode(Mode.STOPPED_FOR_AGENT)
                     print("Agent in Path---Stopping")
                     self.stopped_for_agents = True
-                
+
+                # if self.replan_for_object():
+                #     # If we are too close to an object, stop and replan
+                #     print("******************************************")
+                #     print("Replanning because object in path")
+                #     print("******************************************")
+
+                #     self.replanning_from_object = True
+
+                #     # Stop the robot
+                #     self.switch_mode(Mode.IDLE)
+                #     cmd_vel = Twist()
+                #     cmd_vel.linear.x = 0.0
+                #     cmd_vel.angular.z = 0.0
+                #     self.nav_vel_pub.publish(cmd_vel)
+
+                #     obj_x = []  
+                #     obj_y = []
+                #     obj_d = []
+                #     for (x, y, d) in self.object_list1 + self.object_list2 + self.object_list3:
+                #         obj_x.append(x)
+                #         obj_y.append(y)
+                #         obj_d.append(d)
+
+                #     # Now replan
+                #     self.replan(obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
+
                 if (rospy.get_rostime() - self.current_plan_start_time).to_sec() > self.current_plan_duration:
                     rospy.loginfo("replanning because out of time")
 
