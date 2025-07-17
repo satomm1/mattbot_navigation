@@ -128,7 +128,7 @@ class Navigator:
         self.om_max = 3  # maximum angular velocity
         self.om_heading = 1.3  # angular velocity for heading controller
 
-        self.v_des = 0.4  # desired cruising velocity
+        self.v_des = 0.45  # desired cruising velocity
         self.theta_start_thresh = 0.05  # threshold in theta to start moving forward when path-following
         self.start_pos_thresh = (
             0.2  # threshold to be far enough into the plan to recompute it
