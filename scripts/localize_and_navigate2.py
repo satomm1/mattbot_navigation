@@ -31,6 +31,7 @@ DELTA_THRES = 0.1
 PERSON_STOP_DISTANCE = 1.6  # distance to closest person at which we stop the robot
 PERSON_SLOW_DISTANCE = 2.5  # distance to closest person at which we slow down the robot
 OBJECT_STOP_DISTANCE = 1.5
+AGENT_STOP_DISTANCE = 2
 
 class Mode(Enum):
     IDLE = 0        # not moving, waiting for a goal
@@ -99,7 +100,7 @@ class Navigator:
 
         self.other_agent_locs = dict()
         self.other_agent_time_dict = dict()  # agent ID -> time of last update
-        self.agents_in_path = []  # list of agent ID's that are in the path
+        self.agents_in_path = set()  # set of agent ID's that are in the path
         self.other_agents_not_static = []  # list of agent ID's that are not static (moving)
         self.other_agents_static = []  # list of agent ID's that are static (not moving)
         self.my_id = int(os.environ.get('ROBOT_ID', '0'))  # Get the robot ID from environment variable
@@ -541,7 +542,7 @@ class Navigator:
             else:
                 agent_x, agent_y = self.other_agent_locs[agent_id]
                 dist_to_agent = np.linalg.norm(np.array([self.x - agent_x, self.y - agent_y]))
-                if dist_to_agent < 1.5:
+                if dist_to_agent < AGENT_STOP_DISTANCE:
                     close_agents.append(agent_id)
 
         # Remove invalid agents from the dictionaries
@@ -551,7 +552,7 @@ class Navigator:
        
         # Check if any of the close agents are in the path
         path = self.current_plan
-        agents_in_path = []
+        agents_in_path = set()
         for point in path:
             point_x = point[0]
             point_y = point[1]
@@ -561,8 +562,8 @@ class Navigator:
                 grid_y = int((point_y - self.map_origin[1]) / self.map_resolution)
 
                 dist_to_agent = np.linalg.norm(np.array([point_x - agent_x, point_y - agent_y]))
-                if dist_to_agent < 1:
-                    agents_in_path.append(agent_id)
+                if dist_to_agent < 0.45:
+                    agents_in_path.add(agent_id)
 
         self.agents_in_path = agents_in_path
         
@@ -836,22 +837,26 @@ class Navigator:
 
         rospy.loginfo("Navigator: computing navigation plan")
         success = problem.solve()
-        if not success and self.mode == Mode.IDLE:
+        if not success and (self.mode == Mode.IDLE or self.mode == Mode.STOPPED_FOR_AGENT):
             rospy.loginfo("Planning failed")
             self.times_planned_failed += 1
 
-            if self.times_planned_failed > 5:
-                rospy.loginfo("Planning failed too many times, stopping")
-                self.times_planned_failed = 0
+            self.x_g = None
+            self.y_g = None
+            self.theta_g = None
 
-                self.x_g = None
-                self.y_g = None
-                self.theta_g = None
-                self.switch_mode(Mode.IDLE)
-            else:
-                self.x_g += np.random.normal(0,0.05)
-                self.y_g += np.random.normal(0,0.05)
-                self.replan()
+            # if self.times_planned_failed > 5:
+            #     rospy.loginfo("Planning failed too many times, stopping")
+            #     self.times_planned_failed = 0
+
+            #     self.x_g = None
+            #     self.y_g = None
+            #     self.theta_g = None
+            #     self.switch_mode(Mode.IDLE)
+            # else:
+            #     self.x_g += np.random.normal(0,0.05)
+            #     self.y_g += np.random.normal(0,0.05)
+            #     self.replan()
             return
         else:
             self.times_planned_failed = 0
@@ -1095,7 +1100,7 @@ class Navigator:
                         print("Waypoint reached")
                         self.waypoints.pop(0)  # Remove the first waypoint since we are close to it
                 
-                if not self.is_lowest_id and self.agent_intersect_path():
+                if self.agent_intersect_path() and not self.is_lowest_id:
                     self.switch_mode(Mode.STOPPED_FOR_AGENT)
                     print("Agent in Path---Stopping")
                     self.stopped_for_agents = True
@@ -1223,13 +1228,14 @@ class Navigator:
                     self.replan()
                 else:
                     # Get intersection of agents in path and agents that are not static
-                    moving_agents_in_path = set(self.agents_in_path).intersection(set(self.other_agents_not_static))
+                    moving_agents_in_path = self.agents_in_path.intersection(set(self.other_agents_not_static))
                     if len(moving_agents_in_path) == 0:
                         # No moving agents, replan around the static agents:
                         print("******************************************")
                         print("Replanning because no moving agents in path")
                         print("******************************************")
-                        self.switch_mode(Mode.IDLE)
+                        print("Agents in path:", self.agents_in_path)
+                        print("other agents not static:", self.other_agents_not_static)                        
                         self.replan()
                     else:
                         # We have moving agents in the path, the smallest agent_id has priority
@@ -1241,7 +1247,6 @@ class Navigator:
                             print("Replanning because we are the lowest agent in path")
                             print("******************************************")
                             self.is_lowest_id = True
-                            self.switch_mode(Mode.IDLE)
                             self.replan()
 
             self.publish_control()

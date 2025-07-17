@@ -4,7 +4,7 @@ import scipy.interpolate
 from navigation_utils.trackers import TrajectoryTracker,  PoseController, HeadingController
 from navigation_utils.grids import DetOccupancyGrid2D, StochOccupancyGrid2D
 from navigation_utils.search import AStar
-from zones import load_zones_from_file, get_zone_for_point
+from navigation_utils.zone import load_zones_from_file, get_zone_for_point
 
 def wrapToPi(a):
     if isinstance(a, list):
