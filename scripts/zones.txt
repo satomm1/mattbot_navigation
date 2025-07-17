@@ -1,0 +1,3 @@
+# Format: zone_name x1 y1 x2 y2 x3 y3 ...
+office 1 1 2 1 1 2
+kitchen 2 1 2 2 1 2
