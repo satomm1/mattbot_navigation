@@ -1084,7 +1084,15 @@ class Navigator:
 
                     self.switch_mode(Mode.IDLE)
                     self.robot_stopped_by_person = False
-                    self.replan()
+                    obj_x = []
+                    obj_y = []
+                    obj_d = []
+                    for (x, y) in self.person_list1 + self.person_list2 + self.person_list3:
+                        obj_x.append(x)
+                        obj_y.append(y)
+                        obj_d.append(0.3)  # Assuming a radius of 0.3m for people
+
+                    self.replan(obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
                 elif self.distance_to_person > PERSON_STOP_DISTANCE:
                     print("******************************************")
                     print("Replanning because person no longer in path")
