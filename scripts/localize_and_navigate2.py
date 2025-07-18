@@ -659,6 +659,7 @@ class Navigator:
             self.person_occupancy.update(person_probs)
             self.person_in_path = self.person_intersect_path()
 
+        if self.object_near_occupancy is not None:
             for (x,y,w) in self.object_list1 + self.object_list2 + self.object_list3:
                 radius = w / 2.0
 
