@@ -82,7 +82,7 @@ class AStar(object):
         """
         return (self.resolution * round(x[0] / self.resolution), self.resolution * round(x[1] / self.resolution))
 
-    def get_neighbors(self, x):
+    def get_neighbors(self, x, step_resolution=1):
         """
         Gets the FREE neighbor states of a given state x. Assumes a motion model
         where we can move up, down, left, right, or along the diagonals by an
@@ -108,8 +108,8 @@ class AStar(object):
                 if ii != 0 or jj != 0:
                     x0 = x[0]
                     x1 = x[1]
-                    x0 += ii * self.resolution  # /(np.linalg.norm(np.array((ii, jj))))
-                    x1 += jj * self.resolution  # /(np.linalg.norm(np.array((ii, jj))))
+                    x0 += ii * self.resolution * step_resolution  # /(np.linalg.norm(np.array((ii, jj))))
+                    x1 += jj * self.resolution * step_resolution  # /(np.linalg.norm(np.array((ii, jj))))
                     state = self.snap_to_grid((x0, x1))
                     if self.is_free(state):
                         neighbors.append(state)
@@ -123,7 +123,24 @@ class AStar(object):
         """
         return min(self.open_set, key=lambda x: self.est_cost_through[x])
 
-    def reconstruct_path(self):
+    def interpolate_path_linear(self, path, step_resolution=2):
+        """Linearly interpolate between path points"""
+        path_array = np.array(path)
+        new_path = []
+        for i in range(len(path_array) - 1):
+            start = path_array[i]
+            end = path_array[i + 1]
+            num_to_add = step_resolution - 1
+            
+            new_path.append(self.snap_to_grid(start))
+            for j in range(num_to_add):
+                t = (j + 1) / (num_to_add + 1)
+                interpolated_point = start + t * (end - start)
+                new_path.append(self.snap_to_grid(interpolated_point))
+        new_path.append(self.snap_to_grid(path_array[-1]))
+        return new_path
+
+    def reconstruct_path(self, step_resolution=1):
         """
         Use the came_from map to reconstruct a path from the initial location to
         the goal location
@@ -135,9 +152,13 @@ class AStar(object):
         while current != self.x_init:
             path.append(self.came_from[current])
             current = path[-1]
+
+        # if step_resolution > 1:
+        #     return self.interpolate_path_linear(list(reversed(path)), step_resolution=step_resolution)
+
         return list(reversed(path))
 
-    def solve(self):
+    def solve(self, step_resolution=1):
         """
         Solves the planning problem using the A* search algorithm. It places
         the solution as a list of tuples (each representing a state) that go
@@ -153,9 +174,19 @@ class AStar(object):
                 set membership efficiently using the syntax "if item in set".
         """
         ########## Code starts here ##########
-        time_limit = 120
-        start = time.time()
-        
+        time_limit = 120    
+
+        print("step resolution: ", step_resolution)
+
+        dist_to_goal = self.distance(self.x_init, self.x_goal)
+        if dist_to_goal < 20:
+            time_limit = 5
+        elif dist_to_goal < 40:
+            time_limit = 20
+        else:
+            time_limit = 30
+
+        start = time.time()        
         print(self.x_init)
         while len(self.open_set) > 0:
             if time.time() - start > time_limit:
@@ -164,12 +195,12 @@ class AStar(object):
         
             x_current = self.find_best_est_cost_through()
             if x_current == self.x_goal:
-                self.path = self.reconstruct_path()
+                self.path = self.reconstruct_path(step_resolution=step_resolution)
                 return True
             self.open_set.remove(x_current)
             self.closed_set.add(x_current)
-            for x_neigh in self.get_neighbors(x_current):
-                
+            for x_neigh in self.get_neighbors(x_current, step_resolution=step_resolution):
+
                 # if x_neigh not in self.closed_set:
                 #     continue
                 # tentative_cost_to_arrive = self.cost_to_arrive[x_current] + self.distance(x_current, x_neigh)

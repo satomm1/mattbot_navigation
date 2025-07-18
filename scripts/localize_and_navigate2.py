@@ -844,32 +844,26 @@ class Navigator:
             robots_x=robots_x, robots_y=robots_y, obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
 
         rospy.loginfo("Navigator: computing navigation plan")
-        success = problem.solve()
-        if not success and (self.mode == Mode.IDLE or self.mode == Mode.STOPPED_FOR_AGENT):
-            rospy.loginfo("Planning failed")
-            self.times_planned_failed += 1
+        success = False
+        while not success:
+            success = problem.solve(step_resolution=self.times_planned_failed + 1)
+            if not success and (self.mode == Mode.IDLE or self.mode == Mode.STOPPED_FOR_AGENT):
+                rospy.loginfo("Planning failed")
+                self.times_planned_failed += 1
 
-            self.x_g = None
-            self.y_g = None
-            self.theta_g = None
+                if self.times_planned_failed > 1:
+                    rospy.loginfo("Planning failed too many times, stopping")
+                    self.times_planned_failed = 0
 
-            # if self.times_planned_failed > 5:
-            #     rospy.loginfo("Planning failed too many times, stopping")
-            #     self.times_planned_failed = 0
-
-            #     self.x_g = None
-            #     self.y_g = None
-            #     self.theta_g = None
-            #     self.switch_mode(Mode.IDLE)
-            # else:
-            #     self.x_g += np.random.normal(0,0.05)
-            #     self.y_g += np.random.normal(0,0.05)
-            #     self.replan()
-            return
-        else:
-            self.times_planned_failed = 0
-            rospy.loginfo("Planning Succeeded")
-            planned_path = problem.path
+                    self.x_g = None
+                    self.y_g = None
+                    self.theta_g = None
+                    self.switch_mode(Mode.IDLE)
+                    return
+            else:
+                self.times_planned_failed = 0
+                rospy.loginfo("Planning Succeeded")
+                planned_path = problem.path
 
         # Check whether path is too short
         if planned_path == None:
