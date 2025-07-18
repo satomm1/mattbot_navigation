@@ -209,6 +209,7 @@ class Navigator:
         self.has_stopped = False
 
         self.waypoints = []
+        self.backing_for_waypoints = False
         self.backing_start_time = 0
 
         self.switch_mode(Mode.WAITING_FOR_INIT)
@@ -1102,6 +1103,7 @@ class Navigator:
                         print("Backing up because haven't reached waypoint")
                         print("******************************************")
                         self.backing_start_time = current_time
+                        self.backing_for_waypoints = True
                         self.switch_mode(Mode.BACKING)
                     elif np.linalg.norm(np.array([self.x - self.waypoints[0][0], self.y - self.waypoints[0][1]])) < 0.35:
                         print("Waypoint reached")
@@ -1168,6 +1170,19 @@ class Navigator:
                         self.backing_from_bad_localization = False
                         self.relocalizing_start_time = current_time
                         self.switch_mode(Mode.RELOCALIZING)
+                    elif self.backing_for_waypoints:
+                        print("Backing up for waypoints")
+                        # Stop moving
+                        cmd_vel = Twist()
+                        cmd_vel.linear.x = 0.0
+                        cmd_vel.angular.z = 0.0
+                        self.nav_vel_pub.publish(cmd_vel)
+
+                        self.backing_for_waypoints = False
+
+                        # Now relocalize
+                        self.relocalizing_start_time = current_time
+                        self.switch_mode(Mode.RELOCALIZING)
                     else:
                         self.switch_mode(Mode.IDLE)
 
@@ -1185,7 +1200,7 @@ class Navigator:
                     # self.switch_mode(Mode.RELOCALIZING)
             elif self.mode == Mode.RELOCALIZING:
                 current_time = rospy.get_rostime().to_sec()
-                if current_time - self.relocalizing_start_time > 8:
+                if current_time - self.relocalizing_start_time > 5:
                     self.switch_mode(Mode.IDLE)
                     
                     # Stop moving
