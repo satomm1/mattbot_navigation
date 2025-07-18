@@ -202,6 +202,7 @@ class Navigator:
         self.initialpose_subscriber = rospy.Subscriber("/initialpose", PoseWithCovarianceStamped, self.initial_pose_callback)
         rospy.Subscriber("/lost_localization", Bool, self.lost_localization_callback)
         rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
+        rospy.Subscriber("/valid_points", Bool, self.valid_points_callback)
         self.localized_pub = rospy.Publisher("/localized", Bool, queue_size=10)
         self.initialpose_pub = rospy.Publisher("/initialpose", PoseWithCovarianceStamped, queue_size=10)
         self.invalid_goal_pub = rospy.Publisher("/invalid_goal", Pose2D, queue_size=10)
@@ -436,6 +437,17 @@ class Navigator:
             self.other_agents_not_static.remove(agent_id)
         elif agent_id not in self.other_agents_not_static and not msg.isStatic.data:
             self.other_agents_not_static.append(agent_id)
+
+    def valid_points_callback(self, msg):
+        if not msg.data:
+            rospy.logwarn("Invalid points received, stopping the robot.")
+
+            if self.mode == Mode.TRACK:
+                # For now, use backing for waypoints
+                current_time = rospy.get_rostime().to_sec()
+                self.backing_start_time = current_time
+                self.backing_for_waypoints = True
+                self.switch_mode(Mode.BACKING)
 
     def aligned(self):
         """

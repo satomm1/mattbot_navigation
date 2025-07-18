@@ -99,6 +99,10 @@ class Map:
         self.new_map_publisher = rospy.Publisher('/new_map', OccupancyGrid, queue_size=10)
         self.new_map_publisher.publish(self.new_map)
 
+        # Publisher if valid points or not (due to being too close)
+        self.valid_points = True
+        self.valid_points_pub = rospy.Publisher('/valid_points', Bool, queue_size=10)
+
         # Prepare the combined map and the publisher (contains objects + occupancy grid map)
         self.combined_map = OccupancyGrid()
         self.combined_map.header = self.map_msg.header
@@ -273,6 +277,17 @@ class Map:
 
         # Get data from msg into an numpy array
         data = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)))
+
+        if data.shape[0] == 0:
+            rospy.logwarn("No points in point cloud, skipping processing.")
+            if self.valid_points:
+                self.valid_points = False
+                self.valid_points_pub.publish(Bool(data=False))
+            return
+        elif not self.valid_points:
+            self.valid_points = True
+            self.valid_points_pub.publish(Bool(data=True))
+
         dist = np.sqrt(data[:, 0]**2 + data[:, 2]**2)
 
         height = data[:, 1] + self.camera_height  
