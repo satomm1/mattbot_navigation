@@ -204,6 +204,7 @@ class Navigator:
         rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
         self.localized_pub = rospy.Publisher("/localized", Bool, queue_size=10)
         self.initialpose_pub = rospy.Publisher("/initialpose", PoseWithCovarianceStamped, queue_size=10)
+        self.invalid_goal_pub = rospy.Publisher("/invalid_goal", Pose2D, queue_size=10)
 
         self.has_stopped = False
 
@@ -260,6 +261,12 @@ class Navigator:
         # Make sure we have an occupancy grid and that the goal is valid
         if self.occupancy is not None and not self.occupancy.is_free((msg.x, msg.y)):
             rospy.loginfo("Not a valid goal")
+            # Publish an invalid goal message
+            invalid_goal_msg = Pose2D()
+            invalid_goal_msg.x = msg.x
+            invalid_goal_msg.y = msg.y
+            invalid_goal_msg.theta = msg.theta
+            self.invalid_goal_pub.publish(invalid_goal_msg)
             return
         
         # Update the goal
