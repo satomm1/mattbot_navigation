@@ -1,6 +1,6 @@
 import rospy
 import rospkg
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import Twist, Pose
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
@@ -48,6 +48,9 @@ class Map:
         
         # Subscribe to map updates
         self.map_update_subscriber = rospy.Subscriber('/map_update', MapUpdate, self.map_update_callback, queue_size=10)
+
+        self.robot_mode = 0
+        self.robot_mode_subscriber = rospy.Subscriber('/robot_mode', Int32, self.robot_mode_callback, queue_size=10)
 
         self.new_map = OccupancyGrid()
         self.new_map.header = self.map_msg.header
@@ -195,6 +198,9 @@ class Map:
 
     def localized_callback(self, msg):
         self.is_localized = msg.data   
+
+    def robot_mode_callback(self, msg):
+        self.robot_mode = msg.data
 
     def perceptual_field(self, x0, y0, x1, y1, all_x, all_y):
         """
@@ -535,6 +541,10 @@ class Map:
 
     def detected_objects_callback(self, msg):
         object_array = msg.objects
+
+        if self.robot_mode == 6 or self.robot_mode == 7 or self.robot_mode == 8 or self.robot_mode == 1 or self.robot_mode == 2:
+            # Don't process objects since these states are not stable
+            return
 
         # iterate through all objects
         for obj in object_array:
