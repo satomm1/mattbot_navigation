@@ -1077,7 +1077,7 @@ class Navigator:
                         'odom_alpha2': 0.8,
                         # 'odom_alpha4': 0.8,
                     }
-                    client.update_configuration(params)
+                    # client.update_configuration(params)
 
             elif self.mode == Mode.ALIGN:
                 if self.aligned():
