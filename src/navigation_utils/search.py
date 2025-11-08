@@ -1,5 +1,6 @@
 import numpy as np
 import time
+from queue import PriorityQueue
 
 class AStar(object):
     """Represents a motion planning problem to be solved using A*"""
@@ -17,6 +18,9 @@ class AStar(object):
         self.came_from = {}  # dictionary keeping track of each state's parent to reconstruct the path
         self.est_cost_through = {}
         self.cost_to_arrive = {}
+
+        self.priority_queue = PriorityQueue()
+        self.priority_queue.put((self.manhattan_distance(self.x_init, self.x_goal), self.x_init))
 
         self.open_set.add(self.x_init)
         self.cost_to_arrive[self.x_init] = 0
@@ -72,6 +76,23 @@ class AStar(object):
         ########## Code starts here ##########
         return np.linalg.norm(np.array(x1) - np.array(x2))
         ########## Code ends here ##########
+
+    def manhattan_distance(self, x1, x2):
+        """
+        Computes the Manhattan distance between two states.
+        Inputs:
+            x1: First state tuple
+            x2: Second state tuple
+        Output:
+            Float Manhattan distance
+        """
+        return np.sum(np.abs(np.array(x1) - np.array(x2)))
+    
+    def h(self, x):
+        return self.manhattan_distance(x, self.x_goal)
+
+    def cost(self, x1, x2):
+        return self.distance(x1, x2)
 
     def snap_to_grid(self, x):
         """ Returns the closest point on a discrete state grid
@@ -158,7 +179,7 @@ class AStar(object):
 
         return list(reversed(path))
 
-    def solve(self, step_resolution=1):
+    def solve_old(self, step_resolution=1):
         """
         Solves the planning problem using the A* search algorithm. It places
         the solution as a list of tuples (each representing a state) that go
@@ -219,3 +240,38 @@ class AStar(object):
                     self.est_cost_through[x_neigh] = tentative_cost_to_arrive + self.distance(x_neigh, self.x_goal)
         return False
         ########## Code ends here ##########
+
+    def solve(self, step_resolution=1):
+        time_limit = 120    
+
+        t_start = time.time()  
+        while self.priority_queue.qsize() > 0:
+            current_cost, x_current = self.priority_queue.get()
+
+            if x_current == self.x_goal:
+                t_end = time.time()
+                self.path = self.reconstruct_path()
+                print(f"A* found a path in {t_end - t_start:.2f} seconds.")
+                return True
+
+            if time.time() - t_start > time_limit:
+                print("A* took too long.")
+                return False
+
+            self.closed_set.add(x_current)
+
+            for x_neigh in self.get_neighbors(x_current):
+                if x_neigh in self.closed_set:
+                    continue
+
+                tentative_cost_to_arrive = self.cost_to_arrive[x_current] + self.distance(x_current, x_neigh)
+
+                if x_neigh not in self.cost_to_arrive or tentative_cost_to_arrive < self.cost_to_arrive[x_neigh]:
+                    cost_x_x_neigh = self.cost(x_current, x_neigh)
+                    self.came_from[x_neigh] = x_current
+                    self.cost_to_arrive[x_neigh] = tentative_cost_to_arrive
+                    self.priority_queue.put(
+                        (current_cost + cost_x_x_neigh + self.h(x_neigh)
+                         - self.h(x_current),
+                         x_neigh)
+                    )
