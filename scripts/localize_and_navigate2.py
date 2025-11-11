@@ -128,7 +128,7 @@ class Navigator:
         self.om_max = 3  # maximum angular velocity
         self.om_heading = 1.3  # angular velocity for heading controller
 
-        self.v_des = rospy.get_param('/navigator_node/cruising_velocity', 0.35) # desired cruising velocity
+        self.v_des = rospy.get_param('/cruising_velocity', 0.35) # desired cruising velocity
         self.theta_start_thresh = 0.05  # threshold in theta to start moving forward when path-following
         self.start_pos_thresh = (
             0.2  # threshold to be far enough into the plan to recompute it
@@ -156,13 +156,13 @@ class Navigator:
         self.om_prev = 0.0
 
         # Get AMCL parameters to use
-        self.alpha1 = rospy.get_param('/navigator_node/alpha1', 0.5)
-        self.alpha2 = rospy.get_param('/navigator_node/alpha2', 0.8)
-        self.alpha3 = rospy.get_param('/navigator_node/alpha3', 0.8)
-        self.alpha4 = rospy.get_param('/navigator_node/alpha4', 0.2)
-        self.z_hit = rospy.get_param('/navigator_node/z_hit', 0.95)
-        self.z_rand = rospy.get_param('/navigator_node/z_rand', 0.05)
-        self.sigma_hit = rospy.get_param('/navigator_node/sigma_hit', 0.02)
+        self.alpha1 = rospy.get_param('/alpha1', 0.8)
+        self.alpha2 = rospy.get_param('/alpha2', 0.8)
+        self.alpha3 = rospy.get_param('/alpha3', 0.8)
+        self.alpha4 = rospy.get_param('/alpha4', 0.8)
+        self.z_hit = rospy.get_param('/z_hit', 0.95)
+        self.z_rand = rospy.get_param('/z_rand', 0.05)
+        self.sigma_hit = rospy.get_param('/sigma_hit', 0.01)
 
         self.traj_controller = TrajectoryTracker(
             self.kpx, self.kpy, self.kdx, self.kdy, self.v_max, self.om_max
