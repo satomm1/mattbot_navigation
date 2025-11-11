@@ -128,7 +128,7 @@ class Navigator:
         self.om_max = 3  # maximum angular velocity
         self.om_heading = 1.3  # angular velocity for heading controller
 
-        self.v_des = 0.45  # desired cruising velocity
+        self.v_des = rospy.get_param('/navigator_node/cruising_velocity', 0.35) # desired cruising velocity
         self.theta_start_thresh = 0.05  # threshold in theta to start moving forward when path-following
         self.start_pos_thresh = (
             0.2  # threshold to be far enough into the plan to recompute it
@@ -154,6 +154,15 @@ class Navigator:
         # heading controller parameters
         self.kp_th = 1.5
         self.om_prev = 0.0
+
+        # Get AMCL parameters to use
+        self.alpha1 = rospy.get_param('/navigator_node/alpha1', 0.5)
+        self.alpha2 = rospy.get_param('/navigator_node/alpha2', 0.8)
+        self.alpha3 = rospy.get_param('/navigator_node/alpha3', 0.8)
+        self.alpha4 = rospy.get_param('/navigator_node/alpha4', 0.2)
+        self.z_hit = rospy.get_param('/navigator_node/z_hit', 0.95)
+        self.z_rand = rospy.get_param('/navigator_node/z_rand', 0.05)
+        self.sigma_hit = rospy.get_param('/navigator_node/sigma_hit', 0.02)
 
         self.traj_controller = TrajectoryTracker(
             self.kpx, self.kpy, self.kdx, self.kdy, self.v_max, self.om_max
@@ -1066,18 +1075,21 @@ class Navigator:
                     client = Client('amcl', timeout=30)
                     # Get current configuration
                     config = client.get_configuration()
-                    rospy.loginfo("Current configuration: %s", config)
+                    # rospy.loginfo("Current configuration: %s", config)
 
                     # Update parameters to emphasize sensor measurements
                     params = {
                         # Measurement model parameters
-                        'laser_z_hit': 0.95,            # Increase hit weight (default ~0.7)
-                        'laser_z_rand': 0.05,          # Decrease random weight (default ~0.2)
-                        'laser_sigma_hit': 0.01,        # Decrease sigma for higher confidence
-                        'odom_alpha2': 0.8,
-                        # 'odom_alpha4': 0.8,
+                        'laser_z_hit': self.z_hit,            # Increase hit weight (default ~0.7)
+                        'laser_z_rand': self.z_rand,          # Decrease random weight (default ~0.2)
+                        'laser_sigma_hit': self.sigma_hit,        # Decrease sigma for higher confidence
+                        'odom_alpha1': self.alpha1,
+                        'odom_alpha2': self.alpha2,
+                        'odom_alpha3': self.alpha3,
+                        'odom_alpha4': self.alpha4
                     }
-                    # client.update_configuration(params)
+                    client.update_configuration(params)
+                    print("Updated AMCL parameters for better localization after initial pose.")
 
             elif self.mode == Mode.ALIGN:
                 if self.aligned():

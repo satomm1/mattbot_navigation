@@ -6,6 +6,16 @@
 
   <arg name="patrol" default="false" />
 
+  <arg name="alpha1" default="0.8"/>
+  <arg name="alpha2" default="0.8"/>
+  <arg name="alpha3" default="0.8"/>
+  <arg name="alpha4" default="0.8"/>
+  <arg name="z_hit" default="0.95"/>
+  <arg name="z_rand" default="0.05"/>
+  <arg name="sigma_hit" default="0.01"/>
+
+  <arg name="cruising_velocity" default="0.40"/>
+
   <!-- Launch the occupancy grid mapper -->
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
 
@@ -13,7 +23,14 @@
 
   <!-- Launch the navigator.py script -->
   <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate2.py" output="screen">
-
+    <param name="alpha1" value="$(arg alpha1)"/>
+    <param name="alpha2" value="$(arg alpha2)"/>
+    <param name="alpha3" value="$(arg alpha3)"/>
+    <param name="alpha4" value="$(arg alpha4)"/>
+    <param name="z_hit" value="$(arg z_hit)"/>
+    <param name="z_rand" value="$(arg z_rand)"/>
+    <param name="sigma_hit" value="$(arg sigma_hit)"/>
+    <param name="cruising_velocity" value="$(arg cruising_velocity)"/>
   </node>
 
   <!-- Launch the patrol.py script only if patrol is true -->
