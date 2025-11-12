@@ -16,6 +16,11 @@
 
   <param name="cruising_velocity" value="0.40"/>
 
+  <param name="kpx" value="2.0"/>
+  <param name="kpy" value="2.0"/>
+  <param name="kdx" value="1.5"/>
+  <param name="kdy" value="1.5"/>
+
   <!-- Launch the occupancy grid mapper -->
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
 

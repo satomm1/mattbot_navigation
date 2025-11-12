@@ -146,10 +146,10 @@ class Navigator:
         self.traj_dt = 0.1
 
         # trajectory tracking controller parameters
-        self.kpx = 1
-        self.kpy = 1
-        self.kdx = 1.5
-        self.kdy = 1.5
+        self.kpx = rospy.get_param('/kpx', 2)
+        self.kpy = rospy.get_param('/kpy', 2)
+        self.kdx = rospy.get_param('/kdx', 1.5)
+        self.kdy = rospy.get_param('/kdy', 1.5)
 
         # heading controller parameters
         self.kp_th = 1.5
