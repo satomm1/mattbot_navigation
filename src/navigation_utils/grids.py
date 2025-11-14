@@ -95,8 +95,8 @@ class StochOccupancyGrid2D(object):
             # print(counts)
             #print(self.resolution)
             return False  # Not free according to configuration space
-        elif np.sum(self.probs[config_y_lower:config_y_upper, config_x_lower:config_x_upper]<0):
-            return False  # This is unknown space, not free!
+        # elif np.sum(self.probs[config_y_lower:config_y_upper, config_x_lower:config_x_upper]<0):
+        #     return False  # This is unknown space, not free!
 
         # Now check probabilities
         half_size = int(round((self.window_size-1)/2))
