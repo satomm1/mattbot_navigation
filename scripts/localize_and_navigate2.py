@@ -862,7 +862,10 @@ class Navigator:
 
         combined_occupancy = self.occupancy
 
-        problem = AStar(state_min, state_max, x_init, x_goal, combined_occupancy, self.plan_resolution,
+        if self.use_social_astar:
+            problem = SocialAStar(state_min, state_max, x_init, x_goal, combined_occupancy, self.plan_resolution)
+        else:
+            problem = AStar(state_min, state_max, x_init, x_goal, combined_occupancy, self.plan_resolution,
             robots_x=robots_x, robots_y=robots_y, obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
 
         rospy.loginfo("Navigator: computing navigation plan")

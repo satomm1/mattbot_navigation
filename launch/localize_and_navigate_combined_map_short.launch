@@ -21,6 +21,8 @@
   <param name="kdx" value="1.5"/>
   <param name="kdy" value="1.5"/>
 
+  <param name="use_social_astar" value="false"/>
+
   <!-- Launch the occupancy grid mapper -->
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
 
