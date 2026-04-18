@@ -20,6 +20,8 @@ import requests
 import os
 
 from navigation_utils import TrajectoryTracker, PoseController, HeadingController, wrapToPi, StochOccupancyGrid2D, AStar, compute_smoothed_traj
+from social_path_planning import AStar as SocialAStar, AStar_With_Graph as SocialAStar_With_Graph
+
 
 V_PREV_THRES = 0.0001
 
@@ -185,6 +187,13 @@ class Navigator:
             "/cmd_smoothed_path", Path, queue_size=10
         )
         self.nav_vel_pub = rospy.Publisher("/cmd_vel_mux/input/nav_vel", Twist, queue_size=10)
+
+        # Get whether to use social A* or Regular A*
+        self.use_social_astar = rospy.get_param('/use_social_astar', False)
+        if self.use_social_astar:
+            rospy.loginfo("Using social A* for path planning")
+        else:
+            rospy.loginfo("Using regular A* for path planning")
 
         #Publishes current state of robot (IDLE, ALIGN, etc)
         self.state_pub = rospy.Publisher("/robot_mode", Int32, queue_size=10)
