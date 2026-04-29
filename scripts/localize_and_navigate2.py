@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 
+import rospkg
 import rospy
 from nav_msgs.msg import OccupancyGrid, MapMetaData, Path
-from geometry_msgs.msg import Twist, Pose2D, PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import Twist, Pose2D, PoseStamped, PoseWithCovarianceStamped, Point
 from std_msgs.msg import String, Int32, Float64, Bool
 from visualization_msgs.msg import Marker, MarkerArray
 from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray
@@ -12,6 +13,7 @@ from dynamic_reconfigure.client import Client
 
 import time
 import numpy as np
+import networkx as nx
 from numpy import linalg
 import scipy.interpolate
 import matplotlib.pyplot as plt
@@ -21,6 +23,7 @@ import os
 
 from navigation_utils import TrajectoryTracker, PoseController, HeadingController, wrapToPi, StochOccupancyGrid2D, AStar, compute_smoothed_traj
 from social_path_planning import AStar as SocialAStar, AStar_With_Graph as SocialAStar_With_Graph
+from social_path_planning import FrequentSubgraph
 
 
 V_PREV_THRES = 0.0001
@@ -83,6 +86,15 @@ class Navigator:
         self.occupancy = None
         self.occupancy_updated = False
         self.object_occupancy = None
+        self.frequent = None  # The frequent subgraph
+        self.sparse_graph_threshold = rospy.get_param('/sparse_graph_threshold', 5)  # Threshold for building the frequent subgraph
+        self.sparse_graph_components = rospy.get_param('/sparse_graph_components', 15)  # Minimum component size for pruning the frequent subgraph
+        self.map_frame_id = rospy.get_param('~frequent_graph_map_frame', 'map')
+        self.publish_frequent_graph_viz = rospy.get_param('~publish_frequent_graph_viz', True)
+        # Applied once when canonicalizing loaded heatmap graph keys to ROS map (col, row).
+        self.frequent_graph_mirror_cell_x = rospy.get_param('~frequent_graph_mirror_cell_x', True)
+        self.frequent_graph_mirror_cell_y = rospy.get_param('~frequent_graph_mirror_cell_y', True)
+        self.frequent_graph_swap_cell_axes = rospy.get_param('~frequent_graph_swap_cell_axes', False)
 
         self.person_occupancy = None
         self.robot_stopped_by_person = False
@@ -199,6 +211,9 @@ class Navigator:
         self.state_pub = rospy.Publisher("/robot_mode", Int32, queue_size=10)
 
         self.waypoint_pub = rospy.Publisher("/waypoints", MarkerArray, queue_size=10)
+        self.frequent_graph_viz_pub = rospy.Publisher(
+            "/frequent_graph_viz", Marker, queue_size=1, latch=True
+        )
 
         self.trans_listener = tf.TransformListener()
 
@@ -329,17 +344,139 @@ class Navigator:
         self.map_resolution = msg.resolution
         self.map_origin = (msg.origin.position.x, msg.origin.position.y)
 
+    def _heatmap_cell_to_world(self, ci, ri, w, h, ox, oy, res):
+        """Heatmap/sparse_graph cell (col, row) → world (m) using load-time mirror/swap params."""
+        if self.frequent_graph_swap_cell_axes:
+            ci, ri = ri, ci
+        if self.frequent_graph_mirror_cell_x:
+            ci = w - 1 - ci
+        if self.frequent_graph_mirror_cell_y:
+            ri = h - 1 - ri
+        return ox + float(ci) * res, oy + float(ri) * res
+
+    def _canonical_cell_from_heatmap_indices(self, ci, ri):
+        """Map stored heatmap node indices to ROS map cell indices matching occupancy / get_index."""
+        occ = self.occupancy
+        w, h = int(occ.width), int(occ.height)
+        ox, oy = float(occ.origin_x), float(occ.origin_y)
+        res = float(occ.resolution)
+        wx, wy = self._heatmap_cell_to_world(ci, ri, w, h, ox, oy, res)
+        gi = int(np.round((wx - ox) / res))
+        gj = int(np.round((wy - oy) / res))
+        gi = int(np.clip(gi, 0, w - 1))
+        gj = int(np.clip(gj, 0, h - 1))
+        return (gi, gj)
+
+    def _canonicalize_frequent_graph(self):
+        """Relabel graph nodes so keys are ROS map (col, row); RViz uses origin + index * res."""
+        g = self.frequent.graph
+        mapping = {}
+        collisions = 0
+        seen_new = {}
+        for node in list(g.nodes()):
+            try:
+                ci, ri = int(node[0]), int(node[1])
+            except (TypeError, ValueError, IndexError):
+                rospy.logwarn("Skipping non-integer frequent graph node: %r", node)
+                continue
+            new_node = self._canonical_cell_from_heatmap_indices(ci, ri)
+            mapping[node] = new_node
+            if new_node in seen_new and seen_new[new_node] != node:
+                collisions += 1
+            seen_new.setdefault(new_node, node)
+        if not mapping:
+            return
+        # copy=True: mapping often overlaps old/new labels (e.g. identity on many nodes);
+        # in-place relabel then raises NetworkXUnfeasible (cycle / overlapping label sets).
+        self.frequent.graph = nx.relabel_nodes(g, mapping, copy=True)
+        g = self.frequent.graph
+        rospy.loginfo(
+            "Canonicalized frequent subgraph to ROS map cells: %d nodes, %d edges%s",
+            g.number_of_nodes(),
+            g.number_of_edges(),
+            (" (%d heatmap cells merged to same ROS cell)" % collisions) if collisions else "",
+        )
+
+    def publish_frequent_graph_rviz(self):
+        """Publish the loaded frequent subgraph as a LINE_LIST Marker in ``map_frame_id``."""
+        if not self.publish_frequent_graph_viz:
+            return
+        if self.frequent is None or self.occupancy is None:
+            return
+        g = self.frequent.graph
+        if g.number_of_edges() == 0:
+            rospy.logwarn("Frequent graph has no edges; skipping RViz visualization.")
+            return
+
+        m = Marker()
+        m.header.frame_id = self.map_frame_id
+        m.header.stamp = rospy.Time.now()
+        m.ns = "frequent_subgraph"
+        m.id = 0
+        m.type = Marker.LINE_LIST
+        m.action = Marker.ADD
+        m.pose.orientation.w = 1.0
+        m.scale.x = rospy.get_param('~frequent_graph_line_width', 0.015)
+        m.color.r = 1.0
+        m.color.g = 0.0
+        m.color.b = 1.0
+        m.color.a = rospy.get_param('~frequent_graph_alpha', 0.65)
+        m.lifetime = rospy.Duration(0)
+
+        ox = float(self.occupancy.origin_x)
+        oy = float(self.occupancy.origin_y)
+        res = float(self.occupancy.resolution)
+        z = float(rospy.get_param('~frequent_graph_z', 0.02))
+
+        def _cell_to_world(ci, ri):
+            """Nodes are canonical ROS map (col, row) after _canonicalize_frequent_graph."""
+            return ox + float(ci) * res, oy + float(ri) * res
+
+        for u, v in g.edges():
+            try:
+                uc, ur = int(u[0]), int(u[1])
+                vc, vr = int(v[0]), int(v[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            x0, y0 = _cell_to_world(uc, ur)
+            x1, y1 = _cell_to_world(vc, vr)
+            m.points.append(Point(x=x0, y=y0, z=z))
+            m.points.append(Point(x=x1, y=y1, z=z))
+
+        self.frequent_graph_viz_pub.publish(m)
+        rospy.loginfo(
+            "Published /frequent_graph_viz: %d edges (%d line vertices) frame=%s",
+            g.number_of_edges(),
+            len(m.points),
+            self.map_frame_id,
+        )
+
     def map_callback(self, msg):
         """
         receives new map info and updates the map
         """
+        if msg.header.frame_id:
+            self.map_frame_id = msg.header.frame_id
         self.map_probs = msg.data
         # if we've received the map metadata and have a way to update it:
+
+        # FIXME: We need to update the occupancy grid map every time we get a new message, but for now just get the single map message
         if (
             self.map_width > 0
             and self.map_height > 0
             and len(self.map_probs) > 0
+            and self.occupancy is None
         ):
+
+            print("+"*50)
+            print("Assigned Occupancy Grid Map!")
+            print("+"*50)
+
+            
+            rospack = rospkg.RosPack()
+            pkg_path = rospack.get_path('path_planning')
+            wall_distance_cache = pkg_path + '/src/social_path_planning/environments/y2e2_aligned_wall_dist.npz'
+            
             self.occupancy = StochOccupancyGrid2D(
                 self.map_resolution,
                 self.map_width,
@@ -348,8 +485,28 @@ class Navigator:
                 self.map_origin[1],
                 5,
                 self.map_probs,
+                wall_distance_cache_path=wall_distance_cache
             )
 
+            if self.frequent is None:  # Don't load the graph every time
+                # Get Heat Map File Name Prefix
+                rospack = rospkg.RosPack()
+                pkg_path = rospack.get_path('path_planning')
+                heatmap_prefix = pkg_path + '/ros_map'
+
+                # Check if heatmap file actually exists before trying to load it
+                heatmap_name = heatmap_prefix + '_heatmap.npy'
+                if os.path.isfile(heatmap_name):
+                    self.frequent = FrequentSubgraph(self.occupancy, heat_map_filename=heatmap_prefix)
+                    self.frequent.build_graph(threshold=self.sparse_graph_threshold, reset_graph=True)
+                    rospy.logwarn(f"Number of nodes/edges in graph before pruning = {len(self.frequent.graph.nodes)}/{len(self.frequent.graph.edges)}")
+                    self.frequent.prune_graph(min_component_size=self.sparse_graph_components)
+                    rospy.logwarn(f"Number of nodes/edges in graph = {len(self.frequent.graph.nodes)}/{len(self.frequent.graph.edges)}")
+                    self._canonicalize_frequent_graph()
+                    self.publish_frequent_graph_rviz()
+                else:
+                    rospy.logwarn(f"Heatmap file {heatmap_name} not found, skipping loading frequent subgraph.")
+            
             if self.object_occupancy is None:
                 self.object_occupancy = StochOccupancyGrid2D(
                     self.map_resolution,
@@ -381,6 +538,8 @@ class Navigator:
                     5,
                     np.zeros((self.map_width * self.map_height,)),  # initialize with zeros     
                 )
+
+                
 
     def object_map_callback(self, msg):
         if (
@@ -872,7 +1031,27 @@ class Navigator:
         combined_occupancy = self.occupancy
 
         if self.use_social_astar:
-            problem = SocialAStar(state_min, state_max, x_init, x_goal, combined_occupancy, self.plan_resolution)
+            # First determine if a social graph is available to use, if not, fall back to regular social A*
+            if self.frequent is not None:
+                # Graph nodes are occupancy map cells: get_index must use occ.resolution (same as heat_map / sim).
+                # plan_resolution is coarser and breaks has_edge matching under ROS. If planning is too slow at
+                # map resolution, consider downsampling the heatmap/graph to plan_resolution (larger change).
+                graph_planner_resolution = float(combined_occupancy.resolution)
+                problem = SocialAStar_With_Graph(
+                    state_min,
+                    state_max,
+                    x_init,
+                    x_goal,
+                    combined_occupancy,
+                    self.frequent.graph,
+                    resolution=graph_planner_resolution,
+                    desired_dist_right_extra=0.25,
+                )
+
+                print("+"*5 + "Using social A* with graph" + "+"*5)
+            else:
+                problem = SocialAStar(state_min, state_max, x_init, x_goal, combined_occupancy, self.plan_resolution)
+                print("+"*5 + "Using social A*" + "+"*5)
         else:
             problem = AStar(state_min, state_max, x_init, x_goal, combined_occupancy, self.plan_resolution,
             robots_x=robots_x, robots_y=robots_y, obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
@@ -880,7 +1059,7 @@ class Navigator:
         rospy.loginfo("Navigator: computing navigation plan")
         success = False
         while not success:
-            success = problem.solve(step_resolution=self.times_planned_failed + 1)
+            success = problem.solve()
             if not success and (self.mode == Mode.IDLE or self.mode == Mode.STOPPED_FOR_AGENT):
                 rospy.loginfo("Planning failed")
                 self.times_planned_failed += 1
@@ -898,6 +1077,19 @@ class Navigator:
                 self.times_planned_failed = 0
                 rospy.loginfo("Planning Succeeded")
                 planned_path = problem.path
+
+        if self.use_social_astar and self.frequent is not None:
+            tel = getattr(problem, "last_solve_telemetry", None)
+            if isinstance(tel, dict):
+                rospy.loginfo(
+                    "social A* with graph: path_fraction_on_graph=%s on_graph=%s/%s "
+                    "graph_edge_cost_evals=%s off_graph_social_evals=%s",
+                    tel.get("path_fraction_on_graph"),
+                    tel.get("path_segments_on_graph"),
+                    tel.get("path_segments_total"),
+                    tel.get("graph_edge_cost_evals"),
+                    tel.get("off_graph_social_evals"),
+                )
 
         # Check whether path is too short
         if planned_path == None:

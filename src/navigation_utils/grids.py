@@ -1,5 +1,11 @@
 import numpy as np
 
+from social_path_planning import (
+    attach_wall_distance_cache,
+    DEFAULT_DIST_THRESH,
+    travel_dir_to_dir_idx
+)
+
 # A 2D state space grid with a set of rectangular obstacles. The grid is fully deterministic
 class DetOccupancyGrid2D(object):
     def __init__(self, width, height, obstacles):
@@ -20,7 +26,7 @@ class DetOccupancyGrid2D(object):
 
 class StochOccupancyGrid2D(object):
     def __init__(self, resolution, width, height, origin_x, origin_y,
-                window_size, probs, thresh=0.5, robot_d=0.6):
+                window_size, probs, thresh=0.5, robot_d=0.6, wall_distance_cache_path=None):
         self.resolution = resolution
         self.width = width
         self.height = height
@@ -32,6 +38,16 @@ class StochOccupancyGrid2D(object):
         # print(window_size)
         self.thresh = thresh
         self.robot_d=robot_d
+        self._d_right = None  # Cache for distance to the nearest wall on the right
+
+        self.extent = [self.origin_x, self.origin_x + self.width * self.resolution,
+                       self.origin_y, self.origin_y + self.height * self.resolution]
+
+        attach_wall_distance_cache(
+            self,
+            wall_distance_cache_path,
+            auto_build=False,
+        )
 
     def __add__(self, other):
         if not isinstance(other, StochOccupancyGrid2D):
@@ -117,3 +133,83 @@ class StochOccupancyGrid2D(object):
 
     def get_probs(self):
         return self.probs
+    
+    def dist_to_wall_left(self, x, travel_dir, dist_thresh=15.0):
+        return self.dist_to_wall_right(x, [-travel_dir[0], -travel_dir[1]], dist_thresh=dist_thresh)
+
+    def dist_to_wall_right(self, x, travel_dir, dist_thresh=15.0):
+        """
+        Return distance (meters) from world position x=(x,y) to the first occupied or
+        unknown cell found to the right of the travel_dir. If no wall is found inside
+        the map bounds, returns 0.
+        """
+        if (
+            self._d_right is not None
+            and abs(float(dist_thresh) - DEFAULT_DIST_THRESH) < 1e-9
+        ):
+            col = int(np.round((x[0] - self.origin_x) / self.resolution))
+            row = int(np.round((x[1] - self.origin_y) / self.resolution))
+            col = int(np.clip(col, 0, self.width - 1))
+            row = int(np.clip(row, 0, self.height - 1))
+            k = travel_dir_to_dir_idx(travel_dir)
+            return float(self._d_right[row, col, k])
+
+        return self._dist_to_wall_right_raycast(x, travel_dir, dist_thresh=dist_thresh)
+
+    def _dist_to_wall_right_raycast(self, x, travel_dir, dist_thresh=15.0):
+        """Ray-march implementation used for planning when no cache and for precompute."""
+        right = np.array([travel_dir[1], -travel_dir[0]], dtype=float)
+        rn = np.linalg.norm(right)
+        if rn < 1e-12:
+            return 100.0
+        right = right / rn
+
+        # map bounds in meters
+        x_min = self.origin_x
+        x_max = self.origin_x + self.width * self.resolution
+        y_min = self.origin_y
+        y_max = self.origin_y + self.height * self.resolution
+
+        # sampling parameters
+        step = max(self.resolution * 0.25, 1e-4)   # quarter cell steps (or small eps)
+        # maximum distance to search: distance to map border along right direction
+        # compute intersection of ray x + t*right with map bounding box to get a safe upper bound
+        t_max = 0.0
+        # compute candidate distances to each vertical boundary
+        if right[0] > 0:
+            t_max = max(t_max, (x_max - x[0]) / right[0])
+        elif right[0] < 0:
+            t_max = max(t_max, (x_min - x[0]) / right[0])
+        if right[1] > 0:
+            t_max = max(t_max, (y_max - x[1]) / right[1])
+        elif right[1] < 0:
+            t_max = max(t_max, (y_min - x[1]) / right[1])
+        # if right component is 0 that boundary doesn't constrain; t_max may remain 0 if both comps lead outward.
+        # ensure positive t_max
+        if t_max <= 0:
+            # ray immediately points out of bounds — no wall reachable to the right inside the map
+            return 100
+        if t_max > dist_thresh:
+            t_max = dist_thresh
+
+        # sample along ray
+        n_steps = int(np.ceil(t_max / step))
+        px = float(x[0])
+        py = float(x[1])
+        for i in range(1, n_steps + 1):
+            t = i * step
+            sx = px + right[0] * t
+            sy = py + right[1] * t
+            # check bounds (small numerical tolerance)
+            if sx < x_min or sx >= x_max or sy < y_min or sy >= y_max:
+                return 100
+            # convert to grid indices (row, col). self.probs indexed as [row(y), col(x)]
+            col = int(np.floor((sx - self.origin_x) / self.resolution))
+            row = int(np.floor((sy - self.origin_y) / self.resolution))
+            # clamp safety
+            if row < 0 or row >= self.height or col < 0 or col >= self.width:
+                return 100
+            p = self.probs[row, col]
+            if p >= self.thresh or p < 0:
+                return t
+        return 100
