@@ -92,10 +92,7 @@ class Navigator:
         self.map_frame_id = rospy.get_param('~frequent_graph_map_frame', 'map')
         self.publish_frequent_graph_viz = rospy.get_param('~publish_frequent_graph_viz', True)
         # Applied once when canonicalizing loaded heatmap graph keys to ROS map (col, row).
-        self.frequent_graph_mirror_cell_x = rospy.get_param('~frequent_graph_mirror_cell_x', True)
-        self.frequent_graph_mirror_cell_y = rospy.get_param('~frequent_graph_mirror_cell_y', True)
-        self.frequent_graph_swap_cell_axes = rospy.get_param('~frequent_graph_swap_cell_axes', False)
-
+        
         self.person_occupancy = None
         self.robot_stopped_by_person = False
         self.person_in_path = False
@@ -345,13 +342,7 @@ class Navigator:
         self.map_origin = (msg.origin.position.x, msg.origin.position.y)
 
     def _heatmap_cell_to_world(self, ci, ri, w, h, ox, oy, res):
-        """Heatmap/sparse_graph cell (col, row) → world (m) using load-time mirror/swap params."""
-        if self.frequent_graph_swap_cell_axes:
-            ci, ri = ri, ci
-        if self.frequent_graph_mirror_cell_x:
-            ci = w - 1 - ci
-        if self.frequent_graph_mirror_cell_y:
-            ri = h - 1 - ri
+        """Heatmap/sparse_graph cell (col, row) → world (m)"""
         return ox + float(ci) * res, oy + float(ri) * res
 
     def _canonical_cell_from_heatmap_indices(self, ci, ri):
