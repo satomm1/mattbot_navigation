@@ -26,7 +26,8 @@ class DetOccupancyGrid2D(object):
 
 class StochOccupancyGrid2D(object):
     def __init__(self, resolution, width, height, origin_x, origin_y,
-                window_size, probs, thresh=0.5, robot_d=0.6, wall_distance_cache_path=None):
+                window_size, probs, thresh=0.5, robot_d=0.6, wall_distance_cache_path=None,
+                wall_distance_cache_use_ros_layout=True):
         self.resolution = resolution
         self.width = width
         self.height = height
@@ -39,6 +40,7 @@ class StochOccupancyGrid2D(object):
         self.thresh = thresh
         self.robot_d=robot_d
         self._d_right = None  # Cache for distance to the nearest wall on the right
+        self._wall_distance_cache_use_ros_layout = wall_distance_cache_use_ros_layout
 
         self.extent = [self.origin_x, self.origin_x + self.width * self.resolution,
                        self.origin_y, self.origin_y + self.height * self.resolution]
@@ -47,6 +49,7 @@ class StochOccupancyGrid2D(object):
             self,
             wall_distance_cache_path,
             auto_build=False,
+            use_ros_cache_layout=wall_distance_cache_use_ros_layout,
         )
 
     def __add__(self, other):
@@ -56,9 +59,19 @@ class StochOccupancyGrid2D(object):
             raise ValueError("Grids must have the same dimensions to be added")
         
         new_probs = np.maximum(self.probs, other.probs)
-        return StochOccupancyGrid2D(self.resolution, self.width, self.height,
-                                    self.origin_x, self.origin_y,
-                                    self.window_size, new_probs, self.thresh, self.robot_d)
+        return StochOccupancyGrid2D(
+            self.resolution,
+            self.width,
+            self.height,
+            self.origin_x,
+            self.origin_y,
+            self.window_size,
+            new_probs,
+            self.thresh,
+            self.robot_d,
+            wall_distance_cache_path=None,
+            wall_distance_cache_use_ros_layout=self._wall_distance_cache_use_ros_layout,
+        )
 
     def snap_to_grid(self, x):
         return (self.resolution*round(x[0]/self.resolution), self.resolution*round(x[1]/self.resolution))
