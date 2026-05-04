@@ -232,6 +232,8 @@ class Navigator:
         rospy.Subscriber("/lost_localization", Bool, self.lost_localization_callback)
         rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
         rospy.Subscriber("/valid_points", Bool, self.valid_points_callback)
+        stop_topic = rospy.get_param("~/stop_topic", "/stop").strip() or "/stop"
+        rospy.Subscriber(stop_topic, Bool, self.stop_callback, queue_size=1)
         self.localized_pub = rospy.Publisher("/localized", Bool, queue_size=10)
         self.initialpose_pub = rospy.Publisher("/initialpose", PoseWithCovarianceStamped, queue_size=10)
         self.invalid_goal_pub = rospy.Publisher("/invalid_goal", Pose2D, queue_size=10)
@@ -261,6 +263,18 @@ class Navigator:
             self.y_g = data.y
             self.theta_g = data.theta
             self.replan()
+
+    def stop_callback(self, msg):
+        """Human / fleet stop (e.g. from DDS via /stop): halt motion and go to IDLE."""
+        if not msg.data:
+            return
+        if self.mode == Mode.IDLE:
+            return
+        cmd_vel = Twist()
+        cmd_vel.linear.x = 0.0
+        cmd_vel.angular.z = 0.0
+        self.nav_vel_pub.publish(cmd_vel)
+        self.switch_mode(Mode.IDLE)
 
     def external_goal_callback(self, msg):
         """
