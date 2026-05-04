@@ -124,8 +124,7 @@ class Navigator:
         self.backing_from_bad_localization = False
                                             
         # plan parameters
-        self.plan_resolution = 0.1
-        self.plan_horizon = 500
+        self.plan_resolution = 0.05
 
         # time when we started following the plan
         self.current_plan_start_time = rospy.get_rostime()
@@ -998,9 +997,6 @@ class Navigator:
 
         current_time = rospy.get_rostime()
  
-        # Attempt to plan a path
-        state_min = self.snap_to_grid((-self.plan_horizon, -self.plan_horizon))
-        state_max = self.snap_to_grid((self.plan_horizon, self.plan_horizon))
         x_init = self.snap_to_grid((self.x, self.y))
         self.plan_start = x_init
         x_goal = self.snap_to_grid((self.x_g, self.y_g))
@@ -1020,6 +1016,12 @@ class Navigator:
             robots_y.append(agent_y)
 
         combined_occupancy = self.occupancy
+
+        # Tight world bounds from the loaded map (same idea as build_occ_grid / plan_with_heatmap). Using
+        # a huge ±plan_horizon box forced A* to search an enormous state space at map resolution.
+        ext = combined_occupancy.extent
+        state_min = (float(ext[0]), float(ext[2]))
+        state_max = (float(ext[1]), float(ext[3]))
 
         if self.use_social_astar:
             # First determine if a social graph is available to use, if not, fall back to regular social A*
