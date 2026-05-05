@@ -267,10 +267,12 @@ class MultiAgentNavigator(l2.Navigator):
         if not pid or (msg.plan_id or "").strip() != pid:
             return
         self._peer_multi_planned_paths[int(msg.source_agent)] = msg
-        rospy.logdebug_throttle(
-            5.0,
-            "MultiAgentNavigator: peer planned paths stored: %s",
-            list(self._peer_multi_planned_paths.keys()),
+        n_poses = len(msg.path.poses)
+        rospy.loginfo(
+            "MultiAgentNavigator: received peer planned path source_agent=%d plan_id=%s poses=%d",
+            int(msg.source_agent),
+            msg.plan_id,
+            n_poses
         )
         self._try_simultaneous_plan_if_ready()
 
