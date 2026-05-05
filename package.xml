@@ -55,6 +55,7 @@
   <exec_depend>tf</exec_depend>
   <exec_depend>visualization_msgs</exec_depend>
   <exec_depend>mattbot_dds</exec_depend>
+  <exec_depend>path_planning</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
 
 

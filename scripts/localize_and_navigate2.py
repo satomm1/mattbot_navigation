@@ -57,8 +57,8 @@ class Navigator:
     It is the sole node that should publish to cmd_vel
     """
 
-    def __init__(self):
-        rospy.init_node("mattbot_navigator", anonymous=True)
+    def __init__(self, node_name="mattbot_navigator"):
+        rospy.init_node(node_name, anonymous=True)
         self.mode = Mode.IDLE
 
         self.is_localized = False

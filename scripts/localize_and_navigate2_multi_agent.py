@@ -2,22 +2,55 @@
 """
 Navigator variant: same behavior as localize_and_navigate2, plus /external_goal_multi
 (MultiRobotExternalGoal). After a successful plan from a multi-robot goal, enters
-MULTIAGENT_CONTROL_COMPUTING (integer 11 on /robot_mode) and holds until future
-multi-agent control is implemented.
+MULTIAGENT_CONTROL_COMPUTING (integer 11 on /robot_mode), publishes the ego planned path
+for DDS, waits for peer paths (fleet_robot_ids + plan_id) or times out, then runs
+MultiAgentSimultaneousPlanner in a background thread for waypoint timing.
 
 Python 3.8 does not allow subclassing an existing Enum with new members, so the extra
 state uses a separate IntEnum with value 11 (distinct from localize_and_navigate2.Mode).
 """
 
+import importlib.util
+import os
+import threading
 import time
 from enum import IntEnum
 
+import numpy as np
 import rospy
 from geometry_msgs.msg import Pose2D, PoseStamped, Twist
 from nav_msgs.msg import Path
 from mattbot_dds.msg import MultiAgentPlannedPath, MultiRobotExternalGoal
+from social_path_planning.occupancy_grid import StochOccupancyGrid2D as SpStochOccupancyGrid2D
+from social_path_planning.multi_planning import MultiAgentSimultaneousPlanner
 
-import localize_and_navigate2 as l2
+
+def _load_localize_and_navigate2():
+    """
+    Load the navigator implementation from scripts/localize_and_navigate2.py.
+
+    We cannot ``import localize_and_navigate2`` when this file is run via the Catkin
+    devel wrapper: that name resolves to another wrapper script in lib/pkg/ which execs
+    the real file into a private dict, so the imported module has no ``Navigator``.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "localize_and_navigate2.py")
+    if not os.path.isfile(path):
+        try:
+            import rospkg
+
+            path = os.path.join(rospkg.RosPack().get_path("mattbot_navigation"), "scripts", "localize_and_navigate2.py")
+        except Exception:
+            pass
+    if not os.path.isfile(path):
+        raise ImportError("Could not find localize_and_navigate2.py (tried next to %r)" % (__file__,))
+    spec = importlib.util.spec_from_file_location("_localize_and_navigate2_impl", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+l2 = _load_localize_and_navigate2()
 
 
 class MultiagentComputingMode(IntEnum):
@@ -33,7 +66,18 @@ class MultiAgentNavigator(l2.Navigator):
         self._multi_coordinated = False
         self._multi_source_agent = 0
         self._peer_multi_planned_paths = {}
+        self._multi_fleet_robot_ids = []
+        self._multi_phase_started_at = None
+        self._simultaneous_solve_done = False
+        self._simultaneous_solve_failed = False
+        self._simultaneous_solve_running = False
+        self._simultaneous_optimized_times = None
+        self._simultaneous_lock = threading.Lock()
         super(MultiAgentNavigator, self).__init__(node_name=node_name)
+        self._multi_path_wait_timeout = float(rospy.get_param("~multi_agent_path_wait_timeout", 60.0))
+        self._multi_max_path_points = int(rospy.get_param("~multi_agent_max_path_points", 0))
+        self._multi_agent_robot_diameter = float(rospy.get_param("~multi_agent_robot_diameter", 1.0))
+        self._multi_agent_max_velocity = float(rospy.get_param("~multi_agent_max_velocity", 0.7))
         topic = rospy.get_param("~external_goal_multi_topic", "/external_goal_multi").strip() or "/external_goal_multi"
         rospy.Subscriber(topic, MultiRobotExternalGoal, self.external_goal_multi_callback, queue_size=10)
         rospy.loginfo("MultiAgentNavigator: subscribed to %s", topic)
@@ -58,6 +102,125 @@ class MultiAgentNavigator(l2.Navigator):
             self._dds_planned_pub_topic,
             self._peer_planned_sub_topic,
         )
+
+    def _build_sp_occupancy_grid(self):
+        """`social_path_planning` grid copy for MultiAgentSimultaneousPlanner (same geometry as self.occupancy)."""
+        occ = getattr(self, "occupancy", None)
+        if occ is None:
+            return None
+        return SpStochOccupancyGrid2D(
+            occ.resolution,
+            occ.width,
+            occ.height,
+            occ.origin_x,
+            occ.origin_y,
+            occ.window_size,
+            np.asarray(occ.probs),
+            thresh=float(occ.thresh),
+            robot_d=float(occ.robot_d),
+            wall_distance_cache_path=None,
+            auto_build_wall_distance_cache=False,
+        )
+
+    def _maybe_downsample_path_xy(self, pts):
+        m = self._multi_max_path_points
+        if m <= 0 or len(pts) <= m:
+            return pts
+        idx = np.unique(np.linspace(0, len(pts) - 1, num=m, dtype=int))
+        return [pts[i] for i in idx]
+
+    def _assemble_paths_for_simultaneous(self):
+        paths = []
+        for rid in self._multi_fleet_robot_ids:
+            rid = int(rid)
+            if rid == int(self.my_id):
+                plan = getattr(self, "unsmoothed_plan", None) or []
+                pts = [(float(s[0]), float(s[1])) for s in plan]
+            else:
+                peer = self._peer_multi_planned_paths[rid]
+                pts = [
+                    (float(ps.pose.position.x), float(ps.pose.position.y)) for ps in peer.path.poses
+                ]
+            paths.append(self._maybe_downsample_path_xy(pts))
+        return paths
+
+    def _fleet_paths_complete(self):
+        pid = (self._multi_plan_id or "").strip()
+        if not pid:
+            return False
+        fleet = [int(x) for x in self._multi_fleet_robot_ids]
+        if not fleet:
+            return False
+        ego_plan = getattr(self, "unsmoothed_plan", None) or []
+        if len(ego_plan) == 0:
+            return False
+        my_id = int(self.my_id)
+        for rid in fleet:
+            if rid == my_id:
+                continue
+            p = self._peer_multi_planned_paths.get(rid)
+            if p is None or (p.plan_id or "").strip() != pid or len(p.path.poses) == 0:
+                return False
+        return True
+
+    def _abort_multi_to_idle(self):
+        rospy.logwarn("MultiAgentNavigator: aborting multi-agent phase -> IDLE")
+        self._multi_plan_id = ""
+        self._multi_coordinated = False
+        self._multi_source_agent = 0
+        self._multi_fleet_robot_ids = []
+        self._peer_multi_planned_paths = {}
+        self._simultaneous_solve_done = False
+        self._simultaneous_solve_failed = False
+        self._simultaneous_solve_running = False
+        self._simultaneous_optimized_times = None
+        self._multi_phase_started_at = None
+        self.switch_mode(l2.Mode.IDLE)
+
+    def _try_simultaneous_plan_if_ready(self):
+        if not self._is_multiagent_computing_mode(self.mode):
+            return
+        with self._simultaneous_lock:
+            if self._simultaneous_solve_done or self._simultaneous_solve_running or self._simultaneous_solve_failed:
+                return
+            if not self._fleet_paths_complete():
+                return
+            self._simultaneous_solve_running = True
+        rospy.loginfo(
+            "MultiAgentNavigator: starting simultaneous timing solve (plan_id=%s fleet=%s)",
+            self._multi_plan_id,
+            self._multi_fleet_robot_ids,
+        )
+        threading.Thread(target=self._simultaneous_planner_thread_main, daemon=True).start()
+
+    def _simultaneous_planner_thread_main(self):
+        try:
+            import social_path_planning.multi_planning as smp
+
+            smp.ROBOT_DIAMETER = float(self._multi_agent_robot_diameter)
+            smp.MAX_VELOCITY = float(self._multi_agent_max_velocity)
+            occ = self._build_sp_occupancy_grid()
+            if occ is None:
+                raise RuntimeError("occupancy grid missing for simultaneous planner")
+            paths = self._assemble_paths_for_simultaneous()
+            if not paths or any(len(p) < 1 for p in paths):
+                raise RuntimeError("invalid paths for simultaneous planner")
+            v_list = [float(self._multi_agent_max_velocity)] * len(paths)
+            planner = MultiAgentSimultaneousPlanner(occ, paths=paths, norm=1, v=v_list)
+            optimized_times = planner.plan()
+            lens = [len(t) for t in optimized_times] if optimized_times else []
+            rospy.loginfo(
+                "MultiAgentNavigator: simultaneous plan solved plan_id=%s waypoint_time_lens=%s",
+                self._multi_plan_id,
+                lens,
+            )
+            self._simultaneous_optimized_times = optimized_times
+            self._simultaneous_solve_done = True
+        except Exception as exc:
+            rospy.logerr("MultiAgentNavigator: simultaneous plan failed: %s", exc)
+            self._simultaneous_solve_failed = True
+        finally:
+            self._simultaneous_solve_running = False
 
     @staticmethod
     def _is_multiagent_computing_mode(mode):
@@ -95,9 +258,13 @@ class MultiAgentNavigator(l2.Navigator):
             len(path_msg.poses),
             self._multi_plan_id,
         )
+        self._try_simultaneous_plan_if_ready()
 
     def _peer_multi_agent_planned_path_callback(self, msg):
         if int(msg.source_agent) == int(self.my_id):
+            return
+        pid = (self._multi_plan_id or "").strip()
+        if not pid or (msg.plan_id or "").strip() != pid:
             return
         self._peer_multi_planned_paths[int(msg.source_agent)] = msg
         rospy.logdebug_throttle(
@@ -105,6 +272,7 @@ class MultiAgentNavigator(l2.Navigator):
             "MultiAgentNavigator: peer planned paths stored: %s",
             list(self._peer_multi_planned_paths.keys()),
         )
+        self._try_simultaneous_plan_if_ready()
 
     def external_goal_multi_callback(self, msg):
         """Same policy as external_goal_callback, but pose from MultiRobotExternalGoal + plan metadata."""
@@ -140,10 +308,18 @@ class MultiAgentNavigator(l2.Navigator):
             self.invalid_goal_pub.publish(invalid_goal_msg)
             return
 
+        self._peer_multi_planned_paths = {}
+        self._simultaneous_solve_done = False
+        self._simultaneous_solve_failed = False
+        self._simultaneous_solve_running = False
+        self._simultaneous_optimized_times = None
+        self._multi_phase_started_at = None
+
         self._from_multi_robot_goal = True
         self._multi_plan_id = msg.plan_id
         self._multi_coordinated = bool(msg.coordinated)
         self._multi_source_agent = int(msg.source_agent)
+        self._multi_fleet_robot_ids = [int(x) for x in (msg.fleet_robot_ids or [])]
 
         self.x_g = g.x
         self.y_g = g.y
@@ -179,18 +355,44 @@ class MultiAgentNavigator(l2.Navigator):
                     "Entering MULTIAGENT_CONTROL_COMPUTING after plan (plan_id=%s)",
                     self._multi_plan_id,
                 )
+                self._multi_phase_started_at = rospy.Time.now()
                 self._publish_planned_path_for_multi_dds()
             elif self.mode == l2.Mode.IDLE:
                 self._multi_plan_id = ""
                 self._multi_coordinated = False
                 self._multi_source_agent = 0
+                self._multi_fleet_robot_ids = []
 
     def publish_control(self):
         if self._is_multiagent_computing_mode(self.mode):
+            if self._simultaneous_solve_failed:
+                self._abort_multi_to_idle()
+                return
+            if (
+                not self._simultaneous_solve_done
+                and not self._simultaneous_solve_running
+                and not self._fleet_paths_complete()
+                and self._multi_phase_started_at is not None
+            ):
+                elapsed = (rospy.Time.now() - self._multi_phase_started_at).to_sec()
+                if elapsed > self._multi_path_wait_timeout:
+                    rospy.logwarn(
+                        "MultiAgentNavigator: path wait timeout (%.1fs) plan_id=%s fleet=%s -> IDLE",
+                        self._multi_path_wait_timeout,
+                        getattr(self, "_multi_plan_id", "") or "?",
+                        self._multi_fleet_robot_ids,
+                    )
+                    self._abort_multi_to_idle()
+                    return
+            self._try_simultaneous_plan_if_ready()
+            msg = "holding cmd_vel=0"
+            if self._simultaneous_solve_done:
+                msg = "simultaneous timing ready (cmd_vel=0 until motion wired)"
             rospy.loginfo_throttle(
                 5.0,
-                "MULTIAGENT_CONTROL_COMPUTING (plan_id=%s); holding cmd_vel=0",
+                "MULTIAGENT_CONTROL_COMPUTING (plan_id=%s); %s",
                 getattr(self, "_multi_plan_id", "") or "?",
+                msg,
             )
             self.prev_om = 0.0
             cmd_vel = Twist()
