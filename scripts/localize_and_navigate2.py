@@ -462,7 +462,17 @@ class Navigator:
         if msg.header.frame_id:
             self.map_frame_id = msg.header.frame_id
         self.map_probs = msg.data
-        # if we've received the map metadata and have a way to update it:
+        # OccupancyGrid always carries map geometry in msg.info. The navigator also
+        # subscribes to /map_metadata, but that topic is often published non-latched
+        # (e.g. from agent_entry_exit) so the first /navigation_map can arrive before
+        # map_width/map_height are set from metadata, and we would skip building
+        # self.occupancy forever for that callback chain. Sync from msg.info first.
+        info = msg.info
+        if info.width > 0 and info.height > 0 and info.resolution > 0:
+            self.map_width = int(info.width)
+            self.map_height = int(info.height)
+            self.map_resolution = float(info.resolution)
+            self.map_origin = (info.origin.position.x, info.origin.position.y)
 
         # FIXME: We need to update the occupancy grid map every time we get a new message, but for now just get the single map message
         if (
