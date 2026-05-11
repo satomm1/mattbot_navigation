@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
 Navigator variant: same behavior as localize_and_navigate2, plus /external_goal_multi
-(MultiRobotExternalGoal). After a successful plan from a multi-robot goal, runs a pre-MULTI
-ALIGN dwell (heading toward the polyline start), then enters MULTIAGENT_CONTROL_COMPUTING (mode 11),
-publishes the ego planned path for DDS, waits for peer paths (fleet_robot_ids + plan_id) or times out,
-then the fleet coordinator (lowest robot ID in fleet_robot_ids) runs MultiAgentSimultaneousPlanner once and
-distributes waypoint times via DDS (MultiAgentTimingSolve); followers apply the received solution, build a timed spline,
-wait for MultiAgentExecuteAt (DDS or auto from the same coordinator), then start TRACK with synchronized t=0 at execute_at.
+(MultiRobotExternalGoal) and singleton coordination. After a successful plan from a multi-robot goal,
+runs a pre-MULTI ALIGN dwell, then MULTIAGENT_CONTROL_COMPUTING: publishes planned path, then either
+(1) fleet size >= 2: coordinator runs simultaneous MILP and MultiAgentTimingSolve over DDS;
+(2) fleet size == 1 with peer active trajectories in cache: coordinator runs MultiAgentSequentialPlanner
+with shifted global times and fixed execute_at = now + budget;
+(3) fleet size == 1 solo: analytic max-velocity waypoint times (no MILP).
+Peers publish MultiAgentActiveTrajectory snapshots on timed TRACK commit; cache is pruned periodically
+and on inactive messages. /external_goal (Pose2D) and /voice_goal use the same singleton path as a
+one-robot multi goal (plan_id solo_pose).
 
 Python 3.8 does not allow subclassing an existing Enum with new members, so the extra
 state uses a separate IntEnum with value 11 (distinct from localize_and_navigate2.Mode).
@@ -23,6 +26,7 @@ import rospy
 from geometry_msgs.msg import Pose2D, PoseStamped, Twist
 from nav_msgs.msg import Path
 from mattbot_dds.msg import (
+    MultiAgentActiveTrajectory,
     MultiAgentExecuteAt,
     MultiAgentPlannedPath,
     MultiAgentTimingSolve,
@@ -31,7 +35,7 @@ from mattbot_dds.msg import (
 from navigation_utils import compute_trajectory_from_timed_waypoints
 from social_path_planning.occupancy_grid import StochOccupancyGrid2D as SpStochOccupancyGrid2D
 from visualization_msgs.msg import Marker, MarkerArray
-from social_path_planning.multi_planning import MultiAgentSimultaneousPlanner
+from social_path_planning.multi_planning import MultiAgentSequentialPlanner, MultiAgentSimultaneousPlanner
 
 
 def _load_localize_and_navigate2():
@@ -91,6 +95,11 @@ class MultiAgentNavigator(l2.Navigator):
         self._awaiting_pre_multi_align = False
         self._pre_multi_align_started_at = None
         self._timing_solve_wait_started_at = None
+        self._peer_active_trajectories = {}
+        self._peer_traj_cache_lock = threading.Lock()
+        self._pending_execute_at_for_arm = None
+        self._armed_waypoint_times_for_snapshot = None
+        self._active_traj_prune_timer = None
         super(MultiAgentNavigator, self).__init__(node_name=node_name)
         self._multi_path_wait_timeout = float(rospy.get_param("~multi_agent_path_wait_timeout", 60.0))
         self._multi_agent_timing_solve_wait_timeout_sec = float(
@@ -183,6 +192,94 @@ class MultiAgentNavigator(l2.Navigator):
         rospy.loginfo(
             "MultiAgentNavigator: coordinated MILP runs on min(fleet_robot_ids); timing via MultiAgentTimingSolve DDS"
         )
+        self._multi_agent_sequential_budget_sec = float(rospy.get_param("~multi_agent_sequential_budget_sec", 3.0))
+        self._multi_agent_active_traj_ttl_sec = float(rospy.get_param("~multi_agent_active_trajectory_ttl_sec", 120.0))
+        self._multi_agent_active_traj_check_period_sec = float(
+            rospy.get_param("~multi_agent_active_trajectory_check_period_sec", 1.0)
+        )
+        self._multi_agent_trajectory_done_grace_sec = float(
+            rospy.get_param("~multi_agent_trajectory_done_grace_sec", 0.5)
+        )
+        self._multi_agent_active_traj_forward_extra_ids = [
+            int(x) for x in rospy.get_param("~multi_agent_active_trajectory_forward_ids", [])
+        ]
+        self._active_traj_for_dds_topic = rospy.get_param(
+            "~multi_agent_active_trajectory_for_dds_topic", "/multi_agent_active_trajectory_for_dds"
+        ).strip() or "/multi_agent_active_trajectory_for_dds"
+        self._active_traj_pub = rospy.Publisher(
+            self._active_traj_for_dds_topic, MultiAgentActiveTrajectory, queue_size=2, latch=False
+        )
+        self._active_traj_sub_topic = rospy.get_param(
+            "~multi_agent_active_trajectory_topic", "/multi_agent_active_trajectory"
+        ).strip() or "/multi_agent_active_trajectory"
+        rospy.Subscriber(
+            self._active_traj_sub_topic,
+            MultiAgentActiveTrajectory,
+            self._peer_active_trajectory_callback,
+            queue_size=10,
+        )
+        rospy.loginfo(
+            "MultiAgentNavigator: active trajectory pub=%s sub=%s sequential_budget_s=%.2f",
+            self._active_traj_for_dds_topic,
+            self._active_traj_sub_topic,
+            self._multi_agent_sequential_budget_sec,
+        )
+        self._active_traj_prune_timer = rospy.Timer(
+            rospy.Duration(max(0.2, self._multi_agent_active_traj_check_period_sec)),
+            self._peer_active_trajectory_prune_timer_cb,
+        )
+
+    def external_goal_callback(self, msg):
+        """Pose2D / voice goal: treat as singleton fleet coordination (sequential vs solo like one-robot multi goal)."""
+        if (
+            self.x_g is not None
+            and self.y_g is not None
+            and self.theta_g is not None
+            and (msg.x == self.x_g and msg.y == self.y_g and msg.theta == self.theta_g)
+        ):
+            rospy.loginfo("External goal is the same as current goal, ignoring")
+            return
+
+        if self.mode == l2.Mode.WAITING_FOR_INIT or self.mode == l2.Mode.LOCALIZING:
+            return
+
+        if self.mode != l2.Mode.IDLE:
+            cmd_vel = Twist()
+            cmd_vel.linear.x = 0.0
+            cmd_vel.angular.z = 0.0
+            self.nav_vel_pub.publish(cmd_vel)
+            self.switch_mode(l2.Mode.IDLE)
+
+        if self.occupancy is not None and not self.occupancy.is_free((msg.x, msg.y)):
+            rospy.loginfo("Not a valid goal")
+            invalid_goal_msg = Pose2D()
+            invalid_goal_msg.x = msg.x
+            invalid_goal_msg.y = msg.y
+            invalid_goal_msg.theta = msg.theta
+            self.invalid_goal_pub.publish(invalid_goal_msg)
+            return
+
+        self._peer_multi_planned_paths = {}
+        self._simultaneous_solve_done = False
+        self._simultaneous_solve_failed = False
+        self._simultaneous_solve_running = False
+        self._simultaneous_optimized_times = None
+        self._multi_phase_started_at = None
+        self._reset_timed_execute_state()
+        self._clear_pre_multi_align_state()
+        self._timing_solve_wait_started_at = None
+
+        self._from_multi_robot_goal = True
+        self._multi_plan_id = "solo_pose"
+        self._multi_coordinated = False
+        self._multi_source_agent = int(self.my_id)
+        self._multi_fleet_robot_ids = [int(self.my_id)]
+
+        self.x_g = msg.x
+        self.y_g = msg.y
+        self.theta_g = msg.theta
+        rospy.loginfo("MultiAgentNavigator: external_goal -> singleton fleet replan plan_id=%s", self._multi_plan_id)
+        self.replan()
 
     def _clear_pre_multi_align_state(self):
         self._awaiting_pre_multi_align = False
@@ -209,6 +306,118 @@ class MultiAgentNavigator(l2.Navigator):
         if idx != len(flat):
             return None
         return rows
+
+    def _path_msg_to_xy(self, path_msg):
+        out = []
+        for ps in path_msg.poses:
+            out.append((float(ps.pose.position.x), float(ps.pose.position.y)))
+        return out
+
+    def _solo_velocity_waypoint_times(self, plan):
+        """Cumulative relative times along polyline at max velocity (no MILP)."""
+        if not plan or len(plan) < 2:
+            return [0.0] * max(1, len(plan))
+        v = float(self._multi_agent_max_velocity)
+        if v <= 0:
+            v = 0.5
+        t = [0.0]
+        acc = 0.0
+        for i in range(len(plan) - 1):
+            dx = float(plan[i + 1][0]) - float(plan[i][0])
+            dy = float(plan[i + 1][1]) - float(plan[i][1])
+            acc += float(np.hypot(dx, dy)) / v
+            t.append(acc)
+        return t
+
+    def _peer_active_obstacles_available(self):
+        with self._peer_traj_cache_lock:
+            for rid, rec in list(self._peer_active_trajectories.items()):
+                if int(rid) == int(self.my_id):
+                    continue
+                if not rec.get("active", True):
+                    continue
+                if len(rec.get("path_xy") or []) < 1:
+                    continue
+                ta = rec.get("waypoint_times") or []
+                if len(ta) != len(rec.get("path_xy") or []):
+                    continue
+                return True
+        return False
+
+    def _peer_active_trajectory_callback(self, msg):
+        if int(msg.robot_id) == int(self.my_id):
+            return
+        if not msg.active and int(msg.robot_id) in getattr(self, "_peer_active_trajectories", {}):
+            with self._peer_traj_cache_lock:
+                self._peer_active_trajectories.pop(int(msg.robot_id), None)
+            rospy.loginfo("MultiAgentNavigator: peer %s active trajectory cleared (inactive)", msg.robot_id)
+            return
+        path_xy = self._path_msg_to_xy(msg.path)
+        wt = [float(x) for x in (msg.waypoint_times or [])]
+        if len(path_xy) == 0 or len(wt) != len(path_xy):
+            rospy.logwarn_throttle(5.0, "MultiAgentNavigator: ignoring active_trajectory robot=%s len mismatch", msg.robot_id)
+            return
+        with self._peer_traj_cache_lock:
+            self._peer_active_trajectories[int(msg.robot_id)] = {
+                "path_xy": path_xy,
+                "waypoint_times": wt,
+                "execute_at": msg.execute_at,
+                "stamp": rospy.Time.now(),
+                "plan_id": str(msg.plan_id or ""),
+                "active": bool(msg.active),
+            }
+        rospy.loginfo(
+            "MultiAgentNavigator: cached active trajectory robot=%s wp=%d plan_id=%s",
+            msg.robot_id,
+            len(path_xy),
+            msg.plan_id,
+        )
+
+    def _peer_active_trajectory_prune_timer_cb(self, _evt=None):
+        now = rospy.Time.now()
+        remove = []
+        with self._peer_traj_cache_lock:
+            for rid, rec in list(self._peer_active_trajectories.items()):
+                if int(rid) == int(self.my_id):
+                    remove.append(rid)
+                    continue
+                if not rec.get("active", True):
+                    remove.append(rid)
+                    continue
+                st = rec.get("stamp")
+                if st is not None and (now - st).to_sec() > self._multi_agent_active_traj_ttl_sec:
+                    remove.append(rid)
+                    continue
+                ex = rec.get("execute_at")
+                ta = rec.get("waypoint_times") or []
+                if ex is not None and ta:
+                    t_end = float(ta[-1])
+                    if now.to_sec() > ex.to_sec() + t_end + self._multi_agent_trajectory_done_grace_sec:
+                        remove.append(rid)
+        if remove:
+            with self._peer_traj_cache_lock:
+                for rid in remove:
+                    self._peer_active_trajectories.pop(rid, None)
+
+    def _dds_forward_ids_for_active_traj(self):
+        ids = set(int(x) for x in self._multi_agent_active_traj_forward_extra_ids)
+        with self._peer_traj_cache_lock:
+            ids.update(int(k) for k in self._peer_active_trajectories.keys())
+        for rid in self._multi_fleet_robot_ids:
+            ids.add(int(rid))
+        ids.discard(int(self.my_id))
+        return sorted(ids)
+
+    def _publish_active_trajectory_msg(self, active, path_msg, waypoint_times, execute_at, plan_id):
+        out = MultiAgentActiveTrajectory()
+        out.robot_id = int(self.my_id)
+        out.plan_id = str(plan_id or "")
+        out.active = bool(active)
+        out.execute_at = execute_at if execute_at is not None else rospy.Time(0)
+        out.path = path_msg
+        out.waypoint_times = [float(x) for x in waypoint_times]
+        out.dds_forward_robot_ids = self._dds_forward_ids_for_active_traj()
+        self._active_traj_pub.publish(out)
 
     def _cancel_auto_execute_timer(self):
         if self._auto_execute_timer is not None:
@@ -350,17 +559,23 @@ class MultiAgentNavigator(l2.Navigator):
         self._pending_traj = traj_new
         self._timed_traj_armed = True
         self._timed_arm_rostime = rospy.Time.now()
-        self._execute_at_ros_time = None
+        if self._pending_execute_at_for_arm is not None:
+            self._execute_at_ros_time = self._pending_execute_at_for_arm
+            self._pending_execute_at_for_arm = None
+        else:
+            self._execute_at_ros_time = None
+            self._schedule_leader_auto_execute()
         rospy.loginfo(
             "MultiAgentNavigator: armed timed trajectory (plan_id=%s duration_s=%.3f); waiting for execute_at",
             self._multi_plan_id,
             float(t_new[-1]) if len(t_new) else 0.0,
         )
-        self._schedule_leader_auto_execute()
 
     def _schedule_leader_auto_execute(self):
         """Coordinator (min fleet_robot_ids) publishes execute_at after a delay (or disable via ~multi_agent_auto_execute)."""
         if not self._multi_agent_auto_execute:
+            return
+        if self._execute_at_ros_time is not None:
             return
         fleet = [int(x) for x in self._multi_fleet_robot_ids]
         coord = self._fleet_coordinator_id()
@@ -462,8 +677,24 @@ class MultiAgentNavigator(l2.Navigator):
             marker_arr.markers.append(marker)
         self.waypoint_pub.publish(marker_arr)
 
+        wt_pub = self._armed_waypoint_times_for_snapshot
+        if wt_pub is None or len(wt_pub) != len(planned_path):
+            wt_pub = self._solo_velocity_waypoint_times(planned_path)
+        path_snap = Path()
+        path_snap.header.frame_id = "map"
+        path_snap.header.stamp = rospy.Time.now()
+        for state in planned_path:
+            ps = PoseStamped()
+            ps.header = path_snap.header
+            ps.pose.position.x = float(state[0])
+            ps.pose.position.y = float(state[1])
+            ps.pose.orientation.w = 1.0
+            path_snap.poses.append(ps)
+        self._publish_active_trajectory_msg(True, path_snap, wt_pub, self._execute_at_ros_time, self._multi_plan_id)
+
         self._simultaneous_solve_done = False
         self._simultaneous_optimized_times = None
+        self._armed_waypoint_times_for_snapshot = None
         self._reset_timed_execute_state()
         self._clear_pre_multi_align_state()
         self._timing_solve_wait_started_at = None
@@ -501,6 +732,13 @@ class MultiAgentNavigator(l2.Navigator):
         idx = np.unique(np.linspace(0, len(pts) - 1, num=m, dtype=int))
         return [pts[i] for i in idx]
 
+    def _downsample_path_xy_and_times(self, pts, times):
+        m = self._multi_max_path_points
+        if m <= 0 or len(pts) <= m or len(pts) != len(times):
+            return pts, times
+        idx = np.unique(np.linspace(0, len(pts) - 1, num=m, dtype=int))
+        return [pts[i] for i in idx], [times[i] for i in idx]
+
     def _assemble_paths_for_simultaneous(self):
         paths = []
         for rid in self._multi_fleet_robot_ids:
@@ -518,14 +756,16 @@ class MultiAgentNavigator(l2.Navigator):
 
     def _fleet_paths_complete(self):
         pid = (self._multi_plan_id or "").strip()
-        if not pid:
-            return False
         fleet = [int(x) for x in self._multi_fleet_robot_ids]
         if not fleet:
             return False
         ego_plan = getattr(self, "unsmoothed_plan", None) or []
         if len(ego_plan) == 0:
             return False
+        if not pid:
+            return False
+        if len(fleet) == 1:
+            return True
         my_id = int(self.my_id)
         for rid in fleet:
             if rid == my_id:
@@ -537,6 +777,13 @@ class MultiAgentNavigator(l2.Navigator):
 
     def _abort_multi_to_idle(self):
         rospy.logwarn("MultiAgentNavigator: aborting multi-agent phase -> IDLE")
+        try:
+            empty = Path()
+            empty.header.frame_id = "map"
+            empty.header.stamp = rospy.Time.now()
+            self._publish_active_trajectory_msg(False, empty, [], rospy.Time(0), self._multi_plan_id)
+        except Exception:
+            pass
         self._multi_plan_id = ""
         self._multi_coordinated = False
         self._multi_source_agent = 0
@@ -563,12 +810,112 @@ class MultiAgentNavigator(l2.Navigator):
             if not self._fleet_paths_complete():
                 return
             self._simultaneous_solve_running = True
-        rospy.loginfo(
-            "MultiAgentNavigator: coordinator starting simultaneous timing solve (plan_id=%s fleet=%s)",
-            self._multi_plan_id,
-            self._multi_fleet_robot_ids,
-        )
-        threading.Thread(target=self._simultaneous_planner_thread_main, daemon=True).start()
+        fleet = [int(x) for x in self._multi_fleet_robot_ids]
+        if len(fleet) >= 2:
+            rospy.loginfo(
+                "MultiAgentNavigator: coordinator starting simultaneous timing solve (plan_id=%s fleet=%s)",
+                self._multi_plan_id,
+                self._multi_fleet_robot_ids,
+            )
+            threading.Thread(target=self._simultaneous_planner_thread_main, daemon=True).start()
+        elif len(fleet) == 1 and self._peer_active_obstacles_available():
+            rospy.loginfo(
+                "MultiAgentNavigator: starting sequential timing solve (plan_id=%s peers in cache)",
+                self._multi_plan_id,
+            )
+            threading.Thread(target=self._sequential_planner_thread_main, daemon=True).start()
+        else:
+            rospy.loginfo(
+                "MultiAgentNavigator: singleton fleet solo timing (plan_id=%s no peer trajectories)",
+                self._multi_plan_id,
+            )
+            threading.Thread(target=self._solo_timing_thread_main, daemon=True).start()
+
+    def _solo_timing_thread_main(self):
+        try:
+            plan = getattr(self, "unsmoothed_plan", None) or []
+            if len(plan) < 1:
+                raise RuntimeError("empty plan")
+            times = self._solo_velocity_waypoint_times(plan)
+            self._simultaneous_optimized_times = [times]
+            self._armed_waypoint_times_for_snapshot = list(times)
+            T_ego = rospy.Time.now() + rospy.Duration(max(0.05, self._multi_agent_sequential_budget_sec))
+            self._pending_execute_at_for_arm = T_ego
+            rospy.loginfo(
+                "MultiAgentNavigator: solo timing ready plan_id=%s T_ego=%s duration_s=%.3f",
+                self._multi_plan_id,
+                T_ego,
+                float(times[-1]) if times else 0.0,
+            )
+            self._simultaneous_solve_done = True
+        except Exception as exc:
+            rospy.logerr("MultiAgentNavigator: solo timing failed: %s", exc)
+            self._simultaneous_solve_failed = True
+        finally:
+            self._simultaneous_solve_running = False
+
+    def _sequential_planner_thread_main(self):
+        try:
+            import social_path_planning.multi_planning as smp
+
+            smp.ROBOT_DIAMETER = float(self._multi_agent_robot_diameter)
+            smp.MAX_VELOCITY = float(self._multi_agent_max_velocity)
+            T_ego = rospy.Time.now() + rospy.Duration(max(0.05, self._multi_agent_sequential_budget_sec))
+            t_ego_sec = T_ego.to_sec()
+            ego_plan = getattr(self, "unsmoothed_plan", None) or []
+            ego_path = [(float(s[0]), float(s[1])) for s in ego_plan]
+            other_paths = []
+            other_times_shifted = []
+            with self._peer_traj_cache_lock:
+                snap = {int(k): dict(v) for k, v in self._peer_active_trajectories.items()}
+            for rid, rec in sorted(snap.items()):
+                if rid == int(self.my_id):
+                    continue
+                if not rec.get("active", True):
+                    continue
+                pxy = rec.get("path_xy") or []
+                tau = rec.get("waypoint_times") or []
+                ex = rec.get("execute_at")
+                if ex is None or len(pxy) != len(tau) or not pxy:
+                    continue
+                ex_sec = ex.to_sec()
+                shifted = [ex_sec + float(tau[j]) - t_ego_sec for j in range(len(tau))]
+                op2, ot2 = self._downsample_path_xy_and_times(pxy, shifted)
+                other_paths.append(op2)
+                other_times_shifted.append(ot2)
+            if not other_paths:
+                times = self._solo_velocity_waypoint_times(ego_plan)
+                self._simultaneous_optimized_times = [times]
+                self._armed_waypoint_times_for_snapshot = list(times)
+                self._pending_execute_at_for_arm = T_ego
+                self._simultaneous_solve_done = True
+                rospy.loginfo("MultiAgentNavigator: sequential thread fell back to solo (no valid peers)")
+                return
+            occ = self._build_sp_occupancy_grid()
+            if occ is None:
+                raise RuntimeError("occupancy grid missing for sequential planner")
+            planner = MultiAgentSequentialPlanner(
+                occ, other_paths, other_times_shifted, path=ego_path, v=float(self._multi_agent_max_velocity)
+            )
+            ego_times = planner.plan()
+            if len(ego_times) != len(ego_plan):
+                raise RuntimeError("sequential times length mismatch vs ego plan")
+            self._simultaneous_optimized_times = [ego_times]
+            self._armed_waypoint_times_for_snapshot = list(ego_times)
+            self._pending_execute_at_for_arm = T_ego
+            self._simultaneous_solve_done = True
+            rospy.loginfo(
+                "MultiAgentNavigator: sequential plan solved plan_id=%s T_ego=%s ego_wp=%d peers=%d",
+                self._multi_plan_id,
+                T_ego,
+                len(ego_times),
+                len(other_paths),
+            )
+        except Exception as exc:
+            rospy.logerr("MultiAgentNavigator: sequential plan failed: %s", exc)
+            self._simultaneous_solve_failed = True
+        finally:
+            self._simultaneous_solve_running = False
 
     def _simultaneous_planner_thread_main(self):
         try:
@@ -594,6 +941,10 @@ class MultiAgentNavigator(l2.Navigator):
             self._simultaneous_optimized_times = optimized_times
             self._simultaneous_solve_done = True
             fleet = [int(x) for x in self._multi_fleet_robot_ids]
+            my_id = int(self.my_id)
+            ego_k = fleet.index(my_id) if my_id in fleet else 0
+            if optimized_times and ego_k < len(optimized_times):
+                self._armed_waypoint_times_for_snapshot = [float(x) for x in optimized_times[ego_k]]
             if len(fleet) > 1:
                 ts_msg = MultiAgentTimingSolve()
                 ts_msg.plan_id = self._multi_plan_id
@@ -719,6 +1070,8 @@ class MultiAgentNavigator(l2.Navigator):
         self._multi_coordinated = bool(msg.coordinated)
         self._multi_source_agent = int(msg.source_agent)
         self._multi_fleet_robot_ids = [int(x) for x in (msg.fleet_robot_ids or [])]
+        if len(self._multi_fleet_robot_ids) == 1 and not (self._multi_plan_id or "").strip():
+            self._multi_plan_id = "solo_multi"
 
         self.x_g = g.x
         self.y_g = g.y
@@ -824,7 +1177,12 @@ class MultiAgentNavigator(l2.Navigator):
                     )
                     self._abort_multi_to_idle()
                     return
-            if self._fleet_paths_complete() and not self._simultaneous_solve_done and not self._simultaneous_solve_failed:
+            if (
+                self._fleet_paths_complete()
+                and not self._simultaneous_solve_done
+                and not self._simultaneous_solve_failed
+                and not self._simultaneous_solve_running
+            ):
                 if self._timing_solve_wait_started_at is None:
                     self._timing_solve_wait_started_at = rospy.Time.now()
                 elif (
@@ -883,6 +1241,12 @@ class MultiAgentNavigator(l2.Navigator):
             self.nav_vel_pub.publish(cmd_vel)
             return
         super(MultiAgentNavigator, self).publish_control()
+
+    def shutdown_callback(self):
+        if self._active_traj_prune_timer is not None:
+            self._active_traj_prune_timer.shutdown()
+            self._active_traj_prune_timer = None
+        super(MultiAgentNavigator, self).shutdown_callback()
 
 
 if __name__ == "__main__":
