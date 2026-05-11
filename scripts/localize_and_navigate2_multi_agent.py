@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Navigator variant: same behavior as localize_and_navigate2, plus /external_goal_multi
-(MultiRobotExternalGoal). After a successful plan from a multi-robot goal, enters
-MULTIAGENT_CONTROL_COMPUTING (integer 11 on /robot_mode), publishes the ego planned path
-for DDS, waits for peer paths (fleet_robot_ids + plan_id) or times out, then runs
-MultiAgentSimultaneousPlanner in a background thread, builds a timed spline trajectory,
-waits for MultiAgentExecuteAt (DDS or auto from fleet leader), then starts TRACK/ALIGN with synchronized t=0 at execute_at.
+(MultiRobotExternalGoal). After a successful plan from a multi-robot goal, runs a pre-MULTI
+ALIGN dwell (heading toward the polyline start), then enters MULTIAGENT_CONTROL_COMPUTING (mode 11),
+publishes the ego planned path for DDS, waits for peer paths (fleet_robot_ids + plan_id) or times out,
+then the fleet coordinator (lowest robot ID in fleet_robot_ids) runs MultiAgentSimultaneousPlanner once and
+distributes waypoint times via DDS (MultiAgentTimingSolve); followers apply the received solution, build a timed spline,
+wait for MultiAgentExecuteAt (DDS or auto from the same coordinator), then start TRACK with synchronized t=0 at execute_at.
 
 Python 3.8 does not allow subclassing an existing Enum with new members, so the extra
 state uses a separate IntEnum with value 11 (distinct from localize_and_navigate2.Mode).
@@ -21,7 +22,12 @@ import numpy as np
 import rospy
 from geometry_msgs.msg import Pose2D, PoseStamped, Twist
 from nav_msgs.msg import Path
-from mattbot_dds.msg import MultiAgentExecuteAt, MultiAgentPlannedPath, MultiRobotExternalGoal
+from mattbot_dds.msg import (
+    MultiAgentExecuteAt,
+    MultiAgentPlannedPath,
+    MultiAgentTimingSolve,
+    MultiRobotExternalGoal,
+)
 from navigation_utils import compute_trajectory_from_timed_waypoints
 from social_path_planning.occupancy_grid import StochOccupancyGrid2D as SpStochOccupancyGrid2D
 from visualization_msgs.msg import Marker, MarkerArray
@@ -82,8 +88,14 @@ class MultiAgentNavigator(l2.Navigator):
         self._execute_at_ros_time = None
         self._timed_arm_rostime = None
         self._auto_execute_timer = None
+        self._awaiting_pre_multi_align = False
+        self._pre_multi_align_started_at = None
+        self._timing_solve_wait_started_at = None
         super(MultiAgentNavigator, self).__init__(node_name=node_name)
         self._multi_path_wait_timeout = float(rospy.get_param("~multi_agent_path_wait_timeout", 60.0))
+        self._multi_agent_timing_solve_wait_timeout_sec = float(
+            rospy.get_param("~multi_agent_timing_solve_wait_timeout_sec", 120.0)
+        )
         self._multi_max_path_points = int(rospy.get_param("~multi_agent_max_path_points", 0))
         self._multi_agent_robot_diameter = float(rospy.get_param("~multi_agent_robot_diameter", 1.0))
         self._multi_agent_max_velocity = float(rospy.get_param("~multi_agent_max_velocity", 0.7))
@@ -128,11 +140,75 @@ class MultiAgentNavigator(l2.Navigator):
         self._execute_at_sub_topic = rospy.get_param("~multi_agent_execute_at_topic", "/multi_agent_execute_at").strip() or "/multi_agent_execute_at"
         rospy.Subscriber(self._execute_at_sub_topic, MultiAgentExecuteAt, self._multi_agent_execute_at_callback, queue_size=10)
         rospy.loginfo("MultiAgentNavigator: subscribed to execute_at topic %s", self._execute_at_sub_topic)
+        self._timing_solve_for_dds_topic = rospy.get_param(
+            "~multi_agent_timing_solve_for_dds_topic", "/multi_agent_timing_solve_for_dds"
+        ).strip() or "/multi_agent_timing_solve_for_dds"
+        self._multi_agent_timing_solve_for_dds_pub = rospy.Publisher(
+            self._timing_solve_for_dds_topic, MultiAgentTimingSolve, queue_size=2, latch=False
+        )
+        self._timing_solve_sub_topic = rospy.get_param(
+            "~multi_agent_timing_solve_topic", "/multi_agent_timing_solve"
+        ).strip() or "/multi_agent_timing_solve"
+        rospy.Subscriber(
+            self._timing_solve_sub_topic,
+            MultiAgentTimingSolve,
+            self._multi_agent_timing_solve_callback,
+            queue_size=10,
+        )
         rospy.loginfo(
-            "MultiAgentNavigator: auto_execute=%s leader_delay_s=%.2f (fleet leader = first fleet_robot_ids)",
+            "MultiAgentNavigator: timing solve DDS pub=%s sub=%s",
+            self._timing_solve_for_dds_topic,
+            self._timing_solve_sub_topic,
+        )
+        rospy.loginfo(
+            "MultiAgentNavigator: auto_execute=%s coordinator_delay_s=%.2f (coordinator = min fleet_robot_ids)",
             self._multi_agent_auto_execute,
             self._multi_agent_auto_execute_delay_sec,
         )
+        self._pre_multi_align_sec = float(rospy.get_param("~multi_agent_pre_multi_align_sec", 2.0))
+        self._pre_multi_align_exit_policy = rospy.get_param(
+            "~multi_agent_pre_multi_align_exit_policy", "aligned_or_max"
+        ).strip().lower()
+        if self._pre_multi_align_exit_policy not in ("aligned_or_max", "max_only"):
+            rospy.logwarn(
+                "MultiAgentNavigator: unknown ~multi_agent_pre_multi_align_exit_policy=%r; using aligned_or_max",
+                self._pre_multi_align_exit_policy,
+            )
+            self._pre_multi_align_exit_policy = "aligned_or_max"
+        rospy.loginfo(
+            "MultiAgentNavigator: pre_multi_align max_s=%.2f exit_policy=%s",
+            self._pre_multi_align_sec,
+            self._pre_multi_align_exit_policy,
+        )
+        rospy.loginfo(
+            "MultiAgentNavigator: coordinated MILP runs on min(fleet_robot_ids); timing via MultiAgentTimingSolve DDS"
+        )
+
+    def _clear_pre_multi_align_state(self):
+        self._awaiting_pre_multi_align = False
+        self._pre_multi_align_started_at = None
+
+    def _fleet_coordinator_id(self):
+        fleet = [int(x) for x in self._multi_fleet_robot_ids]
+        return min(fleet) if fleet else None
+
+    def _i_am_coordinator(self):
+        cid = self._fleet_coordinator_id()
+        return cid is not None and int(self.my_id) == cid
+
+    @staticmethod
+    def _unpack_timing_solve_flat(counts, flat):
+        rows = []
+        idx = 0
+        for c in counts:
+            c = int(c)
+            if c < 0 or idx + c > len(flat):
+                return None
+            rows.append([float(x) for x in flat[idx : idx + c]])
+            idx += c
+        if idx != len(flat):
+            return None
+        return rows
 
     def _cancel_auto_execute_timer(self):
         if self._auto_execute_timer is not None:
@@ -157,6 +233,70 @@ class MultiAgentNavigator(l2.Navigator):
             "MultiAgentNavigator: execute_at received plan_id=%s execute_at=%s",
             msg.plan_id,
             self._execute_at_ros_time,
+        )
+
+    def _multi_agent_timing_solve_callback(self, msg):
+        """Apply MILP timing from coordinator (DDS -> ROS); coordinator skips local echo (already set in solver thread)."""
+        if not self._is_multiagent_computing_mode(self.mode):
+            return
+        pid = (msg.plan_id or "").strip()
+        if pid != (self._multi_plan_id or "").strip():
+            return
+        coord = self._fleet_coordinator_id()
+        if coord is None or int(msg.source_agent) != coord:
+            rospy.logwarn_throttle(
+                5.0,
+                "MultiAgentNavigator: ignoring timing_solve source=%s expected coordinator=%s",
+                msg.source_agent,
+                coord,
+            )
+            return
+        if self._i_am_coordinator() and int(msg.source_agent) == int(self.my_id):
+            return
+
+        fleet_msg = [int(x) for x in (msg.fleet_robot_ids or [])]
+        fleet_local = [int(x) for x in self._multi_fleet_robot_ids]
+        if fleet_msg != fleet_local:
+            rospy.logwarn(
+                "MultiAgentNavigator: timing_solve fleet_robot_ids %s != local %s; aborting multi",
+                fleet_msg,
+                fleet_local,
+            )
+            self._simultaneous_solve_failed = True
+            return
+
+        counts = [int(x) for x in (msg.waypoint_counts or [])]
+        flat = [float(x) for x in (msg.waypoint_times_flat or [])]
+        rows = self._unpack_timing_solve_flat(counts, flat)
+        if rows is None or len(rows) != len(fleet_local):
+            rospy.logwarn("MultiAgentNavigator: invalid timing_solve payload; aborting multi")
+            self._simultaneous_solve_failed = True
+            return
+
+        my_id = int(self.my_id)
+        ego_k = fleet_local.index(my_id)
+        plan = getattr(self, "unsmoothed_plan", None) or []
+        if ego_k >= len(rows) or len(rows[ego_k]) != len(plan):
+            rospy.logwarn(
+                "MultiAgentNavigator: ego timing len=%s vs plan len=%d; aborting multi",
+                len(rows[ego_k]) if ego_k < len(rows) else None,
+                len(plan),
+            )
+            self._simultaneous_solve_failed = True
+            return
+
+        with self._simultaneous_lock:
+            if self._simultaneous_solve_done:
+                return
+            self._simultaneous_optimized_times = rows
+            self._simultaneous_solve_done = True
+            self._simultaneous_solve_running = False
+        self._timing_solve_wait_started_at = None
+        rospy.loginfo(
+            "MultiAgentNavigator: applied timing_solve from coordinator=%s plan_id=%s ego_wp=%d",
+            msg.source_agent,
+            pid,
+            len(rows[ego_k]),
         )
 
     def _maybe_arm_timed_trajectory(self):
@@ -195,6 +335,8 @@ class MultiAgentNavigator(l2.Navigator):
             self._peer_multi_planned_paths = {}
             self._simultaneous_solve_done = False
             self._simultaneous_optimized_times = None
+            self._clear_pre_multi_align_state()
+            self._timing_solve_wait_started_at = None
             return
         try:
             t_new, traj_new = compute_trajectory_from_timed_waypoints(
@@ -217,17 +359,19 @@ class MultiAgentNavigator(l2.Navigator):
         self._schedule_leader_auto_execute()
 
     def _schedule_leader_auto_execute(self):
-        """First robot in fleet_robot_ids publishes execute_at after a delay (or disable via ~multi_agent_auto_execute)."""
+        """Coordinator (min fleet_robot_ids) publishes execute_at after a delay (or disable via ~multi_agent_auto_execute)."""
         if not self._multi_agent_auto_execute:
             return
         fleet = [int(x) for x in self._multi_fleet_robot_ids]
-        if not fleet or int(self.my_id) != int(fleet[0]):
+        coord = self._fleet_coordinator_id()
+        if coord is None or int(self.my_id) != coord:
             return
         self._cancel_auto_execute_timer()
+        # Allow peers to finish pre-MULTI ALIGN + one MILP + DDS; increase if fleet is large or clocks loose.
         d = max(0.0, self._multi_agent_auto_execute_delay_sec)
         rospy.loginfo(
-            "MultiAgentNavigator: fleet leader robot %s scheduling auto execute_at publish in %.2fs -> %s",
-            fleet[0],
+            "MultiAgentNavigator: coordinator robot %s scheduling auto execute_at publish in %.2fs -> %s",
+            coord,
             d,
             self._leader_execute_dds_topic,
         )
@@ -242,7 +386,8 @@ class MultiAgentNavigator(l2.Navigator):
         if self._execute_at_ros_time is not None:
             return
         fleet = [int(x) for x in self._multi_fleet_robot_ids]
-        if not fleet or int(self.my_id) != int(fleet[0]):
+        coord = self._fleet_coordinator_id()
+        if coord is None or int(self.my_id) != coord:
             return
         pid = (self._multi_plan_id or "").strip()
         if not pid:
@@ -253,14 +398,14 @@ class MultiAgentNavigator(l2.Navigator):
         msg.execute_at = rospy.Time.now() + rospy.Duration(max(0.05, self._multi_agent_auto_execute_wall_extra_sec))
         self._leader_execute_pub.publish(msg)
         rospy.loginfo(
-            "MultiAgentNavigator: fleet leader published MultiAgentExecuteAt plan_id=%s execute_at=%s (DDS trigger %s)",
+            "MultiAgentNavigator: coordinator published MultiAgentExecuteAt plan_id=%s execute_at=%s (DDS trigger %s)",
             pid,
             msg.execute_at,
             self._leader_execute_dds_topic,
         )
 
     def _commit_timed_trajectory(self):
-        """Leave MULTI: load pending trajectory with t=0 at execute_at wall time; ALIGN or TRACK."""
+        """Leave MULTI: load pending trajectory with t=0 at execute_at wall time; TRACK (pre-MULTI ALIGN already done)."""
         if not self._timed_traj_armed:
             return
         if self._pending_traj is None or self._pending_traj_times is None:
@@ -320,13 +465,15 @@ class MultiAgentNavigator(l2.Navigator):
         self._simultaneous_solve_done = False
         self._simultaneous_optimized_times = None
         self._reset_timed_execute_state()
+        self._clear_pre_multi_align_state()
+        self._timing_solve_wait_started_at = None
 
         if not self.aligned():
-            rospy.loginfo("MultiAgentNavigator: timed plan — not aligned with start direction -> ALIGN")
-            self.switch_mode(l2.Mode.ALIGN)
-        else:
-            rospy.loginfo("MultiAgentNavigator: timed plan -> TRACK")
-            self.switch_mode(l2.Mode.TRACK)
+            rospy.logwarn(
+                "MultiAgentNavigator: timed plan commit while not aligned with start heading; TRACK anyway (pre-MULTI ALIGN should have handled this)"
+            )
+        rospy.loginfo("MultiAgentNavigator: timed plan -> TRACK")
+        self.switch_mode(l2.Mode.TRACK)
 
     def _build_sp_occupancy_grid(self):
         """`social_path_planning` grid copy for MultiAgentSimultaneousPlanner (same geometry as self.occupancy)."""
@@ -401,10 +548,14 @@ class MultiAgentNavigator(l2.Navigator):
         self._simultaneous_optimized_times = None
         self._multi_phase_started_at = None
         self._reset_timed_execute_state()
+        self._clear_pre_multi_align_state()
+        self._timing_solve_wait_started_at = None
         self.switch_mode(l2.Mode.IDLE)
 
     def _try_simultaneous_plan_if_ready(self):
         if not self._is_multiagent_computing_mode(self.mode):
+            return
+        if not self._i_am_coordinator():
             return
         with self._simultaneous_lock:
             if self._simultaneous_solve_done or self._simultaneous_solve_running or self._simultaneous_solve_failed:
@@ -413,7 +564,7 @@ class MultiAgentNavigator(l2.Navigator):
                 return
             self._simultaneous_solve_running = True
         rospy.loginfo(
-            "MultiAgentNavigator: starting simultaneous timing solve (plan_id=%s fleet=%s)",
+            "MultiAgentNavigator: coordinator starting simultaneous timing solve (plan_id=%s fleet=%s)",
             self._multi_plan_id,
             self._multi_fleet_robot_ids,
         )
@@ -442,6 +593,23 @@ class MultiAgentNavigator(l2.Navigator):
             )
             self._simultaneous_optimized_times = optimized_times
             self._simultaneous_solve_done = True
+            fleet = [int(x) for x in self._multi_fleet_robot_ids]
+            if len(fleet) > 1:
+                ts_msg = MultiAgentTimingSolve()
+                ts_msg.plan_id = self._multi_plan_id
+                ts_msg.source_agent = int(self.my_id)
+                ts_msg.fleet_robot_ids = fleet
+                ts_msg.waypoint_counts = [len(t) for t in optimized_times]
+                flat = []
+                for t in optimized_times:
+                    flat.extend(float(x) for x in t)
+                ts_msg.waypoint_times_flat = flat
+                self._multi_agent_timing_solve_for_dds_pub.publish(ts_msg)
+                rospy.loginfo(
+                    "MultiAgentNavigator: published MultiAgentTimingSolve for DDS (%d agents) plan_id=%s",
+                    len(fleet),
+                    self._multi_plan_id,
+                )
         except Exception as exc:
             rospy.logerr("MultiAgentNavigator: simultaneous plan failed: %s", exc)
             self._simultaneous_solve_failed = True
@@ -543,6 +711,8 @@ class MultiAgentNavigator(l2.Navigator):
         self._simultaneous_optimized_times = None
         self._multi_phase_started_at = None
         self._reset_timed_execute_state()
+        self._clear_pre_multi_align_state()
+        self._timing_solve_wait_started_at = None
 
         self._from_multi_robot_goal = True
         self._multi_plan_id = msg.plan_id
@@ -579,21 +749,61 @@ class MultiAgentNavigator(l2.Navigator):
         if multi:
             self._from_multi_robot_goal = False
             if self.mode in (l2.Mode.ALIGN, l2.Mode.TRACK, l2.Mode.PARK):
-                self.switch_mode(MultiagentComputingMode.MULTIAGENT_CONTROL_COMPUTING)
+                plan = getattr(self, "unsmoothed_plan", None) or []
+                if len(plan) >= 2:
+                    dx = float(plan[1][0]) - float(plan[0][0])
+                    dy = float(plan[1][1]) - float(plan[0][1])
+                    self.th_init = float(np.arctan2(dy, dx))
+                self.heading_controller.load_goal(self.th_init)
+                self._awaiting_pre_multi_align = True
+                self._pre_multi_align_started_at = rospy.Time.now()
+                self.switch_mode(l2.Mode.ALIGN)
                 rospy.loginfo(
-                    "Entering MULTIAGENT_CONTROL_COMPUTING after plan (plan_id=%s)",
+                    "MultiAgentNavigator: pre-MULTI ALIGN dwell (plan_id=%s) policy=%s max_s=%.2f",
                     self._multi_plan_id,
+                    self._pre_multi_align_exit_policy,
+                    self._pre_multi_align_sec,
                 )
-                self._multi_phase_started_at = rospy.Time.now()
-                self._publish_planned_path_for_multi_dds()
             elif self.mode == l2.Mode.IDLE:
                 self._multi_plan_id = ""
                 self._multi_coordinated = False
                 self._multi_source_agent = 0
                 self._multi_fleet_robot_ids = []
                 self._reset_timed_execute_state()
+                self._clear_pre_multi_align_state()
+                self._timing_solve_wait_started_at = None
 
     def publish_control(self):
+        if self._awaiting_pre_multi_align and self.mode != l2.Mode.ALIGN:
+            rospy.logwarn_throttle(
+                5.0,
+                "MultiAgentNavigator: pre-MULTI align expected ALIGN but mode=%s; clearing pre-align flag",
+                self.mode,
+            )
+            self._clear_pre_multi_align_state()
+
+        if self._awaiting_pre_multi_align and self.mode == l2.Mode.ALIGN:
+            if self._pre_multi_align_started_at is None:
+                self._pre_multi_align_started_at = rospy.Time.now()
+            elapsed = (rospy.Time.now() - self._pre_multi_align_started_at).to_sec()
+            pol = self._pre_multi_align_exit_policy
+            if pol == "max_only":
+                exit_dwell = elapsed >= self._pre_multi_align_sec
+            else:
+                exit_dwell = self.aligned() or elapsed >= self._pre_multi_align_sec
+            if exit_dwell:
+                self._awaiting_pre_multi_align = False
+                self.switch_mode(MultiagentComputingMode.MULTIAGENT_CONTROL_COMPUTING)
+                rospy.loginfo(
+                    "Entering MULTIAGENT_CONTROL_COMPUTING after pre-align (plan_id=%s)",
+                    self._multi_plan_id,
+                )
+                self._multi_phase_started_at = rospy.Time.now()
+                self._publish_planned_path_for_multi_dds()
+            else:
+                super(MultiAgentNavigator, self).publish_control()
+                return
+
         if self._is_multiagent_computing_mode(self.mode):
             if self._simultaneous_solve_failed:
                 self._abort_multi_to_idle()
@@ -614,6 +824,22 @@ class MultiAgentNavigator(l2.Navigator):
                     )
                     self._abort_multi_to_idle()
                     return
+            if self._fleet_paths_complete() and not self._simultaneous_solve_done and not self._simultaneous_solve_failed:
+                if self._timing_solve_wait_started_at is None:
+                    self._timing_solve_wait_started_at = rospy.Time.now()
+                elif (
+                    rospy.Time.now() - self._timing_solve_wait_started_at
+                ).to_sec() > self._multi_agent_timing_solve_wait_timeout_sec:
+                    rospy.logwarn(
+                        "MultiAgentNavigator: timing solve wait timeout (%.1fs) plan_id=%s fleet=%s -> IDLE",
+                        self._multi_agent_timing_solve_wait_timeout_sec,
+                        getattr(self, "_multi_plan_id", "") or "?",
+                        self._multi_fleet_robot_ids,
+                    )
+                    self._abort_multi_to_idle()
+                    return
+            else:
+                self._timing_solve_wait_started_at = None
             self._try_simultaneous_plan_if_ready()
             if self._simultaneous_solve_done:
                 self._maybe_arm_timed_trajectory()
