@@ -1066,6 +1066,17 @@ class MultiAgentNavigator(l2.Navigator):
                 self._simultaneous_solve_done = True
                 rospy.logdebug("MultiAgentNavigator: sequential thread fell back to solo (no valid peers)")
                 return
+            if len(ego_path) < 2:
+                times = self._solo_velocity_waypoint_times(ego_plan)
+                self._simultaneous_optimized_times = [times]
+                self._armed_waypoint_times_for_snapshot = list(times)
+                self._pending_execute_at_for_arm = T_ego
+                self._simultaneous_solve_done = True
+                rospy.logwarn(
+                    "MultiAgentNavigator: sequential planner skipped (ego path has %d points); using solo analytic times",
+                    len(ego_path),
+                )
+                return
             occ = self._build_sp_occupancy_grid()
             if occ is None:
                 raise RuntimeError("occupancy grid missing for sequential planner")
