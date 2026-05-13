@@ -594,6 +594,15 @@ class MultiAgentNavigator(l2.Navigator):
 
         counts = [int(x) for x in (msg.waypoint_counts or [])]
         flat = [float(x) for x in (msg.waypoint_times_flat or [])]
+        # Coordinator: empty payload = simultaneous MILP infeasible / fleet-wide abort (peers leave MULTI).
+        if len(counts) == 0 and len(flat) == 0:
+            rospy.logwarn(
+                "MultiAgentNavigator: coordinated timing aborted (infeasible or solver failure) plan_id=%s",
+                pid,
+            )
+            self._simultaneous_solve_failed = True
+            return
+
         rows = self._unpack_timing_solve_flat(counts, flat)
         if rows is None or len(rows) != len(fleet_local):
             rospy.logwarn("MultiAgentNavigator: invalid timing_solve payload; aborting multi")
@@ -914,6 +923,29 @@ class MultiAgentNavigator(l2.Navigator):
                 return False
         return True
 
+    def _publish_timing_solve_abort_for_fleet(self):
+        """Coordinator only: broadcast empty timing payload so fleet peers leave MULTI (infeasible MILP, etc.)."""
+        if not self._i_am_coordinator():
+            return
+        fleet = [int(x) for x in self._multi_fleet_robot_ids]
+        if len(fleet) < 2:
+            return
+        pid = (self._multi_plan_id or "").strip()
+        if not pid:
+            return
+        ts_msg = MultiAgentTimingSolve()
+        ts_msg.plan_id = pid
+        ts_msg.source_agent = int(self.my_id)
+        ts_msg.fleet_robot_ids = fleet
+        ts_msg.waypoint_counts = []
+        ts_msg.waypoint_times_flat = []
+        self._multi_agent_timing_solve_for_dds_pub.publish(ts_msg)
+        rospy.logwarn(
+            "MultiAgentNavigator: published timing ABORT for fleet (peers -> IDLE) plan_id=%s fleet=%s",
+            pid,
+            fleet,
+        )
+
     def _abort_multi_to_idle(self):
         """Hard stop MULTI: notify peers (inactive trajectory), clear mission id, reset timing state, IDLE."""
         rospy.logwarn("MultiAgentNavigator: aborting multi-agent phase -> IDLE")
@@ -1107,6 +1139,10 @@ class MultiAgentNavigator(l2.Navigator):
                 )
         except Exception as exc:
             rospy.logerr("MultiAgentNavigator: simultaneous plan failed: %s", exc)
+            try:
+                self._publish_timing_solve_abort_for_fleet()
+            except Exception as pub_exc:
+                rospy.logwarn("MultiAgentNavigator: fleet timing abort publish failed: %s", pub_exc)
             self._simultaneous_solve_failed = True
         finally:
             self._simultaneous_solve_running = False
