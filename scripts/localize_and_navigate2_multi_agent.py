@@ -1,24 +1,47 @@
 #!/usr/bin/env python3
 """
-Navigator variant: same behavior as localize_and_navigate2, plus /external_goal_multi
-(MultiRobotExternalGoal) and singleton coordination. After a successful plan from a multi-robot goal,
-runs a pre-MULTI ALIGN dwell, then MULTIAGENT_CONTROL_COMPUTING: publishes planned path, then either
-(1) fleet size >= 2: coordinator runs simultaneous MILP and MultiAgentTimingSolve over DDS;
-(2) fleet size == 1 with peer active trajectories in cache: coordinator runs MultiAgentSequentialPlanner
-with shifted global times and fixed execute_at = now + budget;
-(3) fleet size == 1 solo: analytic max-velocity waypoint times (no MILP).
+Navigator variant: extends ``localize_and_navigate2.Navigator`` with optional **coordinated timing**
+after a geometric path exists. Geometric planning (A*, smoothing, ALIGN/TRACK/PARK) still lives in the
+parent class; this file adds a **multi-agent timing phase** so several robots can agree on waypoint
+times and a common ``execute_at`` wall clock before TRACK.
 
-For missions started via /external_goal_multi, after the first timed TRACK commit, further replans
-(e.g. plan duration elapsed or waypoint deadlines while moving) re-enter the same timing pipeline.
-If the mission was coordinated with fleet size >= 2, those sticky replans shrink to ego-only timing
-(sequential when peer active trajectories exist in cache, else solo), not a second simultaneous MILP.
+**When does multi timing run?**
+    Only if ``replan()`` is entered with ``_from_multi_robot_goal`` (fresh Pose2D or ``/external_goal_multi``)
+    or ``_sticky_multi_timing_replan`` (see below). Otherwise behavior matches the single-robot navigator.
 
-Peers publish MultiAgentActiveTrajectory snapshots on timed TRACK commit; cache is pruned periodically
-and on inactive messages. /external_goal (Pose2D) and /voice_goal use the same singleton path as a
-one-robot multi goal (plan_id solo_pose).
+**End-to-end lifecycle (happy path)**
+    1. Goal arrives → ``external_goal_callback`` or ``external_goal_multi_callback`` sets fleet metadata
+       and calls ``replan()`` with ``_from_multi_robot_goal`` True.
+    2. Parent ``Navigator.replan()`` builds ``unsmoothed_plan`` / smoothed preview and sets mode ALIGN
+       or TRACK (same as base).
+    3. This subclass then forces **pre-MULTI ALIGN**: dwell in ALIGN so headings settle before DDS
+       publishes the grid plan.
+    4. Mode ``MULTIAGENT_CONTROL_COMPUTING`` (value 11): ego publishes ``MultiAgentPlannedPath`` to ROS
+       (``dds_data_publisher`` forwards to DDS). Peers do the same for the same ``plan_id``.
+    5. **Coordinator** (robot id ``min(fleet_robot_ids)``) runs **one** of:
+       - **Simultaneous** (fleet size ≥ 2): ``MultiAgentSimultaneousPlanner`` MILP; publishes
+         ``MultiAgentTimingSolve`` for non-coordinator fleet members.
+       - **Sequential** (singleton fleet + peer ``MultiAgentActiveTrajectory`` in local cache):
+         ``MultiAgentSequentialPlanner`` with time-shifted peer trajectories.
+       - **Solo** (singleton, no usable peer cache): analytic cumulative times at ``max_velocity``.
+    6. Pending spline is **armed**; robots wait for ``MultiAgentExecuteAt`` (or coordinator auto-publishes
+       after ``~multi_agent_auto_execute_delay_sec``). At ``execute_at``, ``_commit_timed_trajectory()``
+       loads the timed spline, republishes visualization, publishes **active trajectory** for peers,
+       and switches to TRACK. Parent logic then tracks the trajectory as usual.
 
-Python 3.8 does not allow subclassing an existing Enum with new members, so the extra
-state uses a separate IntEnum with value 11 (distinct from localize_and_navigate2.Mode).
+**Sticky replans** (``/external_goal_multi`` missions only)
+    After the first successful timed TRACK commit, ``_sticky_multi_timing_replan`` is True so **timeout /
+    waypoint-miss / path-invalid replans** from the parent ``run()`` loop re-enter steps 3–6 instead of
+    doing only a local single-robot replan. If the original fleet had ≥ 2 robots, the sticky path **shrinks
+    the local fleet to ego only** so timing uses sequential/solo vs peer **active trajectories**, not a
+    second simultaneous MILP (peers may still be executing their old coordinated plan).
+
+**ROS ↔ DDS**
+    This node uses ROS topics only; ``mattbot_dds`` scripts bridge ``*_for_dds`` / ``*_from_agent`` topics
+    to CycloneDDS. Message definitions live in ``mattbot_dds/msg``.
+
+**Python 3.8 note**
+    Parent ``Mode`` enum cannot be extended; extra mode uses ``MultiagentComputingMode`` value 11.
 """
 
 import importlib.util
@@ -73,44 +96,68 @@ l2 = _load_localize_and_navigate2()
 
 
 class MultiagentComputingMode(IntEnum):
-    """Single member; must not overlap localize_and_navigate2.Mode values (0–10)."""
+    """Extra navigator mode; value 11 must not collide with ``localize_and_navigate2.Mode`` (0–10).
+
+    Used while the robot is stationary: waiting for peer planned paths, running MILP/sequential timing,
+    arming the spline, and synchronizing on ``execute_at``.
+    """
 
     MULTIAGENT_CONTROL_COMPUTING = 11
 
 
 class MultiAgentNavigator(l2.Navigator):
+    """Adds multi-robot **timing** (waypoint times + execute_at) on top of the base geometric navigator.
+
+    Read the module docstring for the full lifecycle. Key instance state:
+
+    - ``_from_multi_robot_goal``: set True immediately before ``replan()`` for a **new** multi-aware goal
+      (Pose2D path uses singleton fleet; ``MultiRobotExternalGoal`` carries full fleet metadata).
+    - ``_sticky_multi_timing_replan``: after first timed TRACK from ``/external_goal_multi``, keeps later
+      replans inside the coordinated timing pipeline.
+    - ``_multi_fleet_robot_ids`` / ``_multi_plan_id``: roster and correlation id for DDS messages.
+    - ``_peer_multi_planned_paths``: latest ``MultiAgentPlannedPath`` per **source_agent** (needed for
+      simultaneous MILP when fleet size ≥ 2).
+    - ``_peer_active_trajectories``: cache of peers' **committed** timed plans (for sequential replanning).
+    """
+
     def __init__(self, node_name="mattbot_navigator_multi_agent"):
+        # --- Goal-source flags (drive whether replan() re-enters pre-MULTI + timing) ---
         self._from_multi_robot_goal = False
-        # True only for goals from /external_goal_multi; used to arm sticky replans after first TRACK commit.
         self._replan_as_multi_from_external_goal_multi = False
-        # After a timed TRACK commit from /external_goal_multi: sticky replans re-enter MULTI timing (see module doc).
         self._sticky_multi_timing_replan = False
+        # --- Mission identity (from MultiRobotExternalGoal; Pose2D uses solo_pose + [my_id]) ---
         self._multi_plan_id = ""
         self._multi_coordinated = False
         self._multi_source_agent = 0
         self._peer_multi_planned_paths = {}
         self._multi_fleet_robot_ids = []
+        # --- MULTI phase wall-clock (timeouts in publish_control) ---
         self._multi_phase_started_at = None
+        # --- Coordinator-only MILP / sequential / solo worker (daemon threads) ---
         self._simultaneous_solve_done = False
         self._simultaneous_solve_failed = False
         self._simultaneous_solve_running = False
         self._simultaneous_optimized_times = None
         self._simultaneous_lock = threading.Lock()
+        # --- Arm / commit handoff: spline built in MULTI, executed at execute_at on TRACK ---
         self._timed_traj_armed = False
         self._pending_traj_times = None
         self._pending_traj = None
         self._execute_at_ros_time = None
         self._timed_arm_rostime = None
         self._auto_execute_timer = None
+        # --- Pre-MULTI ALIGN dwell (heading settle before publishing planned path) ---
         self._awaiting_pre_multi_align = False
         self._pre_multi_align_started_at = None
         self._timing_solve_wait_started_at = None
+        # --- Peer timed trajectories (ROS, may be bridged from DDS active_trajectory) ---
         self._peer_active_trajectories = {}
         self._peer_traj_cache_lock = threading.Lock()
         self._pending_execute_at_for_arm = None
         self._armed_waypoint_times_for_snapshot = None
         self._active_traj_prune_timer = None
         super(MultiAgentNavigator, self).__init__(node_name=node_name)
+        # --- Parameters (see rospy param names in get_param calls) ---
         self._multi_path_wait_timeout = float(rospy.get_param("~multi_agent_path_wait_timeout", 60.0))
         self._multi_agent_timing_solve_wait_timeout_sec = float(
             rospy.get_param("~multi_agent_timing_solve_wait_timeout_sec", 120.0)
@@ -132,10 +179,12 @@ class MultiAgentNavigator(l2.Navigator):
             "~multi_agent_execute_at_dds_trigger_topic", "/multi_agent_execute_at_dds"
         ).strip() or "/multi_agent_execute_at_dds"
         self._leader_execute_pub = rospy.Publisher(self._leader_execute_dds_topic, MultiAgentExecuteAt, queue_size=2, latch=False)
+        # Fleet goals with plan_id + roster (often from DDS → own_data_subscriber → this topic).
         topic = rospy.get_param("~external_goal_multi_topic", "/external_goal_multi").strip() or "/external_goal_multi"
         rospy.Subscriber(topic, MultiRobotExternalGoal, self.external_goal_multi_callback, queue_size=10)
         rospy.loginfo("MultiAgentNavigator: subscribed to %s", topic)
 
+        # Ego publishes grid path for DDS; peers' paths arrive on *_from_agent (via DDS → data_subscriber).
         self._dds_planned_pub_topic = rospy.get_param(
             "~multi_agent_planned_path_for_dds_topic", "/multi_agent_planned_path_for_dds"
         ).strip() or "/multi_agent_planned_path_for_dds"
@@ -156,6 +205,7 @@ class MultiAgentNavigator(l2.Navigator):
             self._dds_planned_pub_topic,
             self._peer_planned_sub_topic,
         )
+        # execute_at: wall time when t=0 of the pending timed spline begins (fleet-wide agreement).
         self._execute_at_sub_topic = rospy.get_param("~multi_agent_execute_at_topic", "/multi_agent_execute_at").strip() or "/multi_agent_execute_at"
         rospy.Subscriber(self._execute_at_sub_topic, MultiAgentExecuteAt, self._multi_agent_execute_at_callback, queue_size=10)
         rospy.loginfo("MultiAgentNavigator: subscribed to execute_at topic %s", self._execute_at_sub_topic)
@@ -179,6 +229,7 @@ class MultiAgentNavigator(l2.Navigator):
             self._timing_solve_for_dds_topic,
             self._timing_solve_sub_topic,
         )
+        # Coordinator may publish execute_at locally after a delay so non-ROS peers still receive it via DDS.
         rospy.loginfo(
             "MultiAgentNavigator: auto_execute=%s coordinator_delay_s=%.2f (coordinator = min fleet_robot_ids)",
             self._multi_agent_auto_execute,
@@ -234,13 +285,22 @@ class MultiAgentNavigator(l2.Navigator):
             self._active_traj_sub_topic,
             self._multi_agent_sequential_budget_sec,
         )
+        # Periodically drop stale peer trajectories so sequential planner does not use ancient geometry.
         self._active_traj_prune_timer = rospy.Timer(
             rospy.Duration(max(0.2, self._multi_agent_active_traj_check_period_sec)),
             self._peer_active_trajectory_prune_timer_cb,
         )
 
     def external_goal_callback(self, msg):
-        """Pose2D / voice goal: treat as singleton fleet coordination (sequential vs solo like one-robot multi goal)."""
+        """Handle ``/external_goal`` and ``/voice_goal`` (geometry_msgs/Pose2D).
+
+        Treats the goal as a **singleton fleet** (only this robot id): multi timing uses sequential
+        planner if peer active trajectories exist in cache, otherwise solo analytic times. Does **not**
+        set ``_replan_as_multi_from_external_goal_multi`` (no sticky replan pipeline for Pose2D goals).
+
+        Matches base Navigator policy: ignore duplicate goals, refuse invalid cells, stop then IDLE if
+        busy, then clear DDS path cache and call ``replan()`` with ``_from_multi_robot_goal`` True.
+        """
         if (
             self.x_g is not None
             and self.y_g is not None
@@ -287,11 +347,15 @@ class MultiAgentNavigator(l2.Navigator):
         self.replan()
 
     def _clear_pre_multi_align_state(self):
+        """Cancel the pre-MULTI ALIGN dwell (e.g. on abort or after entering MULTI)."""
         self._awaiting_pre_multi_align = False
         self._pre_multi_align_started_at = None
 
     def _reset_timing_compute_state(self):
-        """Clear simultaneous/sequential thread state between goals or replan cycles."""
+        """Reset MILP/sequential/solo worker flags and pending arm state between goals or replan cycles.
+
+        Does **not** clear ``_multi_plan_id`` / fleet roster; callers do that when abandoning the mission.
+        """
         self._simultaneous_solve_done = False
         self._simultaneous_solve_failed = False
         self._simultaneous_solve_running = False
@@ -302,15 +366,22 @@ class MultiAgentNavigator(l2.Navigator):
         self._timing_solve_wait_started_at = None
 
     def _fleet_coordinator_id(self):
+        """Return ``min(_multi_fleet_robot_ids)`` or None if fleet empty.
+
+        The lowest robot id runs the timing optimization and publishes ``MultiAgentTimingSolve`` /
+        optional ``MultiAgentExecuteAt`` for the fleet.
+        """
         fleet = [int(x) for x in self._multi_fleet_robot_ids]
         return min(fleet) if fleet else None
 
     def _i_am_coordinator(self):
+        """True if this robot is the designated coordinator for the current fleet roster."""
         cid = self._fleet_coordinator_id()
         return cid is not None and int(self.my_id) == cid
 
     @staticmethod
     def _unpack_timing_solve_flat(counts, flat):
+        """Unpack ``MultiAgentTimingSolve.waypoint_times_flat`` using ``waypoint_counts`` per robot."""
         rows = []
         idx = 0
         for c in counts:
@@ -324,6 +395,7 @@ class MultiAgentNavigator(l2.Navigator):
         return rows
 
     def _path_msg_to_xy(self, path_msg):
+        """Convert ``nav_msgs/Path`` to ``[(x,y), ...]`` for planners and cache records."""
         out = []
         for ps in path_msg.poses:
             out.append((float(ps.pose.position.x), float(ps.pose.position.y)))
@@ -346,6 +418,7 @@ class MultiAgentNavigator(l2.Navigator):
         return t
 
     def _peer_active_obstacles_available(self):
+        """True if cache holds at least one **other** robot with path + times suitable for sequential MILP."""
         with self._peer_traj_cache_lock:
             for rid, rec in list(self._peer_active_trajectories.items()):
                 if int(rid) == int(self.my_id):
@@ -361,6 +434,11 @@ class MultiAgentNavigator(l2.Navigator):
         return False
 
     def _peer_active_trajectory_callback(self, msg):
+        """Ingest ``MultiAgentActiveTrajectory`` from ROS (often bridged from DDS).
+
+        Stores polyline + cumulative waypoint times + execute_at so ``MultiAgentSequentialPlanner`` can
+        shift peers into ego's time base. Inactive messages remove that robot from the cache.
+        """
         if int(msg.robot_id) == int(self.my_id):
             return
         if not msg.active and int(msg.robot_id) in self._peer_active_trajectories:
@@ -390,6 +468,7 @@ class MultiAgentNavigator(l2.Navigator):
         )
 
     def _peer_active_trajectory_prune_timer_cb(self, _evt=None):
+        """Drop peer cache entries that are too old, inactive, or clearly finished in wall time."""
         now = rospy.Time.now()
         remove = []
         with self._peer_traj_cache_lock:
@@ -416,6 +495,11 @@ class MultiAgentNavigator(l2.Navigator):
                     self._peer_active_trajectories.pop(rid, None)
 
     def _dds_forward_ids_for_active_traj(self):
+        """Robot ids to embed in ``MultiAgentActiveTrajectory.dds_forward_robot_ids`` for DDS fan-out.
+
+        Includes configured extras, current fleet mates (except self), and anyone present in the
+        peer trajectory cache.
+        """
         ids = set(int(x) for x in self._multi_agent_active_traj_forward_extra_ids)
         with self._peer_traj_cache_lock:
             ids.update(int(k) for k in self._peer_active_trajectories.keys())
@@ -425,6 +509,7 @@ class MultiAgentNavigator(l2.Navigator):
         return sorted(ids)
 
     def _publish_active_trajectory_msg(self, active, path_msg, waypoint_times, execute_at, plan_id):
+        """Publish our timed plan snapshot so peers can treat us as a moving obstacle (sequential mode)."""
         out = MultiAgentActiveTrajectory()
         out.robot_id = int(self.my_id)
         out.plan_id = str(plan_id or "")
@@ -436,11 +521,13 @@ class MultiAgentNavigator(l2.Navigator):
         self._active_traj_pub.publish(out)
 
     def _cancel_auto_execute_timer(self):
+        """Cancel one-shot coordinator timer for delayed ``execute_at`` publish."""
         if self._auto_execute_timer is not None:
             self._auto_execute_timer.shutdown()
             self._auto_execute_timer = None
 
     def _reset_timed_execute_state(self):
+        """Clear arm/commit fields (pending spline, execute_at, auto timer). Called when leaving MULTI."""
         self._cancel_auto_execute_timer()
         self._timed_traj_armed = False
         self._pending_traj_times = None
@@ -449,6 +536,7 @@ class MultiAgentNavigator(l2.Navigator):
         self._timed_arm_rostime = None
 
     def _multi_agent_execute_at_callback(self, msg):
+        """Fill ``_execute_at_ros_time`` when DDS/ROS delivers ``MultiAgentExecuteAt`` for our plan_id."""
         if not self._timed_traj_armed:
             return
         if (msg.plan_id or "").strip() != (self._multi_plan_id or "").strip():
@@ -461,7 +549,11 @@ class MultiAgentNavigator(l2.Navigator):
         )
 
     def _multi_agent_timing_solve_callback(self, msg):
-        """Apply MILP timing from coordinator (DDS -> ROS); coordinator skips local echo (already set in solver thread)."""
+        """Non-coordinator fleet members: apply ``MultiAgentTimingSolve`` from coordinator over ROS/DDS.
+
+        Validates plan_id, coordinator id, fleet roster, and per-robot waypoint counts vs flat buffer.
+        Coordinator ignores its own DDS echo (already applied inside ``_simultaneous_planner_thread_main``).
+        """
         if not self._is_multiagent_computing_mode(self.mode):
             return
         pid = (msg.plan_id or "").strip()
@@ -525,6 +617,12 @@ class MultiAgentNavigator(l2.Navigator):
         )
 
     def _maybe_arm_timed_trajectory(self):
+        """After timing solve: build spline from ``unsmoothed_plan`` + per-waypoint times; arm for execute_at.
+
+        On success sets ``_timed_traj_armed`` and either uses ``_pending_execute_at_for_arm`` from the
+        worker thread or schedules coordinator auto-publish. Short paths fall back to PARK and clear
+        multi session flags.
+        """
         if not self._is_multiagent_computing_mode(self.mode) or not self._simultaneous_solve_done or self._timed_traj_armed:
             return
         fleet = [int(x) for x in self._multi_fleet_robot_ids]
@@ -607,6 +705,7 @@ class MultiAgentNavigator(l2.Navigator):
         self._auto_execute_timer = rospy.Timer(rospy.Duration(d), self._leader_auto_execute_timer_cb, oneshot=True)
 
     def _leader_auto_execute_timer_cb(self, _evt=None):
+        """One-shot: coordinator publishes ``MultiAgentExecuteAt`` to the DDS trigger topic after delay."""
         self._auto_execute_timer = None
         if not self._is_multiagent_computing_mode(self.mode):
             return
@@ -634,7 +733,12 @@ class MultiAgentNavigator(l2.Navigator):
         )
 
     def _commit_timed_trajectory(self):
-        """Leave MULTI: load pending trajectory with t=0 at execute_at wall time; TRACK (pre-MULTI ALIGN already done)."""
+        """Apply the armed timed spline at ``_execute_at_ros_time`` and transition to TRACK.
+
+        Copies trajectory into parent ``current_plan*`` fields, rebuilds waypoint markers for the parent
+        TRACK watchdog, publishes ``MultiAgentActiveTrajectory`` for peers, clears MULTI-only solver
+        flags, and enables **sticky replans** when this mission came from ``/external_goal_multi``.
+        """
         if not self._timed_traj_armed:
             return
         if self._pending_traj is None or self._pending_traj_times is None:
@@ -668,6 +772,7 @@ class MultiAgentNavigator(l2.Navigator):
         self.th_init = traj_new[0, 2]
         self.heading_controller.load_goal(self.th_init)
 
+        # Parent TRACK logic uses waypoints for progress / time-overrun checks (+2s buffer vs spline time).
         self.waypoints = []
         marker_arr = MarkerArray()
         for i in range(20, len(traj_new), 20):
@@ -746,6 +851,7 @@ class MultiAgentNavigator(l2.Navigator):
         )
 
     def _maybe_downsample_path_xy(self, pts):
+        """Optional vertex cap for MILP (``~multi_agent_max_path_points``); no-op if param ≤ 0."""
         m = self._multi_max_path_points
         if m <= 0 or len(pts) <= m:
             return pts
@@ -753,6 +859,7 @@ class MultiAgentNavigator(l2.Navigator):
         return [pts[i] for i in idx]
 
     def _downsample_path_xy_and_times(self, pts, times):
+        """Downsample path and parallel time arrays together (keeps indices aligned)."""
         m = self._multi_max_path_points
         if m <= 0 or len(pts) <= m or len(pts) != len(times):
             return pts, times
@@ -760,6 +867,7 @@ class MultiAgentNavigator(l2.Navigator):
         return [pts[i] for i in idx], [times[i] for i in idx]
 
     def _assemble_paths_for_simultaneous(self):
+        """Build list of polylines (ego from ``unsmoothed_plan``, peers from ``_peer_multi_planned_paths``)."""
         paths = []
         for rid in self._multi_fleet_robot_ids:
             rid = int(rid)
@@ -775,6 +883,7 @@ class MultiAgentNavigator(l2.Navigator):
         return paths
 
     def _fleet_paths_complete(self):
+        """True when ego has a non-empty plan and every **other** fleet member has a matching ``plan_id`` path."""
         pid = (self._multi_plan_id or "").strip()
         fleet = [int(x) for x in self._multi_fleet_robot_ids]
         if not fleet:
@@ -796,6 +905,7 @@ class MultiAgentNavigator(l2.Navigator):
         return True
 
     def _abort_multi_to_idle(self):
+        """Hard stop MULTI: notify peers (inactive trajectory), clear mission id, reset timing state, IDLE."""
         rospy.logwarn("MultiAgentNavigator: aborting multi-agent phase -> IDLE")
         try:
             empty = Path()
@@ -815,6 +925,11 @@ class MultiAgentNavigator(l2.Navigator):
         self.switch_mode(l2.Mode.IDLE)
 
     def _try_simultaneous_plan_if_ready(self):
+        """Coordinator-only entry: start exactly one timing worker when paths are ready.
+
+        Branches: simultaneous (|fleet|≥2), sequential (singleton + peer cache), else solo analytic.
+        Non-coordinators stay in MULTI until they receive ``MultiAgentTimingSolve`` via callback.
+        """
         if not self._is_multiagent_computing_mode(self.mode):
             return
         if not self._i_am_coordinator():
@@ -847,6 +962,7 @@ class MultiAgentNavigator(l2.Navigator):
             threading.Thread(target=self._solo_timing_thread_main, daemon=True).start()
 
     def _solo_timing_thread_main(self):
+        """Background: analytic times only; sets ``_simultaneous_optimized_times`` as a one-row list."""
         try:
             plan = getattr(self, "unsmoothed_plan", None) or []
             if len(plan) < 1:
@@ -870,6 +986,10 @@ class MultiAgentNavigator(l2.Navigator):
             self._simultaneous_solve_running = False
 
     def _sequential_planner_thread_main(self):
+        """Background: ``MultiAgentSequentialPlanner`` using cached peer active trajectories (time-shifted).
+
+        If no valid peer geometry is available, falls back to the same analytic times as solo mode.
+        """
         try:
             import social_path_planning.multi_planning as smp
 
@@ -933,6 +1053,7 @@ class MultiAgentNavigator(l2.Navigator):
             self._simultaneous_solve_running = False
 
     def _simultaneous_planner_thread_main(self):
+        """Background: ``MultiAgentSimultaneousPlanner`` MILP; coordinator publishes ``MultiAgentTimingSolve``."""
         try:
             import social_path_planning.multi_planning as smp
 
@@ -984,10 +1105,11 @@ class MultiAgentNavigator(l2.Navigator):
 
     @staticmethod
     def _is_multiagent_computing_mode(mode):
+        """True if ``mode`` is ``MultiagentComputingMode.MULTIAGENT_CONTROL_COMPUTING`` (value 11)."""
         return isinstance(mode, MultiagentComputingMode)
 
     def _path_from_unsmoothed_plan(self):
-        """nav_msgs/Path in map frame from self.unsmoothed_plan (same layout as publish_planned_path)."""
+        """Build ``nav_msgs/Path`` from ``self.unsmoothed_plan`` rows ``[x, y, ...]`` (map frame)."""
         path_msg = Path()
         path_msg.header.frame_id = "map"
         path_msg.header.stamp = rospy.Time.now()
@@ -1003,7 +1125,7 @@ class MultiAgentNavigator(l2.Navigator):
         return path_msg
 
     def _publish_planned_path_for_multi_dds(self):
-        """ROS topic consumed by dds_data_publisher -> DDS multi_agent_planned_path."""
+        """Publish ego grid path for this ``plan_id`` so peers (and DDS) can run simultaneous timing."""
         path_msg = self._path_from_unsmoothed_plan()
         if not path_msg.poses:
             rospy.logwarn("MultiAgentNavigator: unsmoothed plan empty; skipping DDS planned path publish")
@@ -1021,6 +1143,7 @@ class MultiAgentNavigator(l2.Navigator):
         self._try_simultaneous_plan_if_ready()
 
     def _peer_multi_agent_planned_path_callback(self, msg):
+        """Cache a peer's ``MultiAgentPlannedPath`` when ``plan_id`` matches our active mission."""
         if int(msg.source_agent) == int(self.my_id):
             return
         pid = (self._multi_plan_id or "").strip()
@@ -1037,7 +1160,11 @@ class MultiAgentNavigator(l2.Navigator):
         self._try_simultaneous_plan_if_ready()
 
     def external_goal_multi_callback(self, msg):
-        """Same policy as external_goal_callback, but pose from MultiRobotExternalGoal + plan metadata."""
+        """Handle ``MultiRobotExternalGoal``: fleet roster + ``plan_id`` + goal pose (typically from DDS).
+
+        Sets ``_replan_as_multi_from_external_goal_multi`` so the first successful timed TRACK enables
+        **sticky** replans. Invalid cells clear sticky/session flags; duplicate pose+plan_id is ignored.
+        """
         g = msg.goal
         if (
             self.x_g is not None
@@ -1096,6 +1223,19 @@ class MultiAgentNavigator(l2.Navigator):
         self.replan()
 
     def replan(self, obj_x=None, obj_y=None, obj_d=None):
+        """Extend base ``replan()`` with optional **multi timing tail** (pre-MULTI ALIGN → MULTI → arm).
+
+        ``Navigator.replan`` refuses to run while TRACK; parent ``run()`` switches IDLE first for
+        timeout / invalid path replans. While ``mode == MULTIAGENT_CONTROL_COMPUTING`` this override
+        **returns early** (replan is ignored until MULTI completes or aborts).
+
+        Flags:
+            * ``from_goal``: first replan after external callback set ``_from_multi_robot_goal``.
+            * ``sticky``: subsequent replans for ``/external_goal_multi`` missions after first commit.
+
+        Sticky + former multi-fleet (≥2): shrink ``_multi_fleet_robot_ids`` to ``[my_id]`` so timing uses
+        sequential/solo vs peer active trajectories instead of a second simultaneous MILP.
+        """
         if obj_x is None:
             obj_x = []
         if obj_y is None:
@@ -1115,11 +1255,13 @@ class MultiAgentNavigator(l2.Navigator):
         if multi:
             self._from_multi_robot_goal = False
             fleet = [int(x) for x in self._multi_fleet_robot_ids]
+            # Sticky replan after a true multi-fleet mission: avoid a second simultaneous MILP on ego only.
             if sticky and not from_goal and len(fleet) >= 2:
                 self._peer_multi_planned_paths = {}
                 self._multi_fleet_robot_ids = [int(self.my_id)]
                 fleet = [int(self.my_id)]
             elif len(fleet) >= 2:
+                # First coordinated solve: wait for fresh peer MultiAgentPlannedPath messages.
                 self._peer_multi_planned_paths = {}
             self._reset_timing_compute_state()
             if sticky and not from_goal:
@@ -1128,6 +1270,7 @@ class MultiAgentNavigator(l2.Navigator):
                     self._multi_plan_id or "?",
                     list(self._multi_fleet_robot_ids),
                 )
+            # Re-enter dwell + MULTI only when geometric replan produced a trackable plan.
             if self.mode in (l2.Mode.ALIGN, l2.Mode.TRACK, l2.Mode.PARK):
                 plan = getattr(self, "unsmoothed_plan", None) or []
                 if len(plan) >= 2:
@@ -1145,6 +1288,7 @@ class MultiAgentNavigator(l2.Navigator):
                     self._pre_multi_align_sec,
                 )
             elif self.mode == l2.Mode.IDLE:
+                # Parent planning failed: tear down multi mission state.
                 self._multi_plan_id = ""
                 self._multi_coordinated = False
                 self._multi_source_agent = 0
@@ -1154,6 +1298,16 @@ class MultiAgentNavigator(l2.Navigator):
                 self._reset_timing_compute_state()
 
     def publish_control(self):
+        """Drive pre-MULTI ALIGN dwell, MULTI timing phase, then defer to base controllers.
+
+        Order matters:
+            1) Clear sticky session if mission ended (IDLE + no goal).
+            2) Pre-MULTI ALIGN: optionally block in ALIGN until dwell policy satisfied.
+            3) MULTI: hold cmd_vel zero, enforce timeouts, run coordinator timing, arm, wait execute_at,
+               commit to TRACK when wall clock allows.
+            4) Otherwise ``Navigator.publish_control`` (ALIGN/TRACK/PARK/...).
+        """
+        # Goal reached: parent clears x_g/y_g/theta_g in PARK; drop sticky so next mission starts clean.
         if (
             self._sticky_multi_timing_replan
             and self.mode == l2.Mode.IDLE
@@ -1171,6 +1325,7 @@ class MultiAgentNavigator(l2.Navigator):
             )
             self._clear_pre_multi_align_state()
 
+        # Pre-MULTI ALIGN: stay in ALIGN until heading policy + max dwell satisfied, then enter MULTI.
         if self._awaiting_pre_multi_align and self.mode == l2.Mode.ALIGN:
             if self._pre_multi_align_started_at is None:
                 self._pre_multi_align_started_at = rospy.Time.now()
@@ -1193,10 +1348,12 @@ class MultiAgentNavigator(l2.Navigator):
                 super(MultiAgentNavigator, self).publish_control()
                 return
 
+        # MULTI phase: no base controller yet; coordinator solves timing; all robots wait execute_at.
         if self._is_multiagent_computing_mode(self.mode):
             if self._simultaneous_solve_failed:
                 self._abort_multi_to_idle()
                 return
+            # Wait for peer MultiAgentPlannedPath messages (simultaneous fleet) before starting MILP.
             if (
                 not self._simultaneous_solve_done
                 and not self._simultaneous_solve_running
@@ -1213,6 +1370,7 @@ class MultiAgentNavigator(l2.Navigator):
                     )
                     self._abort_multi_to_idle()
                     return
+            # Paths ready but non-coordinator still needs MultiAgentTimingSolve from DDS/ROS.
             if (
                 self._fleet_paths_complete()
                 and not self._simultaneous_solve_done
@@ -1276,9 +1434,11 @@ class MultiAgentNavigator(l2.Navigator):
             cmd_vel.angular.z = 0.0
             self.nav_vel_pub.publish(cmd_vel)
             return
+        # Normal single-robot modes (from parent Navigator).
         super(MultiAgentNavigator, self).publish_control()
 
     def shutdown_callback(self):
+        """Stop peer-cache timer then delegate to parent (zero cmd_vel on shutdown)."""
         if self._active_traj_prune_timer is not None:
             self._active_traj_prune_timer.shutdown()
             self._active_traj_prune_timer = None
@@ -1286,6 +1446,7 @@ class MultiAgentNavigator(l2.Navigator):
 
 
 if __name__ == "__main__":
+    # Same startup pattern as localize_and_navigate2.py: brief delay for TF/subscribers, then parent's run loop.
     nav = MultiAgentNavigator()
     rospy.on_shutdown(nav.shutdown_callback)
     time.sleep(3)
