@@ -9,8 +9,9 @@ with shifted global times and fixed execute_at = now + budget;
 (3) fleet size == 1 solo: analytic max-velocity waypoint times (no MILP).
 
 For missions started via /external_goal_multi, after the first timed TRACK commit, further replans
-(e.g. plan duration elapsed or waypoint deadlines while moving) re-enter the same timing pipeline
-(sequential when singleton with cached peer trajectories; simultaneous MILP when fleet size >= 2).
+(e.g. plan duration elapsed or waypoint deadlines while moving) re-enter the same timing pipeline.
+If the mission was coordinated with fleet size >= 2, those sticky replans shrink to ego-only timing
+(sequential when peer active trajectories exist in cache, else solo), not a second simultaneous MILP.
 
 Peers publish MultiAgentActiveTrajectory snapshots on timed TRACK commit; cache is pruned periodically
 and on inactive messages. /external_goal (Pose2D) and /voice_goal use the same singleton path as a
@@ -82,8 +83,7 @@ class MultiAgentNavigator(l2.Navigator):
         self._from_multi_robot_goal = False
         # True only for goals from /external_goal_multi; used to arm sticky replans after first TRACK commit.
         self._replan_as_multi_from_external_goal_multi = False
-        # After a timed TRACK commit from an external_goal_multi mission, set so timeout / waypoint-miss replans
-        # re-enter pre-MULTI ALIGN + timing (sequential when singleton + peer trajectories; simultaneous if fleet>=2).
+        # After a timed TRACK commit from /external_goal_multi: sticky replans re-enter MULTI timing (see module doc).
         self._sticky_multi_timing_replan = False
         self._multi_plan_id = ""
         self._multi_coordinated = False
@@ -270,14 +270,7 @@ class MultiAgentNavigator(l2.Navigator):
             return
 
         self._peer_multi_planned_paths = {}
-        self._simultaneous_solve_done = False
-        self._simultaneous_solve_failed = False
-        self._simultaneous_solve_running = False
-        self._simultaneous_optimized_times = None
-        self._multi_phase_started_at = None
-        self._reset_timed_execute_state()
-        self._clear_pre_multi_align_state()
-        self._timing_solve_wait_started_at = None
+        self._reset_timing_compute_state()
 
         self._replan_as_multi_from_external_goal_multi = False
         self._sticky_multi_timing_replan = False
@@ -296,6 +289,17 @@ class MultiAgentNavigator(l2.Navigator):
     def _clear_pre_multi_align_state(self):
         self._awaiting_pre_multi_align = False
         self._pre_multi_align_started_at = None
+
+    def _reset_timing_compute_state(self):
+        """Clear simultaneous/sequential thread state between goals or replan cycles."""
+        self._simultaneous_solve_done = False
+        self._simultaneous_solve_failed = False
+        self._simultaneous_solve_running = False
+        self._simultaneous_optimized_times = None
+        self._multi_phase_started_at = None
+        self._reset_timed_execute_state()
+        self._clear_pre_multi_align_state()
+        self._timing_solve_wait_started_at = None
 
     def _fleet_coordinator_id(self):
         fleet = [int(x) for x in self._multi_fleet_robot_ids]
@@ -359,7 +363,7 @@ class MultiAgentNavigator(l2.Navigator):
     def _peer_active_trajectory_callback(self, msg):
         if int(msg.robot_id) == int(self.my_id):
             return
-        if not msg.active and int(msg.robot_id) in getattr(self, "_peer_active_trajectories", {}):
+        if not msg.active and int(msg.robot_id) in self._peer_active_trajectories:
             with self._peer_traj_cache_lock:
                 self._peer_active_trajectories.pop(int(msg.robot_id), None)
             rospy.loginfo("MultiAgentNavigator: peer %s active trajectory cleared (inactive)", msg.robot_id)
@@ -550,16 +554,12 @@ class MultiAgentNavigator(l2.Navigator):
             self.pose_controller.load_goal(self.x_g, self.y_g, self.theta_g)
             self.heading_controller.load_goal(self.theta_g)
             self.switch_mode(l2.Mode.PARK)
-            self._reset_timed_execute_state()
+            self._reset_timing_compute_state()
             self._multi_plan_id = ""
             self._multi_fleet_robot_ids = []
             self._peer_multi_planned_paths = {}
-            self._simultaneous_solve_done = False
-            self._simultaneous_optimized_times = None
             self._sticky_multi_timing_replan = False
             self._replan_as_multi_from_external_goal_multi = False
-            self._clear_pre_multi_align_state()
-            self._timing_solve_wait_started_at = None
             return
         try:
             t_new, traj_new = compute_trajectory_from_timed_waypoints(
@@ -719,11 +719,11 @@ class MultiAgentNavigator(l2.Navigator):
             )
         rospy.loginfo("MultiAgentNavigator: timed plan -> TRACK")
         self.switch_mode(l2.Mode.TRACK)
-        if getattr(self, "_replan_as_multi_from_external_goal_multi", False):
+        if self._replan_as_multi_from_external_goal_multi:
             self._sticky_multi_timing_replan = True
             rospy.loginfo(
                 "MultiAgentNavigator: sticky multi timing replan enabled (plan_id=%s) for timeout / waypoint-miss replans",
-                getattr(self, "_multi_plan_id", "") or "?",
+                self._multi_plan_id or "?",
             )
 
     def _build_sp_occupancy_grid(self):
@@ -811,14 +811,7 @@ class MultiAgentNavigator(l2.Navigator):
         self._sticky_multi_timing_replan = False
         self._replan_as_multi_from_external_goal_multi = False
         self._peer_multi_planned_paths = {}
-        self._simultaneous_solve_done = False
-        self._simultaneous_solve_failed = False
-        self._simultaneous_solve_running = False
-        self._simultaneous_optimized_times = None
-        self._multi_phase_started_at = None
-        self._reset_timed_execute_state()
-        self._clear_pre_multi_align_state()
-        self._timing_solve_wait_started_at = None
+        self._reset_timing_compute_state()
         self.switch_mode(l2.Mode.IDLE)
 
     def _try_simultaneous_plan_if_ready(self):
@@ -998,11 +991,11 @@ class MultiAgentNavigator(l2.Navigator):
         path_msg = Path()
         path_msg.header.frame_id = "map"
         path_msg.header.stamp = rospy.Time.now()
+        hdr = path_msg.header
         plan = getattr(self, "unsmoothed_plan", None) or []
         for state in plan:
             pose_st = PoseStamped()
-            pose_st.header.frame_id = "map"
-            pose_st.header.stamp = path_msg.header.stamp
+            pose_st.header = hdr
             pose_st.pose.position.x = float(state[0])
             pose_st.pose.position.y = float(state[1])
             pose_st.pose.orientation.w = 1.0
@@ -1053,7 +1046,7 @@ class MultiAgentNavigator(l2.Navigator):
             and g.x == self.x_g
             and g.y == self.y_g
             and g.theta == self.theta_g
-            and msg.plan_id == getattr(self, "_multi_plan_id", "")
+            and msg.plan_id == self._multi_plan_id
         ):
             rospy.loginfo("Multi external goal unchanged (pose + plan_id), ignoring")
             return
@@ -1080,14 +1073,7 @@ class MultiAgentNavigator(l2.Navigator):
             return
 
         self._peer_multi_planned_paths = {}
-        self._simultaneous_solve_done = False
-        self._simultaneous_solve_failed = False
-        self._simultaneous_solve_running = False
-        self._simultaneous_optimized_times = None
-        self._multi_phase_started_at = None
-        self._reset_timed_execute_state()
-        self._clear_pre_multi_align_state()
-        self._timing_solve_wait_started_at = None
+        self._reset_timing_compute_state()
 
         self._replan_as_multi_from_external_goal_multi = True
         self._from_multi_robot_goal = True
@@ -1121,30 +1107,27 @@ class MultiAgentNavigator(l2.Navigator):
             rospy.logdebug_throttle(2.0, "replan ignored in MULTIAGENT_CONTROL_COMPUTING")
             return
 
-        from_goal = bool(getattr(self, "_from_multi_robot_goal", False))
-        sticky = bool(getattr(self, "_sticky_multi_timing_replan", False))
+        from_goal = self._from_multi_robot_goal
+        sticky = self._sticky_multi_timing_replan
         multi = from_goal or sticky
-        if sticky and not from_goal:
-            rospy.loginfo(
-                "MultiAgentNavigator: replan with sticky multi timing (plan_id=%s fleet=%s)",
-                getattr(self, "_multi_plan_id", "") or "?",
-                getattr(self, "_multi_fleet_robot_ids", []) or [],
-            )
         super(MultiAgentNavigator, self).replan(obj_x, obj_y, obj_d)
 
         if multi:
             self._from_multi_robot_goal = False
             fleet = [int(x) for x in self._multi_fleet_robot_ids]
-            self._simultaneous_solve_done = False
-            self._simultaneous_solve_failed = False
-            self._simultaneous_solve_running = False
-            self._simultaneous_optimized_times = None
-            self._multi_phase_started_at = None
-            self._reset_timed_execute_state()
-            self._clear_pre_multi_align_state()
-            self._timing_solve_wait_started_at = None
-            if len(fleet) >= 2:
+            if sticky and not from_goal and len(fleet) >= 2:
                 self._peer_multi_planned_paths = {}
+                self._multi_fleet_robot_ids = [int(self.my_id)]
+                fleet = [int(self.my_id)]
+            elif len(fleet) >= 2:
+                self._peer_multi_planned_paths = {}
+            self._reset_timing_compute_state()
+            if sticky and not from_goal:
+                rospy.loginfo(
+                    "MultiAgentNavigator: sticky replan plan_id=%s fleet=%s",
+                    self._multi_plan_id or "?",
+                    list(self._multi_fleet_robot_ids),
+                )
             if self.mode in (l2.Mode.ALIGN, l2.Mode.TRACK, l2.Mode.PARK):
                 plan = getattr(self, "unsmoothed_plan", None) or []
                 if len(plan) >= 2:
@@ -1168,13 +1151,11 @@ class MultiAgentNavigator(l2.Navigator):
                 self._multi_fleet_robot_ids = []
                 self._sticky_multi_timing_replan = False
                 self._replan_as_multi_from_external_goal_multi = False
-                self._reset_timed_execute_state()
-                self._clear_pre_multi_align_state()
-                self._timing_solve_wait_started_at = None
+                self._reset_timing_compute_state()
 
     def publish_control(self):
         if (
-            getattr(self, "_sticky_multi_timing_replan", False)
+            self._sticky_multi_timing_replan
             and self.mode == l2.Mode.IDLE
             and self.x_g is None
             and self.y_g is None
@@ -1227,7 +1208,7 @@ class MultiAgentNavigator(l2.Navigator):
                     rospy.logwarn(
                         "MultiAgentNavigator: path wait timeout (%.1fs) plan_id=%s fleet=%s -> IDLE",
                         self._multi_path_wait_timeout,
-                        getattr(self, "_multi_plan_id", "") or "?",
+                        self._multi_plan_id or "?",
                         self._multi_fleet_robot_ids,
                     )
                     self._abort_multi_to_idle()
@@ -1246,7 +1227,7 @@ class MultiAgentNavigator(l2.Navigator):
                     rospy.logwarn(
                         "MultiAgentNavigator: timing solve wait timeout (%.1fs) plan_id=%s fleet=%s -> IDLE",
                         self._multi_agent_timing_solve_wait_timeout_sec,
-                        getattr(self, "_multi_plan_id", "") or "?",
+                        self._multi_plan_id or "?",
                         self._multi_fleet_robot_ids,
                     )
                     self._abort_multi_to_idle()
@@ -1286,7 +1267,7 @@ class MultiAgentNavigator(l2.Navigator):
             rospy.loginfo_throttle(
                 5.0,
                 "MULTIAGENT_CONTROL_COMPUTING (plan_id=%s); %s",
-                getattr(self, "_multi_plan_id", "") or "?",
+                self._multi_plan_id or "?",
                 msg,
             )
             self.prev_om = 0.0
