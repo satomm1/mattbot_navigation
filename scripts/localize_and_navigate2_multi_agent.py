@@ -182,7 +182,7 @@ class MultiAgentNavigator(l2.Navigator):
         # Fleet goals with plan_id + roster (often from DDS → own_data_subscriber → this topic).
         topic = rospy.get_param("~external_goal_multi_topic", "/external_goal_multi").strip() or "/external_goal_multi"
         rospy.Subscriber(topic, MultiRobotExternalGoal, self.external_goal_multi_callback, queue_size=10)
-        rospy.loginfo("MultiAgentNavigator: subscribed to %s", topic)
+        rospy.logdebug("MultiAgentNavigator: subscribed to %s", topic)
 
         # Ego publishes grid path for DDS; peers' paths arrive on *_from_agent (via DDS → data_subscriber).
         self._dds_planned_pub_topic = rospy.get_param(
@@ -200,15 +200,15 @@ class MultiAgentNavigator(l2.Navigator):
             self._peer_multi_agent_planned_path_callback,
             queue_size=10,
         )
-        rospy.loginfo(
-            "MultiAgentNavigator: DDS planned path ROS topics pub=%s sub=%s",
+        rospy.logdebug(
+            "MultiAgentNavigator: DDS planned path pub=%s sub=%s",
             self._dds_planned_pub_topic,
             self._peer_planned_sub_topic,
         )
         # execute_at: wall time when t=0 of the pending timed spline begins (fleet-wide agreement).
         self._execute_at_sub_topic = rospy.get_param("~multi_agent_execute_at_topic", "/multi_agent_execute_at").strip() or "/multi_agent_execute_at"
         rospy.Subscriber(self._execute_at_sub_topic, MultiAgentExecuteAt, self._multi_agent_execute_at_callback, queue_size=10)
-        rospy.loginfo("MultiAgentNavigator: subscribed to execute_at topic %s", self._execute_at_sub_topic)
+        rospy.logdebug("MultiAgentNavigator: subscribed to execute_at %s", self._execute_at_sub_topic)
         self._timing_solve_for_dds_topic = rospy.get_param(
             "~multi_agent_timing_solve_for_dds_topic", "/multi_agent_timing_solve_for_dds"
         ).strip() or "/multi_agent_timing_solve_for_dds"
@@ -224,14 +224,14 @@ class MultiAgentNavigator(l2.Navigator):
             self._multi_agent_timing_solve_callback,
             queue_size=10,
         )
-        rospy.loginfo(
-            "MultiAgentNavigator: timing solve DDS pub=%s sub=%s",
+        rospy.logdebug(
+            "MultiAgentNavigator: timing solve pub=%s sub=%s",
             self._timing_solve_for_dds_topic,
             self._timing_solve_sub_topic,
         )
         # Coordinator may publish execute_at locally after a delay so non-ROS peers still receive it via DDS.
-        rospy.loginfo(
-            "MultiAgentNavigator: auto_execute=%s coordinator_delay_s=%.2f (coordinator = min fleet_robot_ids)",
+        rospy.logdebug(
+            "MultiAgentNavigator: auto_execute=%s coordinator_delay_s=%.2f (coordinator=min fleet_robot_ids)",
             self._multi_agent_auto_execute,
             self._multi_agent_auto_execute_delay_sec,
         )
@@ -245,13 +245,13 @@ class MultiAgentNavigator(l2.Navigator):
                 self._pre_multi_align_exit_policy,
             )
             self._pre_multi_align_exit_policy = "aligned_or_max"
-        rospy.loginfo(
+        rospy.logdebug(
             "MultiAgentNavigator: pre_multi_align max_s=%.2f exit_policy=%s",
             self._pre_multi_align_sec,
             self._pre_multi_align_exit_policy,
         )
-        rospy.loginfo(
-            "MultiAgentNavigator: coordinated MILP runs on min(fleet_robot_ids); timing via MultiAgentTimingSolve DDS"
+        rospy.logdebug(
+            "MultiAgentNavigator: coordinated MILP on min(fleet_robot_ids); timing via MultiAgentTimingSolve"
         )
         self._multi_agent_sequential_budget_sec = float(rospy.get_param("~multi_agent_sequential_budget_sec", 3.0))
         self._multi_agent_active_traj_ttl_sec = float(rospy.get_param("~multi_agent_active_trajectory_ttl_sec", 120.0))
@@ -279,8 +279,8 @@ class MultiAgentNavigator(l2.Navigator):
             self._peer_active_trajectory_callback,
             queue_size=10,
         )
-        rospy.loginfo(
-            "MultiAgentNavigator: active trajectory pub=%s sub=%s sequential_budget_s=%.2f",
+        rospy.logdebug(
+            "MultiAgentNavigator: active trajectory pub=%s sub=%s budget_s=%.2f",
             self._active_traj_for_dds_topic,
             self._active_traj_sub_topic,
             self._multi_agent_sequential_budget_sec,
@@ -289,6 +289,16 @@ class MultiAgentNavigator(l2.Navigator):
         self._active_traj_prune_timer = rospy.Timer(
             rospy.Duration(max(0.2, self._multi_agent_active_traj_check_period_sec)),
             self._peer_active_trajectory_prune_timer_cb,
+        )
+        rospy.loginfo(
+            "MultiAgentNavigator: multi-agent ROS/DDS bridge ready "
+            "(goal_multi=%s planned_pub=%s execute_at=%s timing_pub=%s active_pub=%s leader_exec=%s)",
+            topic,
+            self._dds_planned_pub_topic,
+            self._execute_at_sub_topic,
+            self._timing_solve_for_dds_topic,
+            self._active_traj_for_dds_topic,
+            self._leader_execute_dds_topic,
         )
 
     def external_goal_callback(self, msg):
@@ -307,7 +317,7 @@ class MultiAgentNavigator(l2.Navigator):
             and self.theta_g is not None
             and (msg.x == self.x_g and msg.y == self.y_g and msg.theta == self.theta_g)
         ):
-            rospy.loginfo("External goal is the same as current goal, ignoring")
+            rospy.logdebug("External goal is the same as current goal, ignoring")
             return
 
         if self.mode == l2.Mode.WAITING_FOR_INIT or self.mode == l2.Mode.LOCALIZING:
@@ -444,7 +454,7 @@ class MultiAgentNavigator(l2.Navigator):
         if not msg.active and int(msg.robot_id) in self._peer_active_trajectories:
             with self._peer_traj_cache_lock:
                 self._peer_active_trajectories.pop(int(msg.robot_id), None)
-            rospy.loginfo("MultiAgentNavigator: peer %s active trajectory cleared (inactive)", msg.robot_id)
+            rospy.logdebug("MultiAgentNavigator: peer %s active trajectory cleared (inactive)", msg.robot_id)
             return
         path_xy = self._path_msg_to_xy(msg.path)
         wt = [float(x) for x in (msg.waypoint_times or [])]
@@ -460,7 +470,7 @@ class MultiAgentNavigator(l2.Navigator):
                 "plan_id": str(msg.plan_id or ""),
                 "active": bool(msg.active),
             }
-        rospy.loginfo(
+        rospy.logdebug(
             "MultiAgentNavigator: cached active trajectory robot=%s wp=%d plan_id=%s",
             msg.robot_id,
             len(path_xy),
@@ -542,7 +552,7 @@ class MultiAgentNavigator(l2.Navigator):
         if (msg.plan_id or "").strip() != (self._multi_plan_id or "").strip():
             return
         self._execute_at_ros_time = msg.execute_at
-        rospy.loginfo(
+        rospy.logdebug(
             "MultiAgentNavigator: execute_at received plan_id=%s execute_at=%s",
             msg.plan_id,
             self._execute_at_ros_time,
@@ -609,7 +619,7 @@ class MultiAgentNavigator(l2.Navigator):
             self._simultaneous_solve_done = True
             self._simultaneous_solve_running = False
         self._timing_solve_wait_started_at = None
-        rospy.loginfo(
+        rospy.logdebug(
             "MultiAgentNavigator: applied timing_solve from coordinator=%s plan_id=%s ego_wp=%d",
             msg.source_agent,
             pid,
@@ -677,7 +687,7 @@ class MultiAgentNavigator(l2.Navigator):
         else:
             self._execute_at_ros_time = None
             self._schedule_leader_auto_execute()
-        rospy.loginfo(
+        rospy.logdebug(
             "MultiAgentNavigator: armed timed trajectory (plan_id=%s duration_s=%.3f); waiting for execute_at",
             self._multi_plan_id,
             float(t_new[-1]) if len(t_new) else 0.0,
@@ -696,7 +706,7 @@ class MultiAgentNavigator(l2.Navigator):
         self._cancel_auto_execute_timer()
         # Allow peers to finish pre-MULTI ALIGN + one MILP + DDS; increase if fleet is large or clocks loose.
         d = max(0.0, self._multi_agent_auto_execute_delay_sec)
-        rospy.loginfo(
+        rospy.logdebug(
             "MultiAgentNavigator: coordinator robot %s scheduling auto execute_at publish in %.2fs -> %s",
             coord,
             d,
@@ -725,7 +735,7 @@ class MultiAgentNavigator(l2.Navigator):
         msg.fleet_robot_ids = fleet
         msg.execute_at = rospy.Time.now() + rospy.Duration(max(0.05, self._multi_agent_auto_execute_wall_extra_sec))
         self._leader_execute_pub.publish(msg)
-        rospy.loginfo(
+        rospy.logdebug(
             "MultiAgentNavigator: coordinator published MultiAgentExecuteAt plan_id=%s execute_at=%s (DDS trigger %s)",
             pid,
             msg.execute_at,
@@ -941,24 +951,22 @@ class MultiAgentNavigator(l2.Navigator):
                 return
             self._simultaneous_solve_running = True
         fleet = [int(x) for x in self._multi_fleet_robot_ids]
+        branch = (
+            "simultaneous"
+            if len(fleet) >= 2
+            else ("sequential" if self._peer_active_obstacles_available() else "solo")
+        )
+        rospy.loginfo(
+            "MultiAgentNavigator: timing solve plan_id=%s fleet=%s -> %s",
+            self._multi_plan_id,
+            fleet,
+            branch,
+        )
         if len(fleet) >= 2:
-            rospy.loginfo(
-                "MultiAgentNavigator: coordinator starting simultaneous timing solve (plan_id=%s fleet=%s)",
-                self._multi_plan_id,
-                self._multi_fleet_robot_ids,
-            )
             threading.Thread(target=self._simultaneous_planner_thread_main, daemon=True).start()
         elif len(fleet) == 1 and self._peer_active_obstacles_available():
-            rospy.loginfo(
-                "MultiAgentNavigator: starting sequential timing solve (plan_id=%s peers in cache)",
-                self._multi_plan_id,
-            )
             threading.Thread(target=self._sequential_planner_thread_main, daemon=True).start()
         else:
-            rospy.loginfo(
-                "MultiAgentNavigator: singleton fleet solo timing (plan_id=%s no peer trajectories)",
-                self._multi_plan_id,
-            )
             threading.Thread(target=self._solo_timing_thread_main, daemon=True).start()
 
     def _solo_timing_thread_main(self):
@@ -972,7 +980,7 @@ class MultiAgentNavigator(l2.Navigator):
             self._armed_waypoint_times_for_snapshot = list(times)
             T_ego = rospy.Time.now() + rospy.Duration(max(0.05, self._multi_agent_sequential_budget_sec))
             self._pending_execute_at_for_arm = T_ego
-            rospy.loginfo(
+            rospy.logdebug(
                 "MultiAgentNavigator: solo timing ready plan_id=%s T_ego=%s duration_s=%.3f",
                 self._multi_plan_id,
                 T_ego,
@@ -1024,7 +1032,7 @@ class MultiAgentNavigator(l2.Navigator):
                 self._armed_waypoint_times_for_snapshot = list(times)
                 self._pending_execute_at_for_arm = T_ego
                 self._simultaneous_solve_done = True
-                rospy.loginfo("MultiAgentNavigator: sequential thread fell back to solo (no valid peers)")
+                rospy.logdebug("MultiAgentNavigator: sequential thread fell back to solo (no valid peers)")
                 return
             occ = self._build_sp_occupancy_grid()
             if occ is None:
@@ -1039,7 +1047,7 @@ class MultiAgentNavigator(l2.Navigator):
             self._armed_waypoint_times_for_snapshot = list(ego_times)
             self._pending_execute_at_for_arm = T_ego
             self._simultaneous_solve_done = True
-            rospy.loginfo(
+            rospy.logdebug(
                 "MultiAgentNavigator: sequential plan solved plan_id=%s T_ego=%s ego_wp=%d peers=%d",
                 self._multi_plan_id,
                 T_ego,
@@ -1069,7 +1077,7 @@ class MultiAgentNavigator(l2.Navigator):
             planner = MultiAgentSimultaneousPlanner(occ, paths=paths, norm=1, v=v_list)
             optimized_times = planner.plan()
             lens = [len(t) for t in optimized_times] if optimized_times else []
-            rospy.loginfo(
+            rospy.logdebug(
                 "MultiAgentNavigator: simultaneous plan solved plan_id=%s waypoint_time_lens=%s",
                 self._multi_plan_id,
                 lens,
@@ -1092,7 +1100,7 @@ class MultiAgentNavigator(l2.Navigator):
                     flat.extend(float(x) for x in t)
                 ts_msg.waypoint_times_flat = flat
                 self._multi_agent_timing_solve_for_dds_pub.publish(ts_msg)
-                rospy.loginfo(
+                rospy.logdebug(
                     "MultiAgentNavigator: published MultiAgentTimingSolve for DDS (%d agents) plan_id=%s",
                     len(fleet),
                     self._multi_plan_id,
@@ -1135,7 +1143,7 @@ class MultiAgentNavigator(l2.Navigator):
         out.source_agent = int(self.my_id)
         out.path = path_msg
         self._multi_agent_planned_path_pub.publish(out)
-        rospy.loginfo(
+        rospy.logdebug(
             "MultiAgentNavigator: published MultiAgentPlannedPath for DDS (%d poses) plan_id=%s",
             len(path_msg.poses),
             self._multi_plan_id,
@@ -1151,11 +1159,11 @@ class MultiAgentNavigator(l2.Navigator):
             return
         self._peer_multi_planned_paths[int(msg.source_agent)] = msg
         n_poses = len(msg.path.poses)
-        rospy.loginfo(
+        rospy.logdebug(
             "MultiAgentNavigator: received peer planned path source_agent=%d plan_id=%s poses=%d",
             int(msg.source_agent),
             msg.plan_id,
-            n_poses
+            n_poses,
         )
         self._try_simultaneous_plan_if_ready()
 
@@ -1175,7 +1183,7 @@ class MultiAgentNavigator(l2.Navigator):
             and g.theta == self.theta_g
             and msg.plan_id == self._multi_plan_id
         ):
-            rospy.loginfo("Multi external goal unchanged (pose + plan_id), ignoring")
+            rospy.logdebug("Multi external goal unchanged (pose + plan_id), ignoring")
             return
 
         if self.mode == l2.Mode.WAITING_FOR_INIT or self.mode == l2.Mode.LOCALIZING:
@@ -1281,7 +1289,7 @@ class MultiAgentNavigator(l2.Navigator):
                 self._awaiting_pre_multi_align = True
                 self._pre_multi_align_started_at = rospy.Time.now()
                 self.switch_mode(l2.Mode.ALIGN)
-                rospy.loginfo(
+                rospy.logdebug(
                     "MultiAgentNavigator: pre-MULTI ALIGN dwell (plan_id=%s) policy=%s max_s=%.2f",
                     self._multi_plan_id,
                     self._pre_multi_align_exit_policy,
@@ -1422,8 +1430,8 @@ class MultiAgentNavigator(l2.Navigator):
                 msg = "armed; waiting for execute_at message (DDS)"
             elif self._timed_traj_armed:
                 msg = "armed; waiting for execute_at wall time"
-            rospy.loginfo_throttle(
-                5.0,
+            rospy.logdebug_throttle(
+                15.0,
                 "MULTIAGENT_CONTROL_COMPUTING (plan_id=%s); %s",
                 self._multi_plan_id or "?",
                 msg,
