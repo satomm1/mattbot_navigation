@@ -1335,7 +1335,9 @@ class MultiAgentNavigator(l2.Navigator):
                 self.heading_controller.load_goal(self.th_init)
                 self._awaiting_pre_multi_align = True
                 self._pre_multi_align_started_at = rospy.Time.now()
-                self.switch_mode(l2.Mode.ALIGN)
+                # Parent replan() may already have switched IDLE->ALIGN for heading; avoid ALIGN->ALIGN log/noise.
+                if self.mode != l2.Mode.ALIGN:
+                    self.switch_mode(l2.Mode.ALIGN)
                 rospy.logdebug(
                     "MultiAgentNavigator: pre-MULTI ALIGN dwell (plan_id=%s) policy=%s max_s=%.2f",
                     self._multi_plan_id,
