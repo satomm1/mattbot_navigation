@@ -384,6 +384,14 @@ class MultiAgentNavigator(l2.Navigator):
         fleet = [int(x) for x in self._multi_fleet_robot_ids]
         return min(fleet) if fleet else None
 
+    def _is_solo_fleet_timing(self):
+        """True when timing is solo/sequential (no simultaneous MILP); track start is anchored locally."""
+        return len(self._multi_fleet_robot_ids) <= 1
+
+    def _solo_scheduled_execute_at(self):
+        """Wall time when solo/sequential TRACK should begin (small lead for controller settle)."""
+        return rospy.Time.now() + rospy.Duration(max(0.05, self._multi_agent_auto_execute_wall_extra_sec))
+
     def _i_am_coordinator(self):
         """True if this robot is the designated coordinator for the current fleet roster."""
         cid = self._fleet_coordinator_id()
@@ -551,6 +559,8 @@ class MultiAgentNavigator(l2.Navigator):
             return
         if (msg.plan_id or "").strip() != (self._multi_plan_id or "").strip():
             return
+        if self._is_solo_fleet_timing():
+            return
         self._execute_at_ros_time = msg.execute_at
         rospy.logdebug(
             "MultiAgentNavigator: execute_at received plan_id=%s execute_at=%s",
@@ -690,7 +700,11 @@ class MultiAgentNavigator(l2.Navigator):
         self._pending_traj = traj_new
         self._timed_traj_armed = True
         self._timed_arm_rostime = rospy.Time.now()
-        if self._pending_execute_at_for_arm is not None:
+        if self._is_solo_fleet_timing():
+            # Solo/sequential: do not use execute_at stamped at MILP/solve time (stale vs commit → waypoint miss).
+            self._pending_execute_at_for_arm = None
+            self._execute_at_ros_time = self._solo_scheduled_execute_at()
+        elif self._pending_execute_at_for_arm is not None:
             self._execute_at_ros_time = self._pending_execute_at_for_arm
             self._pending_execute_at_for_arm = None
         else:
@@ -767,15 +781,26 @@ class MultiAgentNavigator(l2.Navigator):
         if self._execute_at_ros_time is None:
             return
         now = rospy.Time.now()
-        late_s = (now - self._execute_at_ros_time).to_sec()
-        if late_s > self._multi_agent_execute_max_lateness and self._multi_agent_execute_late_policy == "idle":
-            rospy.logwarn(
-                "MultiAgentNavigator: execute_at late by %.2fs (max %.2fs, policy=idle) -> IDLE",
-                late_s,
-                self._multi_agent_execute_max_lateness,
-            )
-            self._abort_multi_to_idle()
-            return
+        if self._is_solo_fleet_timing():
+            scheduled = self._execute_at_ros_time
+            track_start = now
+            late_s = (track_start - scheduled).to_sec() if scheduled is not None else 0.0
+            if late_s > 0.15:
+                rospy.loginfo(
+                    "MultiAgentNavigator: solo timing — track t=0 at commit (scheduled execute_at was %.2fs earlier)",
+                    late_s,
+                )
+        else:
+            track_start = self._execute_at_ros_time
+            late_s = (now - track_start).to_sec()
+            if late_s > self._multi_agent_execute_max_lateness and self._multi_agent_execute_late_policy == "idle":
+                rospy.logwarn(
+                    "MultiAgentNavigator: execute_at late by %.2fs (max %.2fs, policy=idle) -> IDLE",
+                    late_s,
+                    self._multi_agent_execute_max_lateness,
+                )
+                self._abort_multi_to_idle()
+                return
         t_new = self._pending_traj_times
         traj_new = self._pending_traj
         planned_path = getattr(self, "unsmoothed_plan", None) or []
@@ -785,7 +810,7 @@ class MultiAgentNavigator(l2.Navigator):
         self.pose_controller.load_goal(self.x_g, self.y_g, self.theta_g)
         self.traj_controller.load_traj(t_new, traj_new)
         self.current_plan = traj_new
-        self.current_plan_start_time = self._execute_at_ros_time
+        self.current_plan_start_time = track_start
         self.current_plan_duration = float(t_new[-1])
 
         self.th_init = traj_new[0, 2]
@@ -828,7 +853,7 @@ class MultiAgentNavigator(l2.Navigator):
             ps.pose.position.y = float(state[1])
             ps.pose.orientation.w = 1.0
             path_snap.poses.append(ps)
-        self._publish_active_trajectory_msg(True, path_snap, wt_pub, self._execute_at_ros_time, self._multi_plan_id)
+        self._publish_active_trajectory_msg(True, path_snap, wt_pub, track_start, self._multi_plan_id)
 
         self._simultaneous_solve_done = False
         self._simultaneous_optimized_times = None
@@ -1010,12 +1035,9 @@ class MultiAgentNavigator(l2.Navigator):
             times = self._solo_velocity_waypoint_times(plan)
             self._simultaneous_optimized_times = [times]
             self._armed_waypoint_times_for_snapshot = list(times)
-            T_ego = rospy.Time.now() + rospy.Duration(max(0.05, self._multi_agent_sequential_budget_sec))
-            self._pending_execute_at_for_arm = T_ego
             rospy.logdebug(
-                "MultiAgentNavigator: solo timing ready plan_id=%s T_ego=%s duration_s=%.3f",
+                "MultiAgentNavigator: solo timing ready plan_id=%s duration_s=%.3f (execute_at set at arm)",
                 self._multi_plan_id,
-                T_ego,
                 float(times[-1]) if times else 0.0,
             )
             self._simultaneous_solve_done = True
@@ -1062,7 +1084,6 @@ class MultiAgentNavigator(l2.Navigator):
                 times = self._solo_velocity_waypoint_times(ego_plan)
                 self._simultaneous_optimized_times = [times]
                 self._armed_waypoint_times_for_snapshot = list(times)
-                self._pending_execute_at_for_arm = T_ego
                 self._simultaneous_solve_done = True
                 rospy.logdebug("MultiAgentNavigator: sequential thread fell back to solo (no valid peers)")
                 return
@@ -1070,7 +1091,6 @@ class MultiAgentNavigator(l2.Navigator):
                 times = self._solo_velocity_waypoint_times(ego_plan)
                 self._simultaneous_optimized_times = [times]
                 self._armed_waypoint_times_for_snapshot = list(times)
-                self._pending_execute_at_for_arm = T_ego
                 self._simultaneous_solve_done = True
                 rospy.logwarn(
                     "MultiAgentNavigator: sequential planner skipped (ego path has %d points); using solo analytic times",
@@ -1088,7 +1108,6 @@ class MultiAgentNavigator(l2.Navigator):
                 raise RuntimeError("sequential times length mismatch vs ego plan")
             self._simultaneous_optimized_times = [ego_times]
             self._armed_waypoint_times_for_snapshot = list(ego_times)
-            self._pending_execute_at_for_arm = T_ego
             self._simultaneous_solve_done = True
             rospy.logdebug(
                 "MultiAgentNavigator: sequential plan solved plan_id=%s T_ego=%s ego_wp=%d peers=%d",
