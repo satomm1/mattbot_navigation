@@ -235,7 +235,7 @@ class MultiAgentNavigator(l2.Navigator):
             self._multi_agent_auto_execute,
             self._multi_agent_auto_execute_delay_sec,
         )
-        self._pre_multi_align_sec = float(rospy.get_param("~multi_agent_pre_multi_align_sec", 2.0))
+        self._pre_multi_align_sec = float(rospy.get_param("~multi_agent_pre_multi_align_sec", 4.0))
         self._pre_multi_align_exit_policy = rospy.get_param(
             "~multi_agent_pre_multi_align_exit_policy", "aligned_or_max"
         ).strip().lower()
