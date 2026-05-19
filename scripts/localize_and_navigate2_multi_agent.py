@@ -181,6 +181,9 @@ class MultiAgentNavigator(l2.Navigator):
         self._multi_agent_plan_duration_slack_sec = float(
             rospy.get_param("~multi_agent_plan_duration_slack_sec", 5.0)
         )
+        self._multi_agent_disable_person_and_peer_avoidance = bool(
+            rospy.get_param("~multi_agent_disable_person_and_peer_avoidance", True)
+        )
         self._leader_execute_dds_topic = rospy.get_param(
             "~multi_agent_execute_at_dds_trigger_topic", "/multi_agent_execute_at_dds"
         ).strip() or "/multi_agent_execute_at_dds"
@@ -360,6 +363,11 @@ class MultiAgentNavigator(l2.Navigator):
         self.y_g = msg.y
         self.theta_g = msg.theta
         rospy.loginfo("MultiAgentNavigator: external_goal -> singleton fleet replan plan_id=%s", self._multi_plan_id)
+        if self._suppress_person_and_peer_avoidance():
+            rospy.logdebug(
+                "MultiAgentNavigator: person/peer avoidance disabled for plan_id=%s",
+                self._multi_plan_id,
+            )
         self.replan()
 
     def _clear_pre_multi_align_state(self):
@@ -372,6 +380,23 @@ class MultiAgentNavigator(l2.Navigator):
         if self._awaiting_pre_multi_align:
             return False
         return super(MultiAgentNavigator, self).aligned()
+
+    def _suppress_person_and_peer_avoidance(self):
+        """While a multi-agent mission is active, follow the timed plan; do not stop/slow for people or replan around peers in A*."""
+        if not (self._multi_plan_id or "").strip():
+            return False
+        return bool(self._multi_agent_disable_person_and_peer_avoidance)
+
+    def modify_velocity_for_person(self, V, om):
+        if self._suppress_person_and_peer_avoidance():
+            return V, om
+        return super(MultiAgentNavigator, self).modify_velocity_for_person(V, om)
+
+    def agent_intersect_path(self):
+        if self._suppress_person_and_peer_avoidance():
+            self.agents_in_path = set()
+            return False
+        return super(MultiAgentNavigator, self).agent_intersect_path()
 
     def _reset_timing_compute_state(self):
         """Reset MILP/sequential/solo worker flags and pending arm state between goals or replan cycles.
@@ -1312,6 +1337,11 @@ class MultiAgentNavigator(l2.Navigator):
             self._multi_coordinated,
             self._multi_source_agent,
         )
+        if self._suppress_person_and_peer_avoidance():
+            rospy.logdebug(
+                "MultiAgentNavigator: person/peer avoidance disabled for plan_id=%s",
+                self._multi_plan_id,
+            )
         self.replan()
 
     def replan(self, obj_x=None, obj_y=None, obj_d=None):
@@ -1342,6 +1372,9 @@ class MultiAgentNavigator(l2.Navigator):
         from_goal = self._from_multi_robot_goal
         sticky = self._sticky_multi_timing_replan
         multi = from_goal or sticky
+        if self._suppress_person_and_peer_avoidance():
+            self.agents_in_path = set()
+            self.other_agents_static = []
         super(MultiAgentNavigator, self).replan(obj_x, obj_y, obj_d)
 
         if multi:
