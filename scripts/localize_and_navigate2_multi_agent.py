@@ -178,6 +178,9 @@ class MultiAgentNavigator(l2.Navigator):
         self._multi_agent_waypoint_time_buffer_sec = float(
             rospy.get_param("~multi_agent_waypoint_time_buffer_sec", 5.0)
         )
+        self._multi_agent_plan_duration_slack_sec = float(
+            rospy.get_param("~multi_agent_plan_duration_slack_sec", 5.0)
+        )
         self._leader_execute_dds_topic = rospy.get_param(
             "~multi_agent_execute_at_dds_trigger_topic", "/multi_agent_execute_at_dds"
         ).strip() or "/multi_agent_execute_at_dds"
@@ -790,29 +793,27 @@ class MultiAgentNavigator(l2.Navigator):
         if self._execute_at_ros_time is None:
             return
         now = rospy.Time.now()
-        if self._is_solo_fleet_timing():
-            scheduled = self._execute_at_ros_time
-            track_start = now
-            late_s = (track_start - scheduled).to_sec() if scheduled is not None else 0.0
-            if late_s > 0.15:
-                rospy.loginfo(
-                    "MultiAgentNavigator: solo timing — track t=0 at commit (scheduled execute_at was %.2fs earlier)",
-                    late_s,
-                )
-        else:
-            track_start = self._execute_at_ros_time
-            late_s = (now - track_start).to_sec()
-            if late_s > self._multi_agent_execute_max_lateness and self._multi_agent_execute_late_policy == "idle":
-                rospy.logwarn(
-                    "MultiAgentNavigator: execute_at late by %.2fs (max %.2fs, policy=idle) -> IDLE",
-                    late_s,
-                    self._multi_agent_execute_max_lateness,
-                )
-                self._abort_multi_to_idle()
-                return
+        scheduled = self._execute_at_ros_time
+        late_s = (now - scheduled).to_sec() if scheduled is not None else 0.0
+        if (
+            not self._is_solo_fleet_timing()
+            and late_s > self._multi_agent_execute_max_lateness
+            and self._multi_agent_execute_late_policy == "idle"
+        ):
+            rospy.logwarn(
+                "MultiAgentNavigator: execute_at late by %.2fs (max %.2fs, policy=idle) -> IDLE",
+                late_s,
+                self._multi_agent_execute_max_lateness,
+            )
+            self._abort_multi_to_idle()
+            return
+        # TRACK t=0 and parent out-of-time watchdog use actual commit time (not fleet execute_at).
+        track_start = now
         t_new = self._pending_traj_times
         traj_new = self._pending_traj
         planned_path = getattr(self, "unsmoothed_plan", None) or []
+        dur_nom = float(t_new[-1])
+        dur_slack = max(0.0, self._multi_agent_plan_duration_slack_sec)
 
         self.publish_planned_path(planned_path, self.nav_planned_path_pub)
         self.publish_smoothed_path(traj_new, self.nav_smoothed_path_pub, times=t_new)
@@ -820,7 +821,14 @@ class MultiAgentNavigator(l2.Navigator):
         self.traj_controller.load_traj(t_new, traj_new)
         self.current_plan = traj_new
         self.current_plan_start_time = track_start
-        self.current_plan_duration = float(t_new[-1])
+        self.current_plan_duration = dur_nom + dur_slack
+        rospy.loginfo(
+            "MultiAgentNavigator: timed TRACK (nominal=%.2fs slack=%.2fs timeout=%.2fs execute_at_late=%.2fs)",
+            dur_nom,
+            dur_slack,
+            self.current_plan_duration,
+            late_s,
+        )
 
         self.th_init = traj_new[0, 2]
         self.heading_controller.load_goal(self.th_init)
@@ -863,7 +871,7 @@ class MultiAgentNavigator(l2.Navigator):
             ps.pose.position.y = float(state[1])
             ps.pose.orientation.w = 1.0
             path_snap.poses.append(ps)
-        self._publish_active_trajectory_msg(True, path_snap, wt_pub, track_start, self._multi_plan_id)
+        self._publish_active_trajectory_msg(True, path_snap, wt_pub, scheduled, self._multi_plan_id)
 
         self._simultaneous_solve_done = False
         self._simultaneous_optimized_times = None
