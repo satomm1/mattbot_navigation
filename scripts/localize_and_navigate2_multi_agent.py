@@ -175,6 +175,9 @@ class MultiAgentNavigator(l2.Navigator):
         self._multi_agent_auto_execute_wall_extra_sec = float(
             rospy.get_param("~multi_agent_auto_execute_wall_extra_sec", 1.0)
         )
+        self._multi_agent_waypoint_time_buffer_sec = float(
+            rospy.get_param("~multi_agent_waypoint_time_buffer_sec", 5.0)
+        )
         self._leader_execute_dds_topic = rospy.get_param(
             "~multi_agent_execute_at_dds_trigger_topic", "/multi_agent_execute_at_dds"
         ).strip() or "/multi_agent_execute_at_dds"
@@ -822,11 +825,12 @@ class MultiAgentNavigator(l2.Navigator):
         self.th_init = traj_new[0, 2]
         self.heading_controller.load_goal(self.th_init)
 
-        # Parent TRACK logic uses waypoints for progress / time-overrun checks (+2s buffer vs spline time).
+        # Parent TRACK: deadline = plan_start + t_new[i] + buffer (avoid BACKING/replan when slightly late).
+        wp_buf = max(0.0, self._multi_agent_waypoint_time_buffer_sec)
         self.waypoints = []
         marker_arr = MarkerArray()
         for i in range(20, len(traj_new), 20):
-            self.waypoints.append([traj_new[i, 0], traj_new[i, 1], t_new[i] + 2.0])
+            self.waypoints.append([traj_new[i, 0], traj_new[i, 1], t_new[i] + wp_buf])
             marker = Marker()
             marker.header.frame_id = "map"
             marker.header.stamp = rospy.Time.now()
