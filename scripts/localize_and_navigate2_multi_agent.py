@@ -361,6 +361,12 @@ class MultiAgentNavigator(l2.Navigator):
         self._awaiting_pre_multi_align = False
         self._pre_multi_align_started_at = None
 
+    def aligned(self):
+        """Block parent ``run()`` ALIGN→TRACK while pre-MULTI dwell is active (see ``publish_control``)."""
+        if self._awaiting_pre_multi_align:
+            return False
+        return super(MultiAgentNavigator, self).aligned()
+
     def _reset_timing_compute_state(self):
         """Reset MILP/sequential/solo worker flags and pending arm state between goals or replan cycles.
 
@@ -1396,10 +1402,12 @@ class MultiAgentNavigator(l2.Navigator):
         if self._awaiting_pre_multi_align and self.mode != l2.Mode.ALIGN:
             rospy.logwarn_throttle(
                 5.0,
-                "MultiAgentNavigator: pre-MULTI align expected ALIGN but mode=%s; clearing pre-align flag",
+                "MultiAgentNavigator: pre-MULTI align expected ALIGN but mode=%s; forcing ALIGN",
                 self.mode,
             )
-            self._clear_pre_multi_align_state()
+            self.switch_mode(l2.Mode.ALIGN)
+            super(MultiAgentNavigator, self).publish_control()
+            return
 
         # Pre-MULTI ALIGN: stay in ALIGN until heading policy + max dwell satisfied, then enter MULTI.
         if self._awaiting_pre_multi_align and self.mode == l2.Mode.ALIGN:
@@ -1410,7 +1418,7 @@ class MultiAgentNavigator(l2.Navigator):
             if pol == "max_only":
                 exit_dwell = elapsed >= self._pre_multi_align_sec
             else:
-                exit_dwell = self.aligned() or elapsed >= self._pre_multi_align_sec
+                exit_dwell = super(MultiAgentNavigator, self).aligned() or elapsed >= self._pre_multi_align_sec
             if exit_dwell:
                 self._awaiting_pre_multi_align = False
                 self.switch_mode(MultiagentComputingMode.MULTIAGENT_CONTROL_COMPUTING)
