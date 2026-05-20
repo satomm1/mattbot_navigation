@@ -255,7 +255,7 @@ class Navigator:
         )
 
         # threshold at which navigator switches from trajectory to pose control
-        self.near_thresh = 0.1
+        self.near_thresh = 0.15
         self.at_thresh = 0.01
         self.at_thresh_theta = 0.05
         self.theta_goal_thresh = 0.05
@@ -1546,12 +1546,17 @@ class Navigator:
                 #     # Now replan
                 #     self.replan(obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
 
-                if (rospy.get_rostime() - self.current_plan_start_time).to_sec() > self.current_plan_duration:
-                    rospy.loginfo("replanning because out of time")
+                if ((rospy.get_rostime() - self.current_plan_start_time).to_sec() > self.current_plan_duration * 1.2):
+                    if (self.x_g is not None and self.y_g is not None and np.linalg.norm(np.array([self.x - self.x_g, self.y - self.y_g])) > 0.5):
+                        rospy.loginfo("replanning because out of time")
 
-                    # Stop attempting current plan
-                    self.switch_mode(Mode.IDLE)
-                    self.replan()  # we aren't near the goal but we thought we should have been, so replan
+                        # Stop attempting current plan
+                        self.switch_mode(Mode.IDLE)
+                        self.replan()  # we aren't near the goal but we thought we should have been, so replan
+                    else:
+                        self.heading_controller.load_goal(self.theta_g)
+                        rospy.loginfo("Navigator: Going to park because out of time and near goal")
+                        self.switch_mode(Mode.PARK)                
                     
             elif self.mode == Mode.PARK:
                 # Reached goal: forget goal coordinates and stop
