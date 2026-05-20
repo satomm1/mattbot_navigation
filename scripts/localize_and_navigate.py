@@ -123,8 +123,6 @@ class Navigator:
         self.kdx = 1.5
         self.kdy = 1.5
 
-        # heading controller parameters
-        self.kp_th = 1.5
         self.om_prev = 0.0
 
         self.traj_controller = TrajectoryTracker(
@@ -133,8 +131,7 @@ class Navigator:
         self.pose_controller = PoseController(
             0.0, 0.0, 0.0, self.v_max, self.om_max
         )
-        self.heading_controller = HeadingController(self.kp_th, self.om_max)
-        self.heading_controller2 = HeadingController(self.kp_th, self.om_max)
+        self.heading_controller = HeadingController(self.om_max)
 
         # Data structures to hold the detected objects
         self.detected_objects = []
@@ -682,7 +679,7 @@ class Navigator:
 
         if self.mode == Mode.PARK:
             V, om = self.heading_controller.compute_control(
-                self.x, self.y, self.theta, t
+                self.theta, t, prev_om=self.prev_om
             )
         elif self.mode == Mode.TRACK:
             V, om = self.traj_controller.compute_control(
@@ -693,7 +690,7 @@ class Navigator:
             V, om = self.modify_velocity_for_person(V, om)
         elif self.mode == Mode.ALIGN:
             V, om = self.heading_controller.compute_control(
-                self.x, self.y, self.theta, t
+                self.theta, t, prev_om=self.prev_om
             )
         elif self.mode == Mode.BACKING:
             V = -0.3

@@ -136,7 +136,7 @@ class Navigator:
         # Robot limits
         self.v_max = 0.7  # maximum velocity
         self.om_max = 3  # maximum angular velocity
-        self.om_heading = 1.3  # angular velocity for heading controller
+        self.om_heading = 2.5  # angular velocity for heading controller
 
         self.v_des = rospy.get_param('/cruising_velocity', 0.35) # desired cruising velocity
         self.theta_start_thresh = 0.05  # threshold in theta to start moving forward when path-following
@@ -161,8 +161,6 @@ class Navigator:
         self.kdx = rospy.get_param('/kdx', 1.5)
         self.kdy = rospy.get_param('/kdy', 1.5)
 
-        # heading controller parameters
-        self.kp_th = 1.5
         self.om_prev = 0.0
 
         # Get AMCL parameters to use
@@ -180,8 +178,7 @@ class Navigator:
         self.pose_controller = PoseController(
             0.0, 0.0, 0.0, self.v_max, self.om_max
         )
-        self.heading_controller = HeadingController(self.kp_th, self.om_max)
-        self.heading_controller2 = HeadingController(self.kp_th, self.om_max)
+        self.heading_controller = HeadingController(self.om_max)
 
         # Data structures to hold the detected objects
         self.detected_objects = []
@@ -1183,7 +1180,7 @@ class Navigator:
 
         if self.mode == Mode.PARK:
             V, om = self.heading_controller.compute_control(
-                self.x, self.y, self.theta, t
+                self.theta, t, prev_om=self.prev_om
             )
         elif self.mode == Mode.TRACK:
             V, om = self.traj_controller.compute_control(
@@ -1194,7 +1191,7 @@ class Navigator:
             V, om = self.modify_velocity_for_person(V, om)
         elif self.mode == Mode.ALIGN:
             V, om = self.heading_controller.compute_control(
-                self.x, self.y, self.theta, t
+                self.theta, t, prev_om=self.prev_om
             )
         elif self.mode == Mode.BACKING:
             V = -0.3

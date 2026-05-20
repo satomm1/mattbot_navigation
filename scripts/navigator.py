@@ -16,6 +16,8 @@ from enum import Enum
 from dynamic_reconfigure.server import Server
 # from asl_turtlebot.cfg import NavigatorConfig
 
+from navigation_utils import HeadingController
+
 V_PREV_THRES = 0.0001
 
 # command zero velocities once we are this close to the goal
@@ -448,30 +450,6 @@ class PoseController:
 
         return V, om
 
-class HeadingController:
-    """
-    pose stabilization controller
-    """
-    def __init__(self, kp, om_max=1):
-        self.kp = kp
-        self.om_max = om_max
-
-    def load_goal(self, th_g):
-        """
-        loads in a new goal position
-        """
-        self.th_g = th_g
-
-    def compute_control(self, x, y, th, t):
-        err = wrapToPi(self.th_g - th)
-        om = self.kp*err
-
-        # apply control limits
-        V = 0
-        om = np.clip(om, -self.om_max, self.om_max)
-
-        return V, om
-
 class Navigator:
     """
     This node handles point to point turtlebot motion, avoiding obstacles.
@@ -539,8 +517,7 @@ class Navigator:
         self.kdx = 1.5
         self.kdy = 1.5
 
-        # heading controller parameters
-        self.kp_th = 2.0
+        self.prev_om = 0.0
 
         self.traj_controller = TrajectoryTracker(
             self.kpx, self.kpy, self.kdx, self.kdy, self.v_max, self.om_max
@@ -548,7 +525,7 @@ class Navigator:
         self.pose_controller = PoseController(
             0.0, 0.0, 0.0, self.v_max, self.om_max
         )
-        self.heading_controller = HeadingController(self.kp_th, self.om_max)
+        self.heading_controller = HeadingController(self.om_max)
 
         self.nav_planned_path_pub = rospy.Publisher(
             "/planned_path", Path, queue_size=10
@@ -767,11 +744,13 @@ class Navigator:
             )
         elif self.mode == Mode.ALIGN:
             V, om = self.heading_controller.compute_control(
-                self.x, self.y, self.theta, t
+                self.theta, t, prev_om=self.prev_om
             )
         else:
             V = 0.0
             om = 0.0
+
+        self.prev_om = om
 
         cmd_vel = Twist()
         cmd_vel.linear.x = V

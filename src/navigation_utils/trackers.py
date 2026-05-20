@@ -149,30 +149,67 @@ class PoseController:
 
 class HeadingController:
     """
-    pose stabilization controller
+    Spin-in-place heading controller using trapezoidal deceleration.
+
+    - Far from goal: |omega| = om_max (cruise).
+    - Near goal: |omega| = min(om_max, sqrt(2 * alpha_max * |err|)) so the robot can stop in remaining angle.
+    - Outside the stop zone (|err| > err_stop): enforce om_min so commands avoid stiction twitch.
+    - Slew limit (alpha_max * dt) applies only when increasing |omega| (acceleration).
     """
-    def __init__(self, kp, om_max=1):
-        self.kp = kp
+
+    def __init__(self, om_max=1, om_min=1.0, alpha_max=2.0, err_deadband=0.02):
         self.om_max = om_max
+        self.om_min = om_min
+        self.alpha_max = alpha_max
+        self.err_deadband = err_deadband
+        # Below this |err|, om_min is not applied (trapezoid may command slower approach).
+        self.err_stop = (om_min ** 2) / (2.0 * alpha_max)
+        self.t_prev = None
 
     def load_goal(self, th_g):
-        """
-        loads in a new goal position
-        """
+        """Load a new goal heading and reset timing state."""
         self.th_g = th_g
+        self.t_prev = None
 
-    def compute_control(self, x, y, th, t, prev_om=None):
+    def _trapezoid_omega(self, err):
+        """Trapezoidal spin profile with optional minimum |omega| when moving."""
+        if abs(err) < self.err_deadband:
+            return 0.0
+
+        om_mag = min(self.om_max, np.sqrt(2.0 * self.alpha_max * abs(err)))
+        if abs(err) > self.err_stop:
+            om_mag = max(self.om_min, om_mag)
+
+        return np.sign(err) * om_mag
+
+    def _apply_accel_slew(self, om_cmd, prev_om, dt):
+        """Limit rate of increase of |omega|; deceleration is not slew-limited."""
+        if prev_om is None or dt <= 0.0:
+            return om_cmd
+
+        if abs(om_cmd) <= abs(prev_om) + 1e-9:
+            return om_cmd
+
+        # Only limit when magnitude increases with the same sign (or from rest).
+        if np.sign(om_cmd) == np.sign(prev_om) or abs(prev_om) < 1e-3:
+            om_mag = min(abs(om_cmd), abs(prev_om) + self.alpha_max * dt)
+            return np.sign(om_cmd) * om_mag
+
+        return om_cmd
+
+    def compute_control(self, th, t, prev_om=None):
         err = wrapToPi(self.th_g - th)
-        om = self.kp*err
 
-        if prev_om is not None:
-            if np.abs(prev_om) <= 1e-3:
-                om = np.clip(om, -0.2, 0.2)
-            elif np.abs(prev_om) <= 0.5:
-                om = np.clip(om, -1.5*np.abs(prev_om), 1.5*np.abs(prev_om))
+        if t is not None and self.t_prev is not None:
+            dt = max(float(t - self.t_prev), 1e-3)
+        else:
+            dt = 0.1
+        if t is not None:
+            self.t_prev = t
 
-        # apply control limits
+        om = self._trapezoid_omega(err)
+        om = self._apply_accel_slew(om, prev_om, dt)
+
         V = 0
         om = np.clip(om, -self.om_max, self.om_max)
-
         return V, om
