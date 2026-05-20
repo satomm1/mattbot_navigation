@@ -163,8 +163,8 @@ include_directories(
 catkin_install_python(PROGRAMS
   scripts/utils/__init__.py
   scripts/utils/utils.py
-  scripts/localize_and_navigate2.py
-  scripts/localize_and_navigate2_multi_agent.py
+  scripts/localize_and_navigate.py
+  scripts/localize_and_navigate_multi_agent.py
   scripts/occupancy_grid_mapper.py
   scripts/localize_and_map.py
   scripts/patrol.py

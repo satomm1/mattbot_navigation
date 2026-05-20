@@ -27,7 +27,7 @@
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
   </node>
 
-  <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate2_multi_agent.py" output="screen">
+  <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate_multi_agent.py" output="screen">
   </node>
 
   <node name="patrol_node" pkg="mattbot_navigation" type="patrol.py" output="screen" if="$(arg patrol)">

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Navigator variant: extends ``localize_and_navigate2.Navigator`` with optional **coordinated timing**
+Navigator variant: extends ``localize_and_navigate.Navigator`` with optional **coordinated timing**
 after a geometric path exists. Geometric planning (A*, smoothing, ALIGN/TRACK/PARK) still lives in the
 parent class; this file adds a **multi-agent timing phase** so several robots can agree on waypoint
 times and a common ``execute_at`` wall clock before TRACK.
@@ -67,36 +67,36 @@ from visualization_msgs.msg import Marker, MarkerArray
 from social_path_planning.multi_planning import MultiAgentSequentialPlanner, MultiAgentSimultaneousPlanner
 
 
-def _load_localize_and_navigate2():
+def _load_localize_and_navigate():
     """
-    Load the navigator implementation from scripts/localize_and_navigate2.py.
+    Load the navigator implementation from scripts/localize_and_navigate.py.
 
-    We cannot ``import localize_and_navigate2`` when this file is run via the Catkin
+    We cannot ``import localize_and_navigate`` when this file is run via the Catkin
     devel wrapper: that name resolves to another wrapper script in lib/pkg/ which execs
     the real file into a private dict, so the imported module has no ``Navigator``.
     """
     here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, "localize_and_navigate2.py")
+    path = os.path.join(here, "localize_and_navigate.py")
     if not os.path.isfile(path):
         try:
             import rospkg
 
-            path = os.path.join(rospkg.RosPack().get_path("mattbot_navigation"), "scripts", "localize_and_navigate2.py")
+            path = os.path.join(rospkg.RosPack().get_path("mattbot_navigation"), "scripts", "localize_and_navigate.py")
         except Exception:
             pass
     if not os.path.isfile(path):
-        raise ImportError("Could not find localize_and_navigate2.py (tried next to %r)" % (__file__,))
-    spec = importlib.util.spec_from_file_location("_localize_and_navigate2_impl", path)
+        raise ImportError("Could not find localize_and_navigate.py (tried next to %r)" % (__file__,))
+    spec = importlib.util.spec_from_file_location("_localize_and_navigate_impl", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
-l2 = _load_localize_and_navigate2()
+nav = _load_localize_and_navigate()
 
 
 class MultiagentComputingMode(IntEnum):
-    """Extra navigator mode; value 11 must not collide with ``localize_and_navigate2.Mode`` (0–10).
+    """Extra navigator mode; value 11 must not collide with ``localize_and_navigate.Mode`` (0–10).
 
     Used while the robot is stationary: waiting for peer planned paths, running MILP/sequential timing,
     arming the spline, and synchronizing on ``execute_at``.
@@ -105,7 +105,7 @@ class MultiagentComputingMode(IntEnum):
     MULTIAGENT_CONTROL_COMPUTING = 11
 
 
-class MultiAgentNavigator(l2.Navigator):
+class MultiAgentNavigator(nav.Navigator):
     """Adds multi-robot **timing** (waypoint times + execute_at) on top of the base geometric navigator.
 
     Read the module docstring for the full lifecycle. Key instance state:
@@ -329,15 +329,15 @@ class MultiAgentNavigator(l2.Navigator):
             rospy.logdebug("External goal is the same as current goal, ignoring")
             return
 
-        if self.mode == l2.Mode.WAITING_FOR_INIT or self.mode == l2.Mode.LOCALIZING:
+        if self.mode == nav.Mode.WAITING_FOR_INIT or self.mode == nav.Mode.LOCALIZING:
             return
 
-        if self.mode != l2.Mode.IDLE:
+        if self.mode != nav.Mode.IDLE:
             cmd_vel = Twist()
             cmd_vel.linear.x = 0.0
             cmd_vel.angular.z = 0.0
             self.nav_vel_pub.publish(cmd_vel)
-            self.switch_mode(l2.Mode.IDLE)
+            self.switch_mode(nav.Mode.IDLE)
 
         if self.occupancy is not None and not self.occupancy.is_free((msg.x, msg.y)):
             rospy.loginfo("Not a valid goal")
@@ -717,7 +717,7 @@ class MultiAgentNavigator(l2.Navigator):
             rospy.loginfo("MultiAgentNavigator: timed path too short; PARK to goal")
             self.pose_controller.load_goal(self.x_g, self.y_g, self.theta_g)
             self.heading_controller.load_goal(self.theta_g)
-            self.switch_mode(l2.Mode.PARK)
+            self.switch_mode(nav.Mode.PARK)
             self._reset_timing_compute_state()
             self._multi_plan_id = ""
             self._multi_fleet_robot_ids = []
@@ -910,7 +910,7 @@ class MultiAgentNavigator(l2.Navigator):
                 "MultiAgentNavigator: timed plan commit while not aligned with start heading; TRACK anyway (pre-MULTI ALIGN should have handled this)"
             )
         rospy.loginfo("MultiAgentNavigator: timed plan -> TRACK")
-        self.switch_mode(l2.Mode.TRACK)
+        self.switch_mode(nav.Mode.TRACK)
         if self._replan_as_multi_from_external_goal_multi:
             self._sticky_multi_timing_replan = True
             rospy.loginfo(
@@ -1032,7 +1032,7 @@ class MultiAgentNavigator(l2.Navigator):
         self._replan_as_multi_from_external_goal_multi = False
         self._peer_multi_planned_paths = {}
         self._reset_timing_compute_state()
-        self.switch_mode(l2.Mode.IDLE)
+        self.switch_mode(nav.Mode.IDLE)
 
     def _try_simultaneous_plan_if_ready(self):
         """Coordinator-only entry: start exactly one timing worker when paths are ready.
@@ -1295,15 +1295,15 @@ class MultiAgentNavigator(l2.Navigator):
             rospy.logdebug("Multi external goal unchanged (pose + plan_id), ignoring")
             return
 
-        if self.mode == l2.Mode.WAITING_FOR_INIT or self.mode == l2.Mode.LOCALIZING:
+        if self.mode == nav.Mode.WAITING_FOR_INIT or self.mode == nav.Mode.LOCALIZING:
             return
 
-        if self.mode != l2.Mode.IDLE:
+        if self.mode != nav.Mode.IDLE:
             cmd_vel = Twist()
             cmd_vel.linear.x = 0.0
             cmd_vel.angular.z = 0.0
             self.nav_vel_pub.publish(cmd_vel)
-            self.switch_mode(l2.Mode.IDLE)
+            self.switch_mode(nav.Mode.IDLE)
 
         if self.occupancy is not None and not self.occupancy.is_free((g.x, g.y)):
             rospy.loginfo("Multi external goal: not a valid goal cell")
@@ -1396,7 +1396,7 @@ class MultiAgentNavigator(l2.Navigator):
                     list(self._multi_fleet_robot_ids),
                 )
             # Re-enter dwell + MULTI only when geometric replan produced a trackable plan.
-            if self.mode in (l2.Mode.ALIGN, l2.Mode.TRACK, l2.Mode.PARK):
+            if self.mode in (nav.Mode.ALIGN, nav.Mode.TRACK, nav.Mode.PARK):
                 plan = getattr(self, "unsmoothed_plan", None) or []
                 if len(plan) >= 2:
                     dx = float(plan[1][0]) - float(plan[0][0])
@@ -1406,15 +1406,15 @@ class MultiAgentNavigator(l2.Navigator):
                 self._awaiting_pre_multi_align = True
                 self._pre_multi_align_started_at = rospy.Time.now()
                 # Parent replan() may already have switched IDLE->ALIGN for heading; avoid ALIGN->ALIGN log/noise.
-                if self.mode != l2.Mode.ALIGN:
-                    self.switch_mode(l2.Mode.ALIGN)
+                if self.mode != nav.Mode.ALIGN:
+                    self.switch_mode(nav.Mode.ALIGN)
                 rospy.logdebug(
                     "MultiAgentNavigator: pre-MULTI ALIGN dwell (plan_id=%s) policy=%s max_s=%.2f",
                     self._multi_plan_id,
                     self._pre_multi_align_exit_policy,
                     self._pre_multi_align_sec,
                 )
-            elif self.mode == l2.Mode.IDLE:
+            elif self.mode == nav.Mode.IDLE:
                 # Parent planning failed: tear down multi mission state.
                 self._multi_plan_id = ""
                 self._multi_coordinated = False
@@ -1437,25 +1437,25 @@ class MultiAgentNavigator(l2.Navigator):
         # Goal reached: parent clears x_g/y_g/theta_g in PARK; drop sticky so next mission starts clean.
         if (
             self._sticky_multi_timing_replan
-            and self.mode == l2.Mode.IDLE
+            and self.mode == nav.Mode.IDLE
             and self.x_g is None
             and self.y_g is None
             and self.theta_g is None
         ):
             self._sticky_multi_timing_replan = False
             self._replan_as_multi_from_external_goal_multi = False
-        if self._awaiting_pre_multi_align and self.mode != l2.Mode.ALIGN:
+        if self._awaiting_pre_multi_align and self.mode != nav.Mode.ALIGN:
             rospy.logwarn_throttle(
                 5.0,
                 "MultiAgentNavigator: pre-MULTI align expected ALIGN but mode=%s; forcing ALIGN",
                 self.mode,
             )
-            self.switch_mode(l2.Mode.ALIGN)
+            self.switch_mode(nav.Mode.ALIGN)
             super(MultiAgentNavigator, self).publish_control()
             return
 
         # Pre-MULTI ALIGN: stay in ALIGN until heading policy + max dwell satisfied, then enter MULTI.
-        if self._awaiting_pre_multi_align and self.mode == l2.Mode.ALIGN:
+        if self._awaiting_pre_multi_align and self.mode == nav.Mode.ALIGN:
             if self._pre_multi_align_started_at is None:
                 self._pre_multi_align_started_at = rospy.Time.now()
             elapsed = (rospy.Time.now() - self._pre_multi_align_started_at).to_sec()
@@ -1575,7 +1575,7 @@ class MultiAgentNavigator(l2.Navigator):
 
 
 if __name__ == "__main__":
-    # Same startup pattern as localize_and_navigate2.py: brief delay for TF/subscribers, then parent's run loop.
+    # Same startup pattern as localize_and_navigate.py: brief delay for TF/subscribers, then parent's run loop.
     nav = MultiAgentNavigator()
     rospy.on_shutdown(nav.shutdown_callback)
     time.sleep(3)

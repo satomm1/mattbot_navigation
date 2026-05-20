@@ -1507,9 +1507,10 @@ class Navigator:
                         self.waypoints.pop(0)  # Remove the first waypoint since we are close to it
                 
                 if self.agent_intersect_path() and not self.is_lowest_id:
-                    self.switch_mode(Mode.STOPPED_FOR_AGENT)
-                    print("Agent in Path---Stopping")
-                    self.stopped_for_agents = True
+                    # self.switch_mode(Mode.STOPPED_FOR_AGENT)
+                    # print("Agent in Path---Stopping")
+                    # self.stopped_for_agents = True
+                    pass
 
                 # if self.replan_for_object():
                 #     # If we are too close to an object, stop and replan

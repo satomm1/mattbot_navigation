@@ -29,7 +29,7 @@
 
   </node>
 
-  <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate2.py" output="screen">
+  <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate.py" output="screen">
 
   </node>
 
