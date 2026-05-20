@@ -20,13 +20,112 @@ import matplotlib.pyplot as plt
 from enum import Enum
 import requests
 import os
+import hashlib
+import json
+import pickle
+import tempfile
 
 from navigation_utils import TrajectoryTracker, PoseController, HeadingController, wrapToPi, StochOccupancyGrid2D, AStar, compute_smoothed_traj
 from social_path_planning import AStar as SocialAStar, AStar_With_Graph as SocialAStar_With_Graph
 from social_path_planning import FrequentSubgraph
+from social_path_planning.wall_distance_cache import fingerprint_probs
 
 
 V_PREV_THRES = 0.0001
+
+# Bump when cache contents / canonicalization meaning changes (invalidates old pickles).
+FREQUENT_GRAPH_CACHE_VERSION = 1
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _expected_frequent_graph_cache_meta(occupancy, heatmap_npy_path, threshold, min_component_size):
+    """Fingerprint everything that affects build_graph / prune / canonicalize."""
+    return {
+        "cache_version": FREQUENT_GRAPH_CACHE_VERSION,
+        "sparse_graph_threshold": float(threshold),
+        "sparse_graph_components": int(min_component_size),
+        "heatmap_sha256": _sha256_file(heatmap_npy_path),
+        "occupancy_probs_sha256": fingerprint_probs(occupancy.probs),
+        "map_width": int(occupancy.width),
+        "map_height": int(occupancy.height),
+        "resolution": float(occupancy.resolution),
+        "origin_x": float(occupancy.origin_x),
+        "origin_y": float(occupancy.origin_y),
+        "robot_d": float(getattr(occupancy, "robot_d", 0.6)),
+        "thresh": float(getattr(occupancy, "thresh", 0.5)),
+    }
+
+
+def _frequent_graph_meta_matches(stored, expected):
+    if not isinstance(stored, dict):
+        return False
+    if int(stored.get("cache_version", -1)) != int(expected["cache_version"]):
+        return False
+    for k in (
+        "sparse_graph_threshold",
+        "sparse_graph_components",
+        "heatmap_sha256",
+        "occupancy_probs_sha256",
+        "map_width",
+        "map_height",
+    ):
+        if stored.get(k) != expected.get(k):
+            return False
+    for k, tol in (("resolution", 1e-9), ("origin_x", 1e-6), ("origin_y", 1e-6), ("robot_d", 1e-9), ("thresh", 1e-9)):
+        try:
+            if not np.isclose(float(stored.get(k)), float(expected.get(k)), rtol=0.0, atol=tol):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def _try_load_frequent_graph_cache(pkl_path, meta_path, expected_meta):
+    if not (os.path.isfile(pkl_path) and os.path.isfile(meta_path)):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            stored = json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not _frequent_graph_meta_matches(stored, expected_meta):
+        return None
+    try:
+        with open(pkl_path, "rb") as f:
+            g = pickle.load(f)
+    except (OSError, EOFError, pickle.UnpicklingError, AttributeError):
+        return None
+    if not isinstance(g, nx.DiGraph):
+        return None
+    return g
+
+
+def _save_frequent_graph_cache(graph, pkl_path, meta_path, expected_meta):
+    """Atomic-ish write: temp files then rename."""
+    d = os.path.dirname(os.path.abspath(pkl_path)) or "."
+    fd_pkl, tmp_pkl = tempfile.mkstemp(prefix=".frequent_graph_", suffix=".pkl", dir=d)
+    fd_meta, tmp_meta = tempfile.mkstemp(prefix=".frequent_graph_", suffix=".json", dir=d)
+    try:
+        with os.fdopen(fd_pkl, "wb") as f:
+            pickle.dump(graph, f, protocol=pickle.HIGHEST_PROTOCOL)
+        with os.fdopen(fd_meta, "w", encoding="utf-8") as f:
+            json.dump(expected_meta, f, indent=2, sort_keys=True)
+        os.replace(tmp_pkl, pkl_path)
+        os.replace(tmp_meta, meta_path)
+    except Exception:
+        for p in (tmp_pkl, tmp_meta):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        raise
 
 # command zero velocities once we are this close to the goal
 RHO_THRES = 0.05
@@ -92,7 +191,9 @@ class Navigator:
         self.map_frame_id = rospy.get_param('~frequent_graph_map_frame', 'map')
         self.publish_frequent_graph_viz = rospy.get_param('~publish_frequent_graph_viz', True)
         # Applied once when canonicalizing loaded heatmap graph keys to ROS map (col, row).
-        
+        self.use_frequent_graph_cache = rospy.get_param("~use_frequent_graph_cache", True)
+        self.force_rebuild_frequent_graph = rospy.get_param("~force_rebuild_frequent_graph", False)
+
         self.person_occupancy = None
         self.robot_stopped_by_person = False
         self.person_in_path = False
@@ -506,17 +607,76 @@ class Navigator:
                 heatmap_prefix = pkg_path + '/ros_map'
 
                 # Check if heatmap file actually exists before trying to load it
-                heatmap_name = heatmap_prefix + '_heatmap.npy'
+                heatmap_name = heatmap_prefix + "_heatmap.npy"
                 if os.path.isfile(heatmap_name):
-                    self.frequent = FrequentSubgraph(self.occupancy, heat_map_filename=heatmap_prefix)
-                    self.frequent.build_graph(threshold=self.sparse_graph_threshold, reset_graph=True)
-                    rospy.logwarn(f"Number of nodes/edges in graph before pruning = {len(self.frequent.graph.nodes)}/{len(self.frequent.graph.edges)}")
-                    self.frequent.prune_graph(min_component_size=self.sparse_graph_components)
-                    rospy.logwarn(f"Number of nodes/edges in graph = {len(self.frequent.graph.nodes)}/{len(self.frequent.graph.edges)}")
-                    self._canonicalize_frequent_graph()
+                    cache_pkl = heatmap_prefix + "_frequent_pruned_graph.pkl"
+                    cache_meta = heatmap_prefix + "_frequent_graph_cache_meta.json"
+                    expected_meta = _expected_frequent_graph_cache_meta(
+                        self.occupancy,
+                        heatmap_name,
+                        self.sparse_graph_threshold,
+                        self.sparse_graph_components,
+                    )
+                    loaded_graph = None
+                    if (
+                        self.use_frequent_graph_cache
+                        and not self.force_rebuild_frequent_graph
+                    ):
+                        loaded_graph = _try_load_frequent_graph_cache(
+                            cache_pkl, cache_meta, expected_meta
+                        )
+                    if loaded_graph is not None:
+                        self.frequent = FrequentSubgraph(
+                            self.occupancy, heat_map_filename=heatmap_prefix
+                        )
+                        self.frequent.graph = loaded_graph
+                        rospy.loginfo(
+                            "Loaded pruned frequent subgraph from cache (%s, %d nodes, %d edges)",
+                            cache_pkl,
+                            self.frequent.graph.number_of_nodes(),
+                            self.frequent.graph.number_of_edges(),
+                        )
+                    else:
+                        self.frequent = FrequentSubgraph(
+                            self.occupancy, heat_map_filename=heatmap_prefix
+                        )
+                        self.frequent.build_graph(
+                            threshold=self.sparse_graph_threshold, reset_graph=True
+                        )
+                        rospy.logwarn(
+                            "Number of nodes/edges in graph before pruning = %d/%d",
+                            self.frequent.graph.number_of_nodes(),
+                            self.frequent.graph.number_of_edges(),
+                        )
+                        self.frequent.prune_graph(
+                            min_component_size=self.sparse_graph_components
+                        )
+                        rospy.logwarn(
+                            "Number of nodes/edges in graph = %d/%d",
+                            self.frequent.graph.number_of_nodes(),
+                            self.frequent.graph.number_of_edges(),
+                        )
+                        self._canonicalize_frequent_graph()
+                        if self.use_frequent_graph_cache:
+                            try:
+                                _save_frequent_graph_cache(
+                                    self.frequent.graph, cache_pkl, cache_meta, expected_meta
+                                )
+                                rospy.loginfo(
+                                    "Saved pruned frequent subgraph cache to %s", cache_pkl
+                                )
+                            except OSError as exc:
+                                rospy.logwarn(
+                                    "Could not write frequent subgraph cache (%s): %s",
+                                    cache_pkl,
+                                    exc,
+                                )
                     self.publish_frequent_graph_rviz()
                 else:
-                    rospy.logwarn(f"Heatmap file {heatmap_name} not found, skipping loading frequent subgraph.")
+                    rospy.logwarn(
+                        "Heatmap file %s not found, skipping loading frequent subgraph.",
+                        heatmap_name,
+                    )
             
             if self.object_occupancy is None:
                 self.object_occupancy = StochOccupancyGrid2D(
