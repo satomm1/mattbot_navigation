@@ -61,7 +61,7 @@ from mattbot_dds.msg import (
     MultiAgentTimingSolve,
     MultiRobotExternalGoal,
 )
-from navigation_utils import compute_trajectory_from_timed_waypoints
+from navigation_utils import compute_trajectory_from_timed_waypoints, plan_start_heading
 from social_path_planning.occupancy_grid import StochOccupancyGrid2D as SpStochOccupancyGrid2D
 from visualization_msgs.msg import Marker, MarkerArray
 from social_path_planning.multi_planning import MultiAgentSequentialPlanner, MultiAgentSimultaneousPlanner
@@ -855,7 +855,7 @@ class MultiAgentNavigator(nav.Navigator):
             late_s,
         )
 
-        self.th_init = traj_new[0, 2]
+        self.th_init = plan_start_heading(planned_path, traj_new, v_min=0.05)
         self.heading_controller.load_goal(self.th_init)
 
         # Parent TRACK: deadline = plan_start + t_new[i] + buffer (avoid BACKING/replan when slightly late).
@@ -1397,11 +1397,9 @@ class MultiAgentNavigator(nav.Navigator):
                 )
             # Re-enter dwell + MULTI only when geometric replan produced a trackable plan.
             if self.mode in (nav.Mode.ALIGN, nav.Mode.TRACK, nav.Mode.PARK):
+                traj = getattr(self, "current_plan", None)
                 plan = getattr(self, "unsmoothed_plan", None) or []
-                if len(plan) >= 2:
-                    dx = float(plan[1][0]) - float(plan[0][0])
-                    dy = float(plan[1][1]) - float(plan[0][1])
-                    self.th_init = float(np.arctan2(dy, dx))
+                self.th_init = plan_start_heading(plan, traj, v_min=0.05)
                 self.heading_controller.load_goal(self.th_init)
                 self._awaiting_pre_multi_align = True
                 self._pre_multi_align_started_at = rospy.Time.now()

@@ -25,7 +25,16 @@ import json
 import pickle
 import tempfile
 
-from navigation_utils import TrajectoryTracker, PoseController, HeadingController, wrapToPi, StochOccupancyGrid2D, AStar, compute_smoothed_traj
+from navigation_utils import (
+    TrajectoryTracker,
+    PoseController,
+    HeadingController,
+    wrapToPi,
+    StochOccupancyGrid2D,
+    AStar,
+    compute_smoothed_traj,
+    plan_start_heading,
+)
 from social_path_planning import AStar as SocialAStar, AStar_With_Graph as SocialAStar_With_Graph
 from social_path_planning import FrequentSubgraph
 from social_path_planning.wall_distance_cache import fingerprint_probs
@@ -1293,14 +1302,13 @@ class Navigator:
         self.current_plan_start_time = rospy.get_rostime()
         self.current_plan_duration = t_new[-1]
 
-        self.th_init = traj_new[0, 2]
+        self.th_init = plan_start_heading(planned_path, traj_new, v_min=0.05)
         self.heading_controller.load_goal(self.th_init)
-        
+
         # Populate the waypoints, use every 20th point:
         self.waypoints = []
         marker_arr = MarkerArray()
-        th_init_new = traj_new[0, 2]
-        th_err = wrapToPi(th_init_new - self.theta)
+        th_err = wrapToPi(self.th_init - self.theta)
         t_init_align = abs(th_err / self.om_max)
         for i in range(20, len(traj_new), 20):
             self.waypoints.append([traj_new[i, 0], traj_new[i, 1], t_new[i]+2])  # +2 to add a buffer +t_init_align+current_time

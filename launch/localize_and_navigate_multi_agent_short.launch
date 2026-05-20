@@ -1,4 +1,4 @@
-<!-- Same as localize_and_navigate_combined_map_short.launch but uses localize_and_navigate2_multi_agent.py for fleet multi goals + DDS planned-path exchange. -->
+<!-- Same as localize_and_navigate_combined_map_short.launch but uses localize_and_navigate_multi_agent.py for fleet multi goals + DDS planned-path exchange. -->
 <launch>
 
   <param name="map_name" value="/navigation_map" />
