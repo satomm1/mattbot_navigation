@@ -20,9 +20,15 @@ class HeadingController:
         """
         self.th_g = th_g
 
-    def compute_control(self, x, y, th, t):
+    def compute_control(self, x, y, th, t, prev_om=None):
         err = wrapToPi(self.th_g - th)
-        om = self.kp*err
+        om = self.kp * err
+
+        if prev_om is not None:
+            if np.abs(prev_om) <= 1e-3:
+                om = np.clip(om, -0.2, 0.2)
+            elif np.abs(prev_om) <= 0.5:
+                om = np.clip(om, -1.5 * np.abs(prev_om), 1.5 * np.abs(prev_om))
 
         # apply control limits
         V = 0

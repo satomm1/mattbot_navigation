@@ -11,6 +11,35 @@ def wrapToPi(a):
         return [(x+np.pi) % (2*np.pi) - np.pi for x in a]
     return (a + np.pi) % (2*np.pi) - np.pi
 
+
+def plan_start_heading(unsmoothed_plan, traj_new, v_min=0.05):
+    """
+    Heading target for ALIGN before TRACK.
+
+    Prefer bearing of the first geometric path segment (matches grid plan intent).
+    If that segment is degenerate, use the first spline sample with speed >= v_min,
+    then fall back to traj_new[0, 2].
+    """
+    plan = unsmoothed_plan
+    if plan is not None and len(plan) >= 2:
+        dx = float(plan[1][0]) - float(plan[0][0])
+        dy = float(plan[1][1]) - float(plan[0][1])
+        if dx * dx + dy * dy >= 1e-8:
+            return float(np.arctan2(dy, dx))
+
+    if traj_new is not None and len(traj_new) > 0:
+        traj_new = np.asarray(traj_new)
+        if traj_new.ndim == 2 and traj_new.shape[1] >= 5:
+            for i in range(traj_new.shape[0]):
+                xd = float(traj_new[i, 3])
+                yd = float(traj_new[i, 4])
+                if xd * xd + yd * yd >= v_min * v_min:
+                    return float(np.arctan2(yd, xd))
+        if traj_new.ndim == 2 and traj_new.shape[1] >= 3:
+            return float(traj_new[0, 2])
+    return 0.0
+
+
 def compute_smoothed_traj(path, V_des, k, alpha, dt):
     """
     Fit cubic spline to a path and generate a resulting trajectory for our
