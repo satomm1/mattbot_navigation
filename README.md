@@ -1,16 +1,20 @@
 # Navigation
 
-Implements navigation for the mobile robot. Uses the A* algorithm to find an optimal, smoothes the path using splines, and provides the control for reaching the goal. Parts of these scripts were developed as part of the CS 237A course at Stanford University.
+Implements navigation for the mobile robot. Uses A* to plan paths, smooths them with splines, and tracks them with differential-flatness control. Parts of these scripts were developed as part of the CS 237A course at Stanford University.
 
 ### Scripts
-- **navigator.py**: Implements the navigator.
-- **localize_and_navigate.py**: First rotates the robot until localized, then proceeds with the navigator.
-- **occupancy_grid_mapper.py**: Implements an occupancy grid mapper based on the Astra RGB-D Camera
+
+- **localize_and_navigate2.py**: Primary navigator (localize, ALIGN/TRACK/PARK, replanning, social A* optional).
+- **localize_and_navigate2_multi_agent.py**: Extends v2 with coordinated multi-robot timing and DDS planned-path handoff.
+- **localize_and_map.py**: Navigator variant with mapping/localization workflow.
+- **occupancy_grid_mapper.py**: Occupancy grid mapper from the Astra RGB-D camera.
+- **patrol.py**: Patrol behavior (optional in combined-map launches).
 
 ### Launch
-- **navigator.launch**: Launches the `navigator.py` file.
-- **localize_and_navigate.launch**: Launches the `localize_and_navigate.py` file.
-- **localize_and_navigate_combined_map.launch**: Launches `localize_and_navigate.py` and `occupancy_grid_mapper.py` files.
+
+- **localize_and_navigate_combined_map_short.launch** / **localize_and_navigate_combined_map_tall.launch**: `occupancy_grid_mapper.py` + `localize_and_navigate2.py` (+ optional `patrol.py`).
+- **localize_and_navigate_multi_agent_short.launch**: Same stack with `localize_and_navigate2_multi_agent.py`.
+- **localize_and_occupancy_mapper_short.launch** / **localize_and_occupancy_mapper_tall.launch**: Mapper + `localize_and_map.py`.
 
 **Author**: Matthew Sato, Engineering Informatics Lab, Stanford University
 

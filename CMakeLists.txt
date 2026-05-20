@@ -161,10 +161,8 @@ include_directories(
 ## Mark executable scripts (Python etc.) for installation
 ## in contrast to setup.py, you can choose the destination
 catkin_install_python(PROGRAMS
-  scripts/navigator.py
   scripts/utils/__init__.py
   scripts/utils/utils.py
-  scripts/localize_and_navigate.py
   scripts/localize_and_navigate2.py
   scripts/localize_and_navigate2_multi_agent.py
   scripts/occupancy_grid_mapper.py

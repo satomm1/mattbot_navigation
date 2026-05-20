@@ -1,4 +1,4 @@
-<!-- navigator_launch_file.launch -->
+<!-- localize_and_navigate_combined_map_short.launch -->
 <launch>
 
   <param name="map_name" value="/navigation_map" />
@@ -29,7 +29,6 @@
 
   </node>
 
-  <!-- Launch the navigator.py script -->
   <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate2.py" output="screen">
 
   </node>

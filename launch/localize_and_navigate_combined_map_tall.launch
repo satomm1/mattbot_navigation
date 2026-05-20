@@ -40,7 +40,6 @@
     
   </node>
 
-  <!-- Launch the navigator.py script -->
   <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate2.py" output="screen">
 
   </node>
