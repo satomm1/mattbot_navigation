@@ -16,7 +16,7 @@ times and a common ``execute_at`` wall clock before TRACK.
        or TRACK (same as base).
     3. This subclass then forces **pre-MULTI ALIGN**: dwell in ALIGN so headings settle before DDS
        publishes the grid plan.
-    4. Mode ``MULTIAGENT_CONTROL_COMPUTING`` (value 11): ego publishes ``MultiAgentPlannedPath`` to ROS
+    4. Mode ``MULTIAGENT_CONTROL_COMPUTING`` (value 12): ego publishes ``MultiAgentPlannedPath`` to ROS
        (``dds_data_publisher`` forwards to DDS). Peers do the same for the same ``plan_id``.
     5. **Coordinator** (robot id ``min(fleet_robot_ids)``) runs **one** of:
        - **Simultaneous** (fleet size ≥ 2): ``MultiAgentSimultaneousPlanner`` MILP; publishes
@@ -41,7 +41,7 @@ times and a common ``execute_at`` wall clock before TRACK.
     to CycloneDDS. Message definitions live in ``mattbot_dds/msg``.
 
 **Python 3.8 note**
-    Parent ``Mode`` enum cannot be extended; extra mode uses ``MultiagentComputingMode`` value 11.
+    Parent ``Mode`` enum cannot be extended; extra mode uses ``MultiagentComputingMode`` value 12.
 """
 
 import importlib.util
@@ -96,13 +96,13 @@ nav = _load_localize_and_navigate()
 
 
 class MultiagentComputingMode(IntEnum):
-    """Extra navigator mode; value 11 must not collide with ``localize_and_navigate.Mode`` (0–10).
+    """Extra navigator mode; value 12 must not collide with ``localize_and_navigate.Mode`` (0–11).
 
     Used while the robot is stationary: waiting for peer planned paths, running MILP/sequential timing,
     arming the spline, and synchronizing on ``execute_at``.
     """
 
-    MULTIAGENT_CONTROL_COMPUTING = 11
+    MULTIAGENT_CONTROL_COMPUTING = 12
 
 
 class MultiAgentNavigator(nav.Navigator):
@@ -714,10 +714,9 @@ class MultiAgentNavigator(nav.Navigator):
             self._abort_multi_to_idle()
             return
         if len(plan) < 4:
-            rospy.loginfo("MultiAgentNavigator: timed path too short; PARK to goal")
-            self.pose_controller.load_goal(self.x_g, self.y_g, self.theta_g)
-            self.heading_controller.load_goal(self.theta_g)
-            self.switch_mode(nav.Mode.PARK)
+            rospy.loginfo("MultiAgentNavigator: timed path too short; PARK_POSE to goal")
+            self._set_park_goal_from_traj(self._traj_endpoint_for_park(plan))
+            self._enter_park_pose()
             self._reset_timing_compute_state()
             self._multi_plan_id = ""
             self._multi_fleet_robot_ids = []
@@ -854,6 +853,8 @@ class MultiAgentNavigator(nav.Navigator):
             self.current_plan_duration,
             late_s,
         )
+
+        self._set_park_goal_from_traj(traj_new)
 
         self.th_init = plan_start_heading(planned_path, traj_new, v_min=0.05)
         self.heading_controller.load_goal(self.th_init)
@@ -1222,7 +1223,7 @@ class MultiAgentNavigator(nav.Navigator):
 
     @staticmethod
     def _is_multiagent_computing_mode(mode):
-        """True if ``mode`` is ``MultiagentComputingMode.MULTIAGENT_CONTROL_COMPUTING`` (value 11)."""
+        """True if ``mode`` is ``MultiagentComputingMode.MULTIAGENT_CONTROL_COMPUTING`` (value 12)."""
         return isinstance(mode, MultiagentComputingMode)
 
     def _path_from_unsmoothed_plan(self):
@@ -1396,7 +1397,7 @@ class MultiAgentNavigator(nav.Navigator):
                     list(self._multi_fleet_robot_ids),
                 )
             # Re-enter dwell + MULTI only when geometric replan produced a trackable plan.
-            if self.mode in (nav.Mode.ALIGN, nav.Mode.TRACK, nav.Mode.PARK):
+            if self.mode in (nav.Mode.ALIGN, nav.Mode.TRACK, nav.Mode.PARK_POSE, nav.Mode.PARK_HEADING):
                 traj = getattr(self, "current_plan", None)
                 plan = getattr(self, "unsmoothed_plan", None) or []
                 self.th_init = plan_start_heading(plan, traj, v_min=0.05)

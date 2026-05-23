@@ -152,12 +152,13 @@ class Mode(Enum):
     LOCALIZING2 = 2
     ALIGN = 3       # aligning to start heading of the path
     TRACK = 4       # tracking the path (following the trajectory)
-    PARK = 5       # parking the robot (moving to a specific pose)
-    BACKING = 6     # backing up when stuck
-    WAITING_FOR_INIT = 7
-    RELOCALIZING = 8
-    STOPPED_FOR_PERSON = 9
-    STOPPED_FOR_AGENT = 10
+    PARK_POSE = 5   # drive to final plan endpoint pose
+    PARK_HEADING = 6  # align to mission goal heading
+    BACKING = 7     # backing up when stuck
+    WAITING_FOR_INIT = 8
+    RELOCALIZING = 9
+    STOPPED_FOR_PERSON = 10
+    STOPPED_FOR_AGENT = 11
 
 class Navigator:
     """
@@ -255,10 +256,14 @@ class Navigator:
         )
 
         # threshold at which navigator switches from trajectory to pose control
-        self.near_thresh = 0.15
+        self.near_thresh = 0.35
         self.at_thresh = 0.01
         self.at_thresh_theta = 0.05
         self.theta_goal_thresh = 0.05
+        self.park_pose_at_thresh = 0.05
+        self.park_x = 0.0
+        self.park_y = 0.0
+        self.park_th = 0.0
 
         # trajectory smoothing
         self.spline_alpha = 0.15
@@ -286,7 +291,11 @@ class Navigator:
             self.kpx, self.kpy, self.kdx, self.kdy, self.v_max, self.om_max
         )
         self.pose_controller = PoseController(
-            0.0, 0.0, 0.0, self.v_max, self.om_max
+            rospy.get_param("~park_k1", 1.0),
+            rospy.get_param("~park_k2", 2.0),
+            rospy.get_param("~park_k3", 1.0),
+            self.v_max,
+            self.om_max,
         )
         self.heading_controller = HeadingController(self.om_max)
 
@@ -833,6 +842,36 @@ class Navigator:
             < self.near_thresh
         )
 
+    def _set_park_goal_from_traj(self, traj_new):
+        """Cache PARK_POSE target from the last sample of a smoothed trajectory."""
+        traj_new = np.asarray(traj_new)
+        self.park_x = float(traj_new[-1, 0])
+        self.park_y = float(traj_new[-1, 1])
+        self.park_th = float(traj_new[-1, 2])
+
+    def _traj_endpoint_for_park(self, planned_path):
+        """Return a trajectory array whose last row is the park pose goal."""
+        if len(planned_path) >= 4:
+            _, traj_new = compute_smoothed_traj(
+                planned_path, self.v_des, self.spline_deg, self.spline_alpha, self.traj_dt
+            )
+            return traj_new
+        th = plan_start_heading(planned_path, None)
+        p = planned_path[-1]
+        return np.array([[float(p[0]), float(p[1]), th, 0.0, 0.0, 0.0, 0.0]])
+
+    def at_park_pose(self):
+        """True when position is close enough to the plan endpoint park target."""
+        return (
+            linalg.norm(np.array([self.x - self.park_x, self.y - self.park_y]))
+            < self.park_pose_at_thresh
+        )
+
+    def _enter_park_pose(self):
+        """Start PARK_POSE toward the cached plan endpoint."""
+        self.pose_controller.load_goal(self.park_x, self.park_y, self.park_th)
+        self.switch_mode(Mode.PARK_POSE)
+
     def at_goal(self):
         """
         returns whether the robot has reached the goal position with enough
@@ -1173,7 +1212,7 @@ class Navigator:
             sets self.current_plan_start_time
             sets mode to ALIGN
         else:
-            sets mode to PARK
+            sets mode to PARK_POSE or ALIGN/TRACK
         """
         # Make sure we have a map
         if not self.occupancy:
@@ -1279,9 +1318,8 @@ class Navigator:
             return
         elif len(planned_path) < 4:
             rospy.loginfo("Path too short to track")
-            self.pose_controller.load_goal(self.x_g, self.y_g, self.theta_g)
-            self.heading_controller.load_goal(self.theta_g)
-            self.switch_mode(Mode.PARK)
+            # self._set_park_goal_from_traj(self._traj_endpoint_for_park(planned_path))
+            self._enter_park_pose()
             return
 
         # Smooth and generate a trajectory
@@ -1301,6 +1339,8 @@ class Navigator:
 
         self.current_plan_start_time = rospy.get_rostime()
         self.current_plan_duration = t_new[-1]
+
+        self._set_park_goal_from_traj(traj_new)
 
         self.th_init = plan_start_heading(planned_path, traj_new, v_min=0.05)
         self.heading_controller.load_goal(self.th_init)
@@ -1346,7 +1386,11 @@ class Navigator:
         """
         t = self.get_current_plan_time()
 
-        if self.mode == Mode.PARK:
+        if self.mode == Mode.PARK_POSE:
+            V, om = self.pose_controller.compute_control(
+                self.x, self.y, self.theta, t
+            )
+        elif self.mode == Mode.PARK_HEADING:
             V, om = self.heading_controller.compute_control(
                 self.theta, t, prev_om=self.prev_om
             )
@@ -1484,10 +1528,7 @@ class Navigator:
             elif self.mode == Mode.TRACK:
                 current_time = rospy.get_rostime().to_sec()
                 if self.near_goal():
-                    # We are close to goal ---> Switch to pose controller
-                    self.heading_controller.load_goal(self.theta_g)
-                    print("Setting theta goal to", self.theta_g)
-                    self.switch_mode(Mode.PARK)                
+                    self._enter_park_pose()
                 elif(not self.path_still_valid(self.current_plan)):
                     # Path no longer valid ---> replan
                     rospy.loginfo("replanning because path is no longer valid")
@@ -1554,12 +1595,16 @@ class Navigator:
                         self.switch_mode(Mode.IDLE)
                         self.replan()  # we aren't near the goal but we thought we should have been, so replan
                     else:
-                        self.heading_controller.load_goal(self.theta_g)
                         rospy.loginfo("Navigator: Going to park because out of time and near goal")
-                        self.switch_mode(Mode.PARK)                
-                    
-            elif self.mode == Mode.PARK:
-                # Reached goal: forget goal coordinates and stop
+                        self._enter_park_pose()
+
+            elif self.mode == Mode.PARK_POSE:
+                if self.at_park_pose():
+                    self.heading_controller.load_goal(self.theta_g)
+                    self.switch_mode(Mode.PARK_HEADING)
+                    rospy.loginfo("Navigator: park pose reached, aligning final heading")
+
+            elif self.mode == Mode.PARK_HEADING:
                 if self.aligned_goal():
                     self.x_g = None
                     self.y_g = None
