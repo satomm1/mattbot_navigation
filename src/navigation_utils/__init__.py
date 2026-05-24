@@ -16,17 +16,9 @@ def plan_start_heading(unsmoothed_plan, traj_new, v_min=0.05):
     """
     Heading target for ALIGN before TRACK.
 
-    Prefer bearing of the first geometric path segment (matches grid plan intent).
-    If that segment is degenerate, use the first spline sample with speed >= v_min,
-    then fall back to traj_new[0, 2].
+    Prefer atan2(yd, xd) from the smoothed trajectory (matches TRACK departure).
+    Fall back to the first grid segment bearing, then traj_new[0, 2].
     """
-    plan = unsmoothed_plan
-    if plan is not None and len(plan) >= 2:
-        dx = float(plan[1][0]) - float(plan[0][0])
-        dy = float(plan[1][1]) - float(plan[0][1])
-        if dx * dx + dy * dy >= 1e-8:
-            return float(np.arctan2(dy, dx))
-
     if traj_new is not None and len(traj_new) > 0:
         traj_new = np.asarray(traj_new)
         if traj_new.ndim == 2 and traj_new.shape[1] >= 5:
@@ -37,6 +29,14 @@ def plan_start_heading(unsmoothed_plan, traj_new, v_min=0.05):
                     return float(np.arctan2(yd, xd))
         if traj_new.ndim == 2 and traj_new.shape[1] >= 3:
             return float(traj_new[0, 2])
+
+    plan = unsmoothed_plan
+    if plan is not None and len(plan) >= 2:
+        dx = float(plan[1][0]) - float(plan[0][0])
+        dy = float(plan[1][1]) - float(plan[0][1])
+        if dx * dx + dy * dy >= 1e-8:
+            return float(np.arctan2(dy, dx))
+
     return 0.0
 
 
@@ -127,4 +127,3 @@ def compute_trajectory_from_timed_waypoints(path, t_waypoints, k, alpha, dt):
     theta_d = np.arctan2(yd_d, xd_d)
     traj_smoothed = np.stack([x_d, y_d, theta_d, xd_d, yd_d, xdd_d, ydd_d]).transpose()
     return t_smoothed, traj_smoothed
-
