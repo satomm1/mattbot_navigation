@@ -36,34 +36,43 @@ class TrajectoryTracker:
         self.traj_times = times
         self.traj = traj
 
-    def _soft_start_scale(self, t):
-        """Smoothstep 0→1 over the first soft_start_sec of tracking."""
+    def _reference_time(self, t):
+        """
+        Map wall-clock track time to spline sample time.
+
+        During soft start, reference time integrates the smoothstep speed scale so
+        position/velocity stay consistent and the tracker does not fall behind then
+        surge to catch up. After soft start, reference time trails wall clock by
+        half of soft_start_sec (the lag accumulated during the ramp).
+        """
         T = self.soft_start_sec
+        t = max(0.0, float(t))
         if T <= 0.0:
-            return 1.0
-        u = float(np.clip(t / T, 0.0, 1.0))
-        return 3.0 * u * u - 2.0 * u * u * u
+            return t
+        if t <= T:
+            u = t / T
+            # integral_0^u (3s^2 - 2s^3) ds = u^3 - u^4/2
+            return T * (u * u * u - 0.5 * u * u * u * u)
+        return t - 0.5 * T
 
     def get_desired_state(self, t):
         """
         Input:
-            t: Current time
+            t: Current wall-clock time since TRACK began
         Output:
             x_d, xd_d, xdd_d, y_d, yd_d, ydd_d: Desired state and derivatives
-                at time t according to self.coeffs
+                at reference time on the loaded trajectory
         """
-        x_d = np.interp(t, self.traj_times, self.traj[:, 0])
-        y_d = np.interp(t, self.traj_times, self.traj[:, 1])
-        xd_d = np.interp(t, self.traj_times, self.traj[:, 3])
-        yd_d = np.interp(t, self.traj_times, self.traj[:, 4])
-        xdd_d = np.interp(t, self.traj_times, self.traj[:, 5])
-        ydd_d = np.interp(t, self.traj_times, self.traj[:, 6])
+        t_ref = self._reference_time(t)
+        if len(self.traj_times) > 0:
+            t_ref = min(t_ref, float(self.traj_times[-1]))
 
-        scale = self._soft_start_scale(t)
-        xd_d *= scale
-        yd_d *= scale
-        xdd_d *= scale
-        ydd_d *= scale
+        x_d = np.interp(t_ref, self.traj_times, self.traj[:, 0])
+        y_d = np.interp(t_ref, self.traj_times, self.traj[:, 1])
+        xd_d = np.interp(t_ref, self.traj_times, self.traj[:, 3])
+        yd_d = np.interp(t_ref, self.traj_times, self.traj[:, 4])
+        xdd_d = np.interp(t_ref, self.traj_times, self.traj[:, 5])
+        ydd_d = np.interp(t_ref, self.traj_times, self.traj[:, 6])
 
         return x_d, xd_d, xdd_d, y_d, yd_d, ydd_d
 
@@ -120,7 +129,9 @@ class TrajectoryTracker:
         om = np.clip(om, -self.om_max, self.om_max)
 
         # If near the end of the trajectory, slow down so we don't stop abruptly
-        x_goal, _, _, y_goal, _, _ = self.get_desired_state(self.traj_times[-1])
+        t_end = float(self.traj_times[-1])
+        x_goal = np.interp(t_end, self.traj_times, self.traj[:, 0])
+        y_goal = np.interp(t_end, self.traj_times, self.traj[:, 1])
         dist = np.sqrt((x - x_goal) ** 2 + (y - y_goal) ** 2)
         if dist < 1:
             new_V_max = 0.25+0.25*dist # Slow down linearly starting at 0.5V_max to 0.25V_max
