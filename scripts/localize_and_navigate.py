@@ -251,6 +251,8 @@ class Navigator:
 
         self.v_des = rospy.get_param('/cruising_velocity', 0.35) # desired cruising velocity
         self.theta_start_thresh = 0.05  # threshold in theta to start moving forward when path-following
+        self.post_align_pause_sec = rospy.get_param('~post_align_pause_sec', 1.0)
+        self._aligned_since = None  # wall time when post-align dwell started (before TRACK)
         self.start_pos_thresh = (
             0.2  # threshold to be far enough into the plan to recompute it
         )
@@ -287,8 +289,12 @@ class Navigator:
         self.z_rand = rospy.get_param('/z_rand', 0.05)
         self.sigma_hit = rospy.get_param('/sigma_hit', 0.01)
 
+        self.track_accel_max = rospy.get_param('~track_accel_max', 0.3)
+        self.track_soft_start_sec = rospy.get_param('~track_soft_start_sec', 1.5)
         self.traj_controller = TrajectoryTracker(
-            self.kpx, self.kpy, self.kdx, self.kdy, self.v_max, self.om_max
+            self.kpx, self.kpy, self.kdx, self.kdy, self.v_max, self.om_max,
+            a_max=self.track_accel_max,
+            soft_start_sec=self.track_soft_start_sec,
         )
         self.pose_controller = PoseController(
             rospy.get_param("~park_k1", 1.0),
@@ -815,14 +821,26 @@ class Navigator:
                 self.backing_for_waypoints = True
                 self.switch_mode(Mode.BACKING)
 
+    def _heading_align_error(self):
+        return abs(wrapToPi(self.theta - self.th_init))
+
+    def _post_align_pause_elapsed(self):
+        if self._aligned_since is None:
+            return 0.0
+        return (rospy.get_rostime() - self._aligned_since).to_sec()
+
+    def _in_post_align_pause(self):
+        """True while the post-align dwell timer is running (before TRACK)."""
+        if self._aligned_since is None:
+            return False
+        return self._post_align_pause_elapsed() < self.post_align_pause_sec
+
     def aligned(self):
         """
         returns whether robot is aligned with starting direction of path
         (enough to switch to tracking controller)
         """
-        return (
-            abs(wrapToPi(self.theta - self.th_init)) < self.theta_start_thresh
-        )
+        return self._heading_align_error() < self.theta_start_thresh
 
     def aligned_goal(self):
         """
@@ -917,6 +935,8 @@ class Navigator:
 
     def switch_mode(self, new_mode):
         rospy.loginfo("Switching from %s -> %s", self.mode, new_mode)
+        if self.mode == Mode.ALIGN and new_mode != Mode.ALIGN:
+            self._aligned_since = None
         self.mode = new_mode
         self.state_pub.publish(self.mode.value)
 
@@ -1376,8 +1396,12 @@ class Navigator:
             self.switch_mode(Mode.ALIGN)
             return
         else:
-            rospy.loginfo("Ready to track")
-            self.switch_mode(Mode.TRACK)
+            rospy.loginfo(
+                "Already aligned; pausing %.1fs before TRACK", self.post_align_pause_sec
+            )
+            self._aligned_since = rospy.get_rostime()
+            self.switch_mode(Mode.ALIGN)
+            return
 
     def publish_control(self):
         """
@@ -1402,9 +1426,12 @@ class Navigator:
             # Check if we need to modify the velocity for a person
             V, om = self.modify_velocity_for_person(V, om)
         elif self.mode == Mode.ALIGN:
-            V, om = self.heading_controller.compute_control(
-                self.theta, t, prev_om=self.prev_om
-            )
+            if self._in_post_align_pause():
+                V, om = 0.0, 0.0
+            else:
+                V, om = self.heading_controller.compute_control(
+                    self.theta, t, prev_om=self.prev_om
+                )
         elif self.mode == Mode.BACKING:
             V = -0.3
             om = 0.0
@@ -1522,9 +1549,17 @@ class Navigator:
                     print("Updated AMCL parameters for better localization after initial pose.")
 
             elif self.mode == Mode.ALIGN:
-                if self.aligned():
-                    self.current_plan_start_time = rospy.get_rostime()
-                    self.switch_mode(Mode.TRACK)
+                if self._aligned_since is not None:
+                    if self._post_align_pause_elapsed() >= self.post_align_pause_sec:
+                        self._aligned_since = None
+                        self.current_plan_start_time = rospy.get_rostime()
+                        self.switch_mode(Mode.TRACK)
+                elif self.aligned():
+                    self._aligned_since = rospy.get_rostime()
+                    rospy.loginfo(
+                        "Aligned; pausing %.1fs before TRACK",
+                        self.post_align_pause_sec,
+                    )
             elif self.mode == Mode.TRACK:
                 current_time = rospy.get_rostime().to_sec()
                 if self.near_goal():
