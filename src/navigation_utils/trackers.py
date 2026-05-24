@@ -1,6 +1,6 @@
 import numpy as np
 
-V_PREV_THRES = 0.0001
+V_EPS = 0.05  # minimum |V| for curvature (om) division at standstill
 
 def wrapToPi(a):
     if isinstance(a, list):
@@ -11,7 +11,7 @@ class TrajectoryTracker:
     """ Trajectory tracking controller using differential flatness """
 
     def __init__(self, kpx, kpy, kdx, kdy,
-                 V_max=0.6, om_max=1):
+                 V_max=0.6, om_max=1, a_max=0.3, soft_start_sec=1.5):
         self.kpx = kpx
         self.kpy = kpy
         self.kdx = kdx
@@ -19,6 +19,8 @@ class TrajectoryTracker:
 
         self.V_max = V_max
         self.om_max = om_max
+        self.a_max = a_max
+        self.soft_start_sec = float(soft_start_sec)
 
         self.coeffs = np.zeros(8)  # Polynomial coefficients for x(t) and y(t) as
         # returned by the differential flatness code
@@ -33,6 +35,14 @@ class TrajectoryTracker:
         self.reset()
         self.traj_times = times
         self.traj = traj
+
+    def _soft_start_scale(self, t):
+        """Smoothstep 0→1 over the first soft_start_sec of tracking."""
+        T = self.soft_start_sec
+        if T <= 0.0:
+            return 1.0
+        u = float(np.clip(t / T, 0.0, 1.0))
+        return 3.0 * u * u - 2.0 * u * u * u
 
     def get_desired_state(self, t):
         """
@@ -49,7 +59,33 @@ class TrajectoryTracker:
         xdd_d = np.interp(t, self.traj_times, self.traj[:, 5])
         ydd_d = np.interp(t, self.traj_times, self.traj[:, 6])
 
+        scale = self._soft_start_scale(t)
+        xd_d *= scale
+        yd_d *= scale
+        xdd_d *= scale
+        ydd_d *= scale
+
         return x_d, xd_d, xdd_d, y_d, yd_d, ydd_d
+
+    def _V_for_om(self, V):
+        """Avoid division by zero in om; do not jump commanded speed."""
+        if abs(V) >= V_EPS:
+            return V
+        return V_EPS if V >= 0.0 else -V_EPS
+
+    def _apply_accel_slew(self, V_cmd, V_prev, dt):
+        """Limit rate of increase of |V|; deceleration is not slew-limited."""
+        if dt <= 0.0:
+            return V_prev
+
+        if abs(V_cmd) <= abs(V_prev) + 1e-9:
+            return V_cmd
+
+        if np.sign(V_cmd) == np.sign(V_prev) or abs(V_prev) < 1e-3:
+            V_mag = min(abs(V_cmd), abs(V_prev) + self.a_max * dt)
+            return np.sign(V_cmd) * V_mag
+
+        return V_cmd
 
     def compute_control(self, x, y, th, t):
         """
@@ -60,12 +96,11 @@ class TrajectoryTracker:
             V, om: Control actions
         """
 
-        dt = t - self.t_prev
+        dt = max(t - self.t_prev, 0.0)
         x_d, xd_d, xdd_d, y_d, yd_d, ydd_d = self.get_desired_state(t)
 
         ########## Code starts here ##########
-        if self.V_prev < V_PREV_THRES:
-            self.V_prev = np.sqrt(xd_d ** 2 + yd_d ** 2)
+        V_div = self._V_for_om(self.V_prev)
 
         x_dot = self.V_prev * np.cos(th)
         y_dot = self.V_prev * np.sin(th)
@@ -74,9 +109,10 @@ class TrajectoryTracker:
         u2 = ydd_d + self.kpy * (y_d - y) + self.kdy * (yd_d - y_dot)
 
         a = u1 * np.cos(th) + u2 * np.sin(th)
-        om = -u1 * np.sin(th) / self.V_prev + u2 * np.cos(th) / self.V_prev
+        om = (-u1 * np.sin(th) + u2 * np.cos(th)) / V_div
 
-        V = self.V_prev + a * dt
+        V = self.V_prev + a * dt if dt > 0.0 else self.V_prev
+        V = self._apply_accel_slew(V, self.V_prev, dt)
         ########## Code ends here ##########
 
         # apply control limits
