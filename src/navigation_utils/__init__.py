@@ -234,56 +234,116 @@ def compute_smoothed_traj(path, V_des, k, alpha, dt,
     return t_smoothed, traj_smoothed
 
 
-def compute_trajectory_from_timed_waypoints(path, t_waypoints, k, alpha, dt,
-                                            corner_aware=True, corner_min_turn_deg=45.0,
-                                            corner_inset_m=0.10, corner_points_per_leg=3):
-    """
-    Like compute_smoothed_traj, but knot times in the time domain are given by t_waypoints
-    (e.g. from a multi-agent timing MILP). path[i] is visited at time t_waypoints[i].
+def _cumulative_arc_length_xy(xy):
+    """Cumulative Euclidean arc length along rows of an Nx2 polyline (length N)."""
+    xy = np.asarray(xy, dtype=float)
+    if xy.ndim != 2 or xy.shape[1] != 2:
+        raise ValueError("xy must be Nx2")
+    if xy.shape[0] < 1:
+        return np.zeros(0, dtype=float)
+    if xy.shape[0] == 1:
+        return np.zeros(1, dtype=float)
+    seg = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+    return np.concatenate([[0.0], np.cumsum(seg)])
 
-    path: sequence of (x, y), length N
-    t_waypoints: length-N monotone non-decreasing times; typically t[0] == 0
-    k, alpha, dt: same meaning as compute_smoothed_traj (splrep degree, smoothing, sample step)
-    Returns:
-        t_smoothed, traj_smoothed (N,7) as compute_smoothed_traj
+
+def _enforce_monotone_waypoint_times(t_waypoints, eps=1e-4):
+    """Force t[0]==0 and strictly non-decreasing knot times (for MILP schedules)."""
+    t = np.asarray(t_waypoints, dtype=float).copy().reshape(-1)
+    if t.size == 0:
+        return t
+    t[0] = 0.0
+    for i in range(1, len(t)):
+        if t[i] <= t[i - 1]:
+            t[i] = t[i - 1] + eps
+    return t
+
+
+def _prepare_timed_path_and_schedule(path, t_waypoints, corner_aware, corner_min_turn_deg,
+                                     corner_inset_m, corner_points_per_leg):
     """
-    assert path and k > 2 and k < len(path)
+    Corner-densify path (same as compute_smoothed_traj) and build arc-length + time schedules.
+
+    Returns (path, t_wp, s_wp) with len(t_wp)==len(s_wp)==len(path).
+    """
     path = np.asarray(path, dtype=float)
+    t_wp = np.asarray(t_waypoints, dtype=float).reshape(-1)
     if corner_aware and path.shape[0] >= 3:
-        path, t_waypoints = insert_corner_interpolation_points(
+        path, t_wp = insert_corner_interpolation_points(
             path,
             min_turn_deg=corner_min_turn_deg,
             inset_m=corner_inset_m,
             points_per_leg=corner_points_per_leg,
-            t_waypoints=t_waypoints,
+            t_waypoints=t_wp,
         )
     if path.ndim != 2 or path.shape[1] != 2:
         raise ValueError("path must be Nx2")
-    t = np.asarray(t_waypoints, dtype=float).copy().reshape(-1)
-    if t.shape[0] != path.shape[0]:
+    if t_wp.shape[0] != path.shape[0]:
         raise ValueError("t_waypoints must have same length as path")
-    t[0] = 0.0
-    eps = 1e-4
-    for i in range(1, len(t)):
-        if t[i] <= t[i - 1]:
-            t[i] = t[i - 1] + eps
-    t_end = float(t[-1])
-    if t_end <= 0.0:
+    t_wp = _enforce_monotone_waypoint_times(t_wp)
+    s_wp = _cumulative_arc_length_xy(path)
+    if float(s_wp[-1]) <= 0.0:
+        raise ValueError("timed path must have positive arc length")
+    if float(t_wp[-1]) <= 0.0:
         raise ValueError("timed path must have positive duration (last t > 0)")
+    return path, t_wp, s_wp
 
-    tck_x = scipy.interpolate.splrep(t, path[:, 0], k=k, s=alpha)
-    tck_y = scipy.interpolate.splrep(t, path[:, 1], k=k, s=alpha)
+
+def compute_trajectory_from_timed_waypoints(path, t_waypoints, k, alpha, dt,
+                                            corner_aware=True, corner_min_turn_deg=45.0,
+                                            corner_inset_m=0.10, corner_points_per_leg=3):
+    """
+    Build a wall-clock trajectory from a grid path and per-waypoint arrival times (e.g. MILP).
+
+    Geometry and timing are decoupled:
+      - Spatial path x(s), y(s) is a cubic spline in **arc length** s (same corner densification
+        and splrep settings as compute_smoothed_traj).
+      - Schedule s(t) is piecewise-linear between (t_waypoints[i], s_i). Long MILP waits become
+        slow forward motion or hold along the same curve, not spatial loops.
+
+    Single-robot navigation should keep using compute_smoothed_traj (distance-based knot times).
+
+    path: sequence of (x, y), length N
+    t_waypoints: length-N monotone non-decreasing times; typically t[0] == 0
+    k, alpha, dt: same meaning as compute_smoothed_traj
+    Returns:
+        t_smoothed, traj_smoothed (N,7) compatible with TrajectoryTracker.load_traj
+    """
+    assert path and k > 2 and k < len(path)
+    path, t_wp, s_wp = _prepare_timed_path_and_schedule(
+        path,
+        t_waypoints,
+        corner_aware,
+        corner_min_turn_deg,
+        corner_inset_m,
+        corner_points_per_leg,
+    )
+    t_end = float(t_wp[-1])
+
+    # Geometry: splrep in arc length (not wall-clock MILP times).
+    tck_x = scipy.interpolate.splrep(s_wp, path[:, 0], k=k, s=alpha)
+    tck_y = scipy.interpolate.splrep(s_wp, path[:, 1], k=k, s=alpha)
 
     t_smoothed = np.arange(0.0, t_end, float(dt))
     if t_smoothed.size == 0 or t_smoothed[-1] < t_end - 1e-9:
         t_smoothed = np.append(t_smoothed, t_end)
 
-    x_d = scipy.interpolate.splev(t_smoothed, tck_x, der=0)
-    y_d = scipy.interpolate.splev(t_smoothed, tck_y, der=0)
-    xd_d = scipy.interpolate.splev(t_smoothed, tck_x, der=1)
-    yd_d = scipy.interpolate.splev(t_smoothed, tck_y, der=1)
-    xdd_d = scipy.interpolate.splev(t_smoothed, tck_x, der=2)
-    ydd_d = scipy.interpolate.splev(t_smoothed, tck_y, der=2)
+    # Schedule s(t) from MILP waypoint times; hold/slow segments when delta t >> delta s.
+    s_ref = np.interp(t_smoothed, t_wp, s_wp)
+    ds_dt = np.gradient(s_ref, t_smoothed)
+    d2s_dt2 = np.gradient(ds_dt, t_smoothed)
+
+    dx_ds = scipy.interpolate.splev(s_ref, tck_x, der=1)
+    dy_ds = scipy.interpolate.splev(s_ref, tck_y, der=1)
+    d2x_ds2 = scipy.interpolate.splev(s_ref, tck_x, der=2)
+    d2y_ds2 = scipy.interpolate.splev(s_ref, tck_y, der=2)
+
+    x_d = scipy.interpolate.splev(s_ref, tck_x, der=0)
+    y_d = scipy.interpolate.splev(s_ref, tck_y, der=0)
+    xd_d = dx_ds * ds_dt
+    yd_d = dy_ds * ds_dt
+    xdd_d = d2x_ds2 * (ds_dt ** 2) + dx_ds * d2s_dt2
+    ydd_d = d2y_ds2 * (ds_dt ** 2) + dy_ds * d2s_dt2
     theta_d = np.arctan2(yd_d, xd_d)
     traj_smoothed = np.stack([x_d, y_d, theta_d, xd_d, yd_d, xdd_d, ydd_d]).transpose()
     return t_smoothed, traj_smoothed
