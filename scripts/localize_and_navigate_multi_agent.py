@@ -682,6 +682,51 @@ class MultiAgentNavigator(nav_impl.Navigator):
             len(rows[ego_k]),
         )
 
+    def _log_waypoint_arrival_schedule(self, plan, t_wp, label="timing"):
+        """Log MILP/analytic arrival time and map location for each grid waypoint (debug)."""
+        plan = plan or []
+        t_wp = np.asarray(t_wp, dtype=float).reshape(-1)
+        if len(plan) != len(t_wp):
+            rospy.logwarn(
+                "MultiAgentNavigator: %s schedule len mismatch plan=%d times=%d",
+                label,
+                len(plan),
+                len(t_wp),
+            )
+            return
+        rospy.loginfo(
+            "MultiAgentNavigator: waypoint arrival schedule (%s) plan_id=%s robot=%s n=%d duration=%.3fs",
+            label,
+            self._multi_plan_id or "?",
+            int(self.my_id),
+            len(plan),
+            float(t_wp[-1]) if len(t_wp) else 0.0,
+        )
+        v_max = float(self._multi_agent_max_velocity)
+        for i, (state, t_arr) in enumerate(zip(plan, t_wp)):
+            x = float(state[0])
+            y = float(state[1])
+            dt_seg = float(t_wp[i] - t_wp[i - 1]) if i > 0 else 0.0
+            ds_seg = 0.0
+            if i > 0:
+                ds_seg = float(
+                    np.hypot(x - float(plan[i - 1][0]), y - float(plan[i - 1][1]))
+                )
+            min_dt = ds_seg / v_max if v_max > 1e-6 else 0.0
+            extra = ""
+            if i > 0 and dt_seg > min_dt + 0.5:
+                extra = "  WAIT+{:.2f}s".format(dt_seg - min_dt)
+            rospy.loginfo(
+                "  wp[%3d] t=%8.3fs  (%.3f, %.3f)  dseg=%.3fm  dt=%.3fs%s",
+                i,
+                float(t_arr),
+                x,
+                y,
+                ds_seg,
+                dt_seg,
+                extra,
+            )
+
     def _maybe_arm_timed_trajectory(self):
         """After timing solve: build spline from ``unsmoothed_plan`` + per-waypoint times; arm for execute_at.
 
@@ -713,6 +758,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
             )
             self._abort_multi_to_idle()
             return
+        self._log_waypoint_arrival_schedule(plan, t_wp, label="arm")
         if len(plan) < 4:
             rospy.loginfo("MultiAgentNavigator: timed path too short; PARK_POSE to goal")
             self._set_park_goal_from_traj(self._traj_endpoint_for_park(plan))
