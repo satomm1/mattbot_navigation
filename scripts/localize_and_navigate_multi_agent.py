@@ -726,7 +726,8 @@ class MultiAgentNavigator(nav.Navigator):
             return
         try:
             t_new, traj_new = compute_trajectory_from_timed_waypoints(
-                plan, t_wp, self.spline_deg, self.spline_alpha, self.traj_dt
+                plan, t_wp, self.spline_deg, self.spline_alpha, self.traj_dt,
+                **self._corner_smooth_kwargs(),
             )
         except Exception as exc:
             rospy.logerr("MultiAgentNavigator: timed trajectory build failed: %s", exc)

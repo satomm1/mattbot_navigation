@@ -271,6 +271,10 @@ class Navigator:
         self.spline_alpha = 0.15
         self.spline_deg = 3  # cubic spline
         self.traj_dt = 0.1
+        self.corner_aware_smoothing = rospy.get_param('~corner_aware_smoothing', True)
+        self.corner_min_turn_deg = rospy.get_param('~corner_min_turn_deg', 45.0)
+        self.corner_inset_m = rospy.get_param('~corner_inset_m', 0.10)
+        self.corner_points_per_leg = rospy.get_param('~corner_points_per_leg', 3)
 
         # trajectory tracking controller parameters
         self.kpx = rospy.get_param('/kpx', 2)
@@ -623,6 +627,7 @@ class Navigator:
                 self.map_probs,
                 wall_distance_cache_path=wall_distance_cache
             )
+            self._init_dynamic_occupancy_grids()
 
             if self.frequent is None:  # Don't load the graph every time
                 # Get Heat Map File Name Prefix
@@ -701,40 +706,42 @@ class Navigator:
                         "Heatmap file %s not found, skipping loading frequent subgraph.",
                         heatmap_name,
                     )
-            
-            if self.object_occupancy is None:
-                self.object_occupancy = StochOccupancyGrid2D(
-                    self.map_resolution,
-                    self.map_width,
-                    self.map_height,
-                    self.map_origin[0],
-                    self.map_origin[1],
-                    5,
-                    np.zeros((self.map_width * self.map_height,)),  # initialize with zeros
-                )
 
-            if self.person_occupancy is None:
-                self.person_occupancy = StochOccupancyGrid2D(
-                    self.map_resolution,
-                    self.map_width,
-                    self.map_height,
-                    self.map_origin[0],
-                    self.map_origin[1],
-                    5,
-                    np.zeros((self.map_width * self.map_height,)),  # initialize with zeros     
-                )
-
-                self.object_near_occupancy = StochOccupancyGrid2D(
-                    self.map_resolution,
-                    self.map_width,
-                    self.map_height,
-                    self.map_origin[0],
-                    self.map_origin[1],
-                    5,
-                    np.zeros((self.map_width * self.map_height,)),  # initialize with zeros     
-                )
-
-                
+    def _init_dynamic_occupancy_grids(self):
+        """Initialize stochastic layers for dynamic obstacle checks."""
+        if self.map_width <= 0 or self.map_height <= 0:
+            return
+        empty = np.zeros((self.map_width * self.map_height,))
+        if self.object_occupancy is None:
+            self.object_occupancy = StochOccupancyGrid2D(
+                self.map_resolution,
+                self.map_width,
+                self.map_height,
+                self.map_origin[0],
+                self.map_origin[1],
+                5,
+                empty,
+            )
+        if self.person_occupancy is None:
+            self.person_occupancy = StochOccupancyGrid2D(
+                self.map_resolution,
+                self.map_width,
+                self.map_height,
+                self.map_origin[0],
+                self.map_origin[1],
+                5,
+                empty,
+            )
+        if self.object_near_occupancy is None:
+            self.object_near_occupancy = StochOccupancyGrid2D(
+                self.map_resolution,
+                self.map_width,
+                self.map_height,
+                self.map_origin[0],
+                self.map_origin[1],
+                5,
+                empty,
+            )
 
     def object_map_callback(self, msg):
         if (
@@ -867,12 +874,28 @@ class Navigator:
         self.park_y = float(traj_new[-1, 1])
         self.park_th = float(traj_new[-1, 2])
 
+    def _compute_smoothed_traj(self, planned_path):
+        return compute_smoothed_traj(
+            planned_path,
+            self.v_des,
+            self.spline_deg,
+            self.spline_alpha,
+            self.traj_dt,
+            **self._corner_smooth_kwargs(),
+        )
+
+    def _corner_smooth_kwargs(self):
+        return {
+            "corner_aware": self.corner_aware_smoothing,
+            "corner_min_turn_deg": self.corner_min_turn_deg,
+            "corner_inset_m": self.corner_inset_m,
+            "corner_points_per_leg": self.corner_points_per_leg,
+        }
+
     def _traj_endpoint_for_park(self, planned_path):
         """Return a trajectory array whose last row is the park pose goal."""
         if len(planned_path) >= 4:
-            _, traj_new = compute_smoothed_traj(
-                planned_path, self.v_des, self.spline_deg, self.spline_alpha, self.traj_dt
-            )
+            _, traj_new = self._compute_smoothed_traj(planned_path)
             return traj_new
         th = plan_start_heading(planned_path, None)
         p = planned_path[-1]
@@ -1182,8 +1205,14 @@ class Navigator:
             return False
     
     def path_still_valid(self, path):
+        if path is None or len(path) == 0:
+            return True
+        self._init_dynamic_occupancy_grids()
+        if self.object_occupancy is None:
+            return True
         for point in path:
-            if not self.object_occupancy.is_free(point):
+            xy = np.asarray(point, dtype=float).reshape(-1)[:2]
+            if not self.object_occupancy.is_free(xy):
                 print("Path no longer valid...")
                 return False
         return True
@@ -1343,9 +1372,7 @@ class Navigator:
             return
 
         # Smooth and generate a trajectory
-        t_new, traj_new = compute_smoothed_traj(
-            planned_path, self.v_des, self.spline_deg, self.spline_alpha, self.traj_dt
-        )
+        t_new, traj_new = self._compute_smoothed_traj(planned_path)
 
         # Publish the new plan
         self.publish_planned_path(planned_path, self.nav_planned_path_pub)
