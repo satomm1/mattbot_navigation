@@ -92,7 +92,7 @@ def _load_localize_and_navigate():
     return mod
 
 
-nav = _load_localize_and_navigate()
+nav_impl = _load_localize_and_navigate()
 
 
 class MultiagentComputingMode(IntEnum):
@@ -105,7 +105,7 @@ class MultiagentComputingMode(IntEnum):
     MULTIAGENT_CONTROL_COMPUTING = 12
 
 
-class MultiAgentNavigator(nav.Navigator):
+class MultiAgentNavigator(nav_impl.Navigator):
     """Adds multi-robot **timing** (waypoint times + execute_at) on top of the base geometric navigator.
 
     Read the module docstring for the full lifecycle. Key instance state:
@@ -329,15 +329,15 @@ class MultiAgentNavigator(nav.Navigator):
             rospy.logdebug("External goal is the same as current goal, ignoring")
             return
 
-        if self.mode == nav.Mode.WAITING_FOR_INIT or self.mode == nav.Mode.LOCALIZING:
+        if self.mode == nav_impl.Mode.WAITING_FOR_INIT or self.mode == nav_impl.Mode.LOCALIZING:
             return
 
-        if self.mode != nav.Mode.IDLE:
+        if self.mode != nav_impl.Mode.IDLE:
             cmd_vel = Twist()
             cmd_vel.linear.x = 0.0
             cmd_vel.angular.z = 0.0
             self.nav_vel_pub.publish(cmd_vel)
-            self.switch_mode(nav.Mode.IDLE)
+            self.switch_mode(nav_impl.Mode.IDLE)
 
         if self.occupancy is not None and not self.occupancy.is_free((msg.x, msg.y)):
             rospy.loginfo("Not a valid goal")
@@ -912,7 +912,7 @@ class MultiAgentNavigator(nav.Navigator):
                 "MultiAgentNavigator: timed plan commit while not aligned with start heading; TRACK anyway (pre-MULTI ALIGN should have handled this)"
             )
         rospy.loginfo("MultiAgentNavigator: timed plan -> TRACK")
-        self.switch_mode(nav.Mode.TRACK)
+        self.switch_mode(nav_impl.Mode.TRACK)
         if self._replan_as_multi_from_external_goal_multi:
             self._sticky_multi_timing_replan = True
             rospy.loginfo(
@@ -1034,7 +1034,7 @@ class MultiAgentNavigator(nav.Navigator):
         self._replan_as_multi_from_external_goal_multi = False
         self._peer_multi_planned_paths = {}
         self._reset_timing_compute_state()
-        self.switch_mode(nav.Mode.IDLE)
+        self.switch_mode(nav_impl.Mode.IDLE)
 
     def _try_simultaneous_plan_if_ready(self):
         """Coordinator-only entry: start exactly one timing worker when paths are ready.
@@ -1297,15 +1297,15 @@ class MultiAgentNavigator(nav.Navigator):
             rospy.logdebug("Multi external goal unchanged (pose + plan_id), ignoring")
             return
 
-        if self.mode == nav.Mode.WAITING_FOR_INIT or self.mode == nav.Mode.LOCALIZING:
+        if self.mode == nav_impl.Mode.WAITING_FOR_INIT or self.mode == nav_impl.Mode.LOCALIZING:
             return
 
-        if self.mode != nav.Mode.IDLE:
+        if self.mode != nav_impl.Mode.IDLE:
             cmd_vel = Twist()
             cmd_vel.linear.x = 0.0
             cmd_vel.angular.z = 0.0
             self.nav_vel_pub.publish(cmd_vel)
-            self.switch_mode(nav.Mode.IDLE)
+            self.switch_mode(nav_impl.Mode.IDLE)
 
         if self.occupancy is not None and not self.occupancy.is_free((g.x, g.y)):
             rospy.loginfo("Multi external goal: not a valid goal cell")
@@ -1398,7 +1398,7 @@ class MultiAgentNavigator(nav.Navigator):
                     list(self._multi_fleet_robot_ids),
                 )
             # Re-enter dwell + MULTI only when geometric replan produced a trackable plan.
-            if self.mode in (nav.Mode.ALIGN, nav.Mode.TRACK, nav.Mode.PARK_POSE, nav.Mode.PARK_HEADING):
+            if self.mode in (nav_impl.Mode.ALIGN, nav_impl.Mode.TRACK, nav_impl.Mode.PARK_POSE, nav_impl.Mode.PARK_HEADING):
                 traj = getattr(self, "current_plan", None)
                 plan = getattr(self, "unsmoothed_plan", None) or []
                 self.th_init = plan_start_heading(plan, traj, v_min=0.05)
@@ -1406,15 +1406,15 @@ class MultiAgentNavigator(nav.Navigator):
                 self._awaiting_pre_multi_align = True
                 self._pre_multi_align_started_at = rospy.Time.now()
                 # Parent replan() may already have switched IDLE->ALIGN for heading; avoid ALIGN->ALIGN log/noise.
-                if self.mode != nav.Mode.ALIGN:
-                    self.switch_mode(nav.Mode.ALIGN)
+                if self.mode != nav_impl.Mode.ALIGN:
+                    self.switch_mode(nav_impl.Mode.ALIGN)
                 rospy.logdebug(
                     "MultiAgentNavigator: pre-MULTI ALIGN dwell (plan_id=%s) policy=%s max_s=%.2f",
                     self._multi_plan_id,
                     self._pre_multi_align_exit_policy,
                     self._pre_multi_align_sec,
                 )
-            elif self.mode == nav.Mode.IDLE:
+            elif self.mode == nav_impl.Mode.IDLE:
                 # Parent planning failed: tear down multi mission state.
                 self._multi_plan_id = ""
                 self._multi_coordinated = False
@@ -1437,25 +1437,25 @@ class MultiAgentNavigator(nav.Navigator):
         # Goal reached: parent clears x_g/y_g/theta_g in PARK; drop sticky so next mission starts clean.
         if (
             self._sticky_multi_timing_replan
-            and self.mode == nav.Mode.IDLE
+            and self.mode == nav_impl.Mode.IDLE
             and self.x_g is None
             and self.y_g is None
             and self.theta_g is None
         ):
             self._sticky_multi_timing_replan = False
             self._replan_as_multi_from_external_goal_multi = False
-        if self._awaiting_pre_multi_align and self.mode != nav.Mode.ALIGN:
+        if self._awaiting_pre_multi_align and self.mode != nav_impl.Mode.ALIGN:
             rospy.logwarn_throttle(
                 5.0,
                 "MultiAgentNavigator: pre-MULTI align expected ALIGN but mode=%s; forcing ALIGN",
                 self.mode,
             )
-            self.switch_mode(nav.Mode.ALIGN)
+            self.switch_mode(nav_impl.Mode.ALIGN)
             super(MultiAgentNavigator, self).publish_control()
             return
 
         # Pre-MULTI ALIGN: stay in ALIGN until heading policy + max dwell satisfied, then enter MULTI.
-        if self._awaiting_pre_multi_align and self.mode == nav.Mode.ALIGN:
+        if self._awaiting_pre_multi_align and self.mode == nav_impl.Mode.ALIGN:
             if self._pre_multi_align_started_at is None:
                 self._pre_multi_align_started_at = rospy.Time.now()
             elapsed = (rospy.Time.now() - self._pre_multi_align_started_at).to_sec()
