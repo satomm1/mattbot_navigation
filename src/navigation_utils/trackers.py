@@ -11,7 +11,9 @@ class TrajectoryTracker:
     """ Trajectory tracking controller using differential flatness """
 
     def __init__(self, kpx, kpy, kdx, kdy,
-                 V_max=0.6, om_max=1, a_max=0.3, soft_start_sec=1.5):
+                 V_max=0.6, om_max=1, a_max=0.3, soft_start_sec=1.5,
+                 hold_enter_speed=0.03, hold_exit_speed=0.08,
+                 hold_pos_tol=0.08, hold_kp_pos=1.8, hold_kp_heading=2.5):
         self.kpx = kpx
         self.kpy = kpy
         self.kdx = kdx
@@ -21,6 +23,12 @@ class TrajectoryTracker:
         self.om_max = om_max
         self.a_max = a_max
         self.soft_start_sec = float(soft_start_sec)
+        self.hold_enter_speed = float(hold_enter_speed)
+        self.hold_exit_speed = float(hold_exit_speed)
+        self.hold_pos_tol = float(hold_pos_tol)
+        self.hold_kp_pos = float(hold_kp_pos)
+        self.hold_kp_heading = float(hold_kp_heading)
+        self._hold_active = False
 
         self.coeffs = np.zeros(8)  # Polynomial coefficients for x(t) and y(t) as
         # returned by the differential flatness code
@@ -29,6 +37,7 @@ class TrajectoryTracker:
         self.V_prev = 0.
         self.om_prev = 0.
         self.t_prev = 0.
+        self._hold_active = False
 
     def load_traj(self, times, traj):
         """ Loads in a new trajectory to follow, and resets the time """
@@ -107,22 +116,45 @@ class TrajectoryTracker:
 
         dt = max(t - self.t_prev, 0.0)
         x_d, xd_d, xdd_d, y_d, yd_d, ydd_d = self.get_desired_state(t)
+        v_ref = np.hypot(xd_d, yd_d)
 
-        ########## Code starts here ##########
-        V_div = self._V_for_om(self.V_prev)
+        # Hold-aware mode: for scheduled waits (near-zero reference speed), stop at the
+        # hold point instead of coasting through and later correcting with reverse motion.
+        if self._hold_active:
+            self._hold_active = v_ref < self.hold_exit_speed
+        else:
+            self._hold_active = v_ref < self.hold_enter_speed
 
-        x_dot = self.V_prev * np.cos(th)
-        y_dot = self.V_prev * np.sin(th)
+        if self._hold_active:
+            err_x = x_d - x
+            err_y = y_d - y
+            rho = np.hypot(err_x, err_y)
+            if rho <= self.hold_pos_tol:
+                V = 0.0
+                om = 0.0
+            else:
+                alpha = wrapToPi(np.arctan2(err_y, err_x) - th)
+                # Forward-only approach while holding; rotate in place if target is behind.
+                V_target = self.hold_kp_pos * rho * max(0.0, np.cos(alpha))
+                V_target = min(V_target, 0.35 * self.V_max)
+                om = self.hold_kp_heading * alpha
+                V = self._apply_accel_slew(V_target, self.V_prev, dt)
+        else:
+            ########## Code starts here ##########
+            V_div = self._V_for_om(self.V_prev)
 
-        u1 = xdd_d + self.kpx * (x_d - x) + self.kdx * (xd_d - x_dot)
-        u2 = ydd_d + self.kpy * (y_d - y) + self.kdy * (yd_d - y_dot)
+            x_dot = self.V_prev * np.cos(th)
+            y_dot = self.V_prev * np.sin(th)
 
-        a = u1 * np.cos(th) + u2 * np.sin(th)
-        om = (-u1 * np.sin(th) + u2 * np.cos(th)) / V_div
+            u1 = xdd_d + self.kpx * (x_d - x) + self.kdx * (xd_d - x_dot)
+            u2 = ydd_d + self.kpy * (y_d - y) + self.kdy * (yd_d - y_dot)
 
-        V = self.V_prev + a * dt if dt > 0.0 else self.V_prev
-        V = self._apply_accel_slew(V, self.V_prev, dt)
-        ########## Code ends here ##########
+            a = u1 * np.cos(th) + u2 * np.sin(th)
+            om = (-u1 * np.sin(th) + u2 * np.cos(th)) / V_div
+
+            V = self.V_prev + a * dt if dt > 0.0 else self.V_prev
+            V = self._apply_accel_slew(V, self.V_prev, dt)
+            ########## Code ends here ##########
 
         # apply control limits
         V = np.clip(V, -self.V_max, self.V_max)
