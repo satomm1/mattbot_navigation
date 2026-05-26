@@ -107,7 +107,9 @@ class Map:
         self.combined_map = OccupancyGrid()
         self.combined_map.header = self.map_msg.header
         self.combined_map.info = self.map_msg.info
-        self.combined_map_publisher = rospy.Publisher('/navigation_map', OccupancyGrid, queue_size=10)
+        self.combined_map_publisher = rospy.Publisher(
+            '/navigation_map', OccupancyGrid, queue_size=1, latch=True
+        )
         self.object_map_publisher = rospy.Publisher('/object_map', OccupancyGrid, queue_size=10)
 
         camera_info_msg = rospy.wait_for_message("/camera/color/camera_info", CameraInfo)
@@ -158,7 +160,43 @@ class Map:
         self.person_static_map = np.ones((self.height, self.width))*-1  # Map for tracking people
         self.person_moving_map = np.ones((self.height, self.width))*-1  # Map for tracking people
         self.person_dict = dict()  # Dictionary for tracking people
-        self.person_subscriber = rospy.Subscriber('/person', PersonArray, self.person_callback, queue_size=10) 
+        self.person_subscriber = rospy.Subscriber('/person', PersonArray, self.person_callback, queue_size=10)
+
+        # Baseline /navigation_map from static SLAM + mod layers so navigators do not depend
+        # on the first depth frame (which may be delayed or skipped).
+        self._publish_navigation_map()
+
+    def _build_combined_map_data(self, camera_location=None):
+        """Merge static SLAM, map_mod, and dynamic layers into one grid (height, width)."""
+        map_data = np.array(self.map_msg.data, dtype=np.float64).reshape(self.height, self.width)
+        mod_data = np.array(self.map_mod_msg.data, dtype=np.float64).reshape(self.height, self.width)
+        combined_map_data = np.maximum(map_data, mod_data)  # Combine the original map and the modified map
+        combined_map_data = np.maximum(combined_map_data, self.detected_object_map)  # Combine with the detected object map
+        combined_map_data = np.maximum(combined_map_data, self.person_static_map)  # Combine with the person static map
+
+        if camera_location is not None:
+            # We only care about the person_moving_map if within 2 meters of us:
+            x_min = max(int((camera_location[0] - 1) / self.resolution), 0)
+            x_max = min(int((camera_location[0] + 1) / self.resolution), self.width)
+            y_min = max(int((camera_location[1] - 1) / self.resolution), 0)
+            y_max = min(int((camera_location[1] + 1) / self.resolution), self.height)
+            combined_map_data[y_min:y_max, x_min:x_max] = np.maximum(
+                combined_map_data[y_min:y_max, x_min:x_max],
+                self.person_moving_map[y_min:y_max, x_min:x_max],
+            )
+
+        return combined_map_data
+
+    def _publish_navigation_map(self, camera_location=None):
+        """Publish latched /navigation_map (static layers always; moving people if camera known)."""
+        # combined_map_data = combined_map_data.flatten()
+        # new_map_binary = np.where(self.new_map_as_np.probs.flatten() > 0.85)[0]
+        # combined_map_data[new_map_binary] = 100
+
+        combined_map_data = self._build_combined_map_data(camera_location)
+        self.combined_map.header.stamp = rospy.Time.now()
+        self.combined_map.data = combined_map_data.flatten().astype(int).tolist()
+        self.combined_map_publisher.publish(self.combined_map)
 
     def get_camera_to_base_transform(self):
         """
@@ -201,7 +239,9 @@ class Map:
             return None
 
     def localized_callback(self, msg):
-        self.is_localized = msg.data   
+        self.is_localized = msg.data
+        if msg.data:
+            self._publish_navigation_map()
 
     def robot_mode_callback(self, msg):
         self.robot_mode = msg.data
@@ -488,26 +528,7 @@ class Map:
         self.new_map_publisher.publish(self.new_map)
         self.new_map_as_np.decay_l()  # Decay the l values
 
-        # combined_map_data = np.array(self.map_msg.data)
-        map_data = np.array(self.map_msg.data).reshape(self.height, self.width)
-        mod_data = np.array(self.map_mod_msg.data).reshape(self.height, self.width)
-        combined_map_data = np.maximum(map_data, mod_data)  # Combine the original map and the modified map
-        combined_map_data = np.maximum(combined_map_data, self.detected_object_map)  # Combine with the detected object map
-        combined_map_data = np.maximum(combined_map_data, self.person_static_map)  # Combine with the person static map
-
-        # We only care about the person_moving_map if within 2 meters of us:
-        x_min = max([int((camera_location[0] - 1)/self.resolution), 0])
-        x_max = min([int((camera_location[0] + 1)/self.resolution), self.width])
-        y_min = max([int((camera_location[1] - 1)/self.resolution), 0])
-        y_max = min([int((camera_location[1] + 1)/self.resolution), self.height])
-        combined_map_data[y_min:y_max, x_min:x_max] = np.maximum(combined_map_data[y_min:y_max, x_min:x_max], self.person_moving_map[y_min:y_max, x_min:x_max])
-
-        # combined_map_data = combined_map_data.flatten()
-        # new_map_binary = np.where(self.new_map_as_np.probs.flatten() > 0.85)[0]
-        # combined_map_data[new_map_binary] = 100
-        self.combined_map.data = combined_map_data.flatten().astype(int).tolist()
-        self.combined_map_publisher.publish(self.combined_map) 
-
+        self._publish_navigation_map(camera_location)
         
         # print("Intermediate Time taken: ", t2 - t1)
         # print("Processing Time taken: ", t3 - t2)
