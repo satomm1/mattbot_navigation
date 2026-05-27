@@ -85,11 +85,9 @@ class TrajectoryTracker:
 
         return x_d, xd_d, xdd_d, y_d, yd_d, ydd_d
 
-    def _V_for_om(self, V):
-        """Avoid division by zero in om; do not jump commanded speed."""
-        if abs(V) >= V_EPS:
-            return V
-        return V_EPS if V >= 0.0 else -V_EPS
+    def _V_for_om(self, V, v_ref=0.0):
+        """Denominator for curvature; use ref speed so om does not spike at V≈0."""
+        return max(abs(V), abs(v_ref), V_EPS)
 
     def _apply_accel_slew(self, V_cmd, V_prev, dt):
         """Limit rate of increase of |V|; deceleration is not slew-limited."""
@@ -141,7 +139,7 @@ class TrajectoryTracker:
                 V = self._apply_accel_slew(V_target, self.V_prev, dt)
         else:
             ########## Code starts here ##########
-            V_div = self._V_for_om(self.V_prev)
+            V_div = self._V_for_om(self.V_prev, v_ref)
 
             x_dot = self.V_prev * np.cos(th)
             y_dot = self.V_prev * np.sin(th)
