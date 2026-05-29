@@ -233,7 +233,14 @@ class Navigator:
         self.other_agents_at_goal = []
     
         self.backing_from_bad_localization = False
-                                            
+        self.backing_for_waypoints = False
+        self.relocalizing_start_time = 0.0
+        self.pending_replan_after_recovery = False
+        self.relocalize_duration_sec = rospy.get_param(
+            '~relocalize_duration_sec', 5.0
+        )
+        self.backing_duration_sec = rospy.get_param('~backing_duration_sec', 1.0)
+
         # plan parameters
         self.plan_resolution = 0.05
 
@@ -367,7 +374,6 @@ class Navigator:
         self.has_stopped = False
 
         self.waypoints = []
-        self.backing_for_waypoints = False
         self.backing_start_time = 0
 
         self.switch_mode(Mode.WAITING_FOR_INIT)
@@ -761,16 +767,39 @@ class Navigator:
                 msg.data,
             )
 
-    def initial_pose_relocalize_callback(self, msg):
+    def _start_localization_recovery(self, initial_pose_msg=None):
         """
-        Callback for initial pose, sets the robot's position and orientation
-        """        
-        # Only do anything if in tracking mode
-        if self.mode == Mode.TRACK:
-            self.initialpose_pub.publish(msg)
-            self.backing_start_time = rospy.get_rostime().to_sec()
-            self.backing_from_bad_localization = True
-            self.switch_mode(Mode.BACKING)
+        Halt navigation, optionally reset AMCL, back up, then spin to relocalize.
+        Replan only after RELOCALIZING completes (pending_replan_after_recovery).
+        """
+        if self.mode in (Mode.BACKING, Mode.RELOCALIZING):
+            rospy.logdebug(
+                "Navigator: localization recovery already active (mode=%s)",
+                self.mode,
+            )
+            return False
+        if self.mode != Mode.TRACK:
+            rospy.logwarn(
+                "Navigator: localization recovery ignored in mode %s",
+                self.mode,
+            )
+            return False
+
+        if initial_pose_msg is not None:
+            self.initialpose_pub.publish(initial_pose_msg)
+        self.backing_start_time = rospy.get_rostime().to_sec()
+        self.backing_from_bad_localization = True
+        self.pending_replan_after_recovery = True
+        self.switch_mode(Mode.BACKING)
+        rospy.loginfo(
+            "Navigator: starting localization recovery (inject_pose=%s)",
+            initial_pose_msg is not None,
+        )
+        return True
+
+    def initial_pose_relocalize_callback(self, msg):
+        """Inject corrected pose into AMCL and run recovery (back, then relocalize spin)."""
+        self._start_localization_recovery(initial_pose_msg=msg)
 
     def initial_pose_callback(self, msg):
         """
@@ -785,15 +814,13 @@ class Navigator:
 
 
     def lost_localization_callback(self, msg):
-        self.backing_start_time = rospy.get_rostime().to_sec()
-        self.switch_mode(Mode.BACKING)
-
-
-        # if self.localized and msg.data:
-        #     rospy.loginfo("Navigator: Lost localization")
-        #     self.localized = False
-        #     self.received_initial_pose = False
-        #     self.switch_mode(Mode.WAITING_FOR_INIT)
+        """Halt and run recovery FSM; pose injection may follow via initialpose_relocalize."""
+        if not msg.data:
+            return
+        if self.mode in (Mode.BACKING, Mode.RELOCALIZING):
+            return
+        rospy.logwarn("Navigator: lost localization signal received")
+        self._start_localization_recovery(initial_pose_msg=None)
 
     def agent_location_callback(self, msg):
         """
@@ -1673,61 +1700,55 @@ class Navigator:
                     self.theta_g = None
                     self.switch_mode(Mode.IDLE)
             elif self.mode == Mode.BACKING:
-                print("Backing Up")
                 current_time = rospy.get_rostime().to_sec()
-                if current_time - self.backing_start_time > 1:
-
-                    if False:  # self.backing_from_bad_localization:
-                        print("Backing up from bad localization")
-                        # Stop moving
-                        cmd_vel = Twist()
-                        cmd_vel.linear.x = 0.0
-                        cmd_vel.angular.z = 0.0
-                        self.nav_vel_pub.publish(cmd_vel)
-
-                        self.backing_from_bad_localization = False
-                        self.relocalizing_start_time = current_time
-                        self.switch_mode(Mode.RELOCALIZING)
-                    elif self.backing_for_waypoints:
-                        print("Backing up for waypoints")
-                        # Stop moving
-                        cmd_vel = Twist()
-                        cmd_vel.linear.x = 0.0
-                        cmd_vel.angular.z = 0.0
-                        self.nav_vel_pub.publish(cmd_vel)
-
-                        self.backing_for_waypoints = False
-
-                        # Now relocalize
-                        self.relocalizing_start_time = current_time
-                        self.switch_mode(Mode.RELOCALIZING)
-                    else:
-                        self.switch_mode(Mode.IDLE)
-
-                        # Stop moving
-                        cmd_vel = Twist()
-                        cmd_vel.linear.x = 0.0
-                        cmd_vel.angular.z = 0.0
-                        self.nav_vel_pub.publish(cmd_vel)
-
-                        # Now replan
-                        print("Replanning after backing up")
-                        self.replan()
-
-                    # self.relocalizing_start_time = current_time
-                    # self.switch_mode(Mode.RELOCALIZING)
-            elif self.mode == Mode.RELOCALIZING:
-                current_time = rospy.get_rostime().to_sec()
-                if current_time - self.relocalizing_start_time > 5:
-                    self.switch_mode(Mode.IDLE)
-                    
-                    # Stop moving
+                if current_time - self.backing_start_time > self.backing_duration_sec:
                     cmd_vel = Twist()
                     cmd_vel.linear.x = 0.0
                     cmd_vel.angular.z = 0.0
                     self.nav_vel_pub.publish(cmd_vel)
 
-                    self.replan()
+                    if self.backing_from_bad_localization:
+                        rospy.loginfo(
+                            "Navigator: backing complete, relocalizing in place"
+                        )
+                        self.backing_from_bad_localization = False
+                        self.relocalizing_start_time = current_time
+                        self.switch_mode(Mode.RELOCALIZING)
+                    elif self.backing_for_waypoints:
+                        rospy.loginfo(
+                            "Navigator: backing for waypoints, relocalizing in place"
+                        )
+                        self.backing_for_waypoints = False
+                        self.pending_replan_after_recovery = True
+                        self.relocalizing_start_time = current_time
+                        self.switch_mode(Mode.RELOCALIZING)
+                    else:
+                        rospy.loginfo(
+                            "Navigator: backing complete, returning to IDLE"
+                        )
+                        self.switch_mode(Mode.IDLE)
+                        self.replan()
+            elif self.mode == Mode.RELOCALIZING:
+                current_time = rospy.get_rostime().to_sec()
+                if current_time - self.relocalizing_start_time > self.relocalize_duration_sec:
+                    cmd_vel = Twist()
+                    cmd_vel.linear.x = 0.0
+                    cmd_vel.angular.z = 0.0
+                    self.nav_vel_pub.publish(cmd_vel)
+
+                    should_replan = self.pending_replan_after_recovery
+                    self.pending_replan_after_recovery = False
+                    self.switch_mode(Mode.IDLE)
+
+                    if should_replan:
+                        rospy.loginfo(
+                            "Navigator: relocalize complete, replanning"
+                        )
+                        self.replan()
+                    else:
+                        rospy.loginfo(
+                            "Navigator: relocalize complete, staying IDLE"
+                        )
             elif self.mode == Mode.STOPPED_FOR_PERSON:
                 current_time = rospy.get_rostime().to_sec()
                 if current_time - self.stopped_for_person_time > 5:
