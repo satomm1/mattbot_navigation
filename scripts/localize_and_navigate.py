@@ -2,7 +2,7 @@
 
 import rospkg
 import rospy
-from nav_msgs.msg import OccupancyGrid, MapMetaData, Path
+from nav_msgs.msg import OccupancyGrid, MapMetaData, Path, Odometry
 from geometry_msgs.msg import Twist, Pose2D, PoseStamped, PoseWithCovarianceStamped, Point
 from std_msgs.msg import String, Int32, Float64, Bool
 from visualization_msgs.msg import Marker, MarkerArray
@@ -241,6 +241,19 @@ class Navigator:
         )
         self.backing_duration_sec = rospy.get_param('~backing_duration_sec', 1.0)
 
+        self.stall_detection_enabled = rospy.get_param('~stall_detection_enabled', True)
+        self.stall_cmd_vel_threshold = rospy.get_param('~stall_cmd_vel_threshold', 0.08)
+        self.stall_odom_displacement_m = rospy.get_param('~stall_odom_displacement_m', 0.02)
+        self.stall_window_sec = rospy.get_param('~stall_window_sec', 0.5)
+        self._last_cmd_linear = 0.0
+        self._odom_history = []
+        self._last_stall_recovery_time = 0.0
+        self.stall_recovery_cooldown_sec = rospy.get_param(
+            '~stall_recovery_cooldown_sec', 15.0
+        )
+        self.track_stall_grace_sec = rospy.get_param('~track_stall_grace_sec', 2.0)
+        self.track_start_time = 0.0
+
         # plan parameters
         self.plan_resolution = 0.05
 
@@ -367,6 +380,7 @@ class Navigator:
         rospy.Subscriber("/valid_points", Bool, self.valid_points_callback)
         stop_topic = rospy.get_param("~/stop_topic", "/stop").strip() or "/stop"
         rospy.Subscriber(stop_topic, Bool, self.stop_callback, queue_size=1)
+        rospy.Subscriber('/odom', Odometry, self.odom_callback, queue_size=1)
         self.localized_pub = rospy.Publisher("/localized", Bool, queue_size=10)
         self.initialpose_pub = rospy.Publisher("/initialpose", PoseWithCovarianceStamped, queue_size=10)
         self.invalid_goal_pub = rospy.Publisher("/invalid_goal", Pose2D, queue_size=10)
@@ -767,6 +781,49 @@ class Navigator:
                 msg.data,
             )
 
+    def odom_callback(self, msg):
+        t = rospy.get_rostime().to_sec()
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+        self._odom_history.append((t, x, y))
+        cutoff = t - self.stall_window_sec
+        self._odom_history = [
+            entry for entry in self._odom_history if entry[0] >= cutoff
+        ]
+
+    def _check_wheel_stall(self):
+        """True if commanded forward motion but odometry barely moved (e.g. against a wall)."""
+        if not self.stall_detection_enabled or self.mode != Mode.TRACK:
+            return False
+        if (
+            rospy.get_rostime().to_sec() - self.track_start_time
+            < self.track_stall_grace_sec
+        ):
+            return False
+        if abs(self._last_cmd_linear) < self.stall_cmd_vel_threshold:
+            return False
+        if len(self._odom_history) < 2:
+            return False
+        xs = [e[1] for e in self._odom_history]
+        ys = [e[2] for e in self._odom_history]
+        displacement = np.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        return displacement < self.stall_odom_displacement_m
+
+    def _maybe_recover_from_stall(self):
+        if not self._check_wheel_stall():
+            return
+        now = rospy.get_rostime().to_sec()
+        if now - self._last_stall_recovery_time < self.stall_recovery_cooldown_sec:
+            return
+        self._last_stall_recovery_time = now
+        rospy.logwarn(
+            "Navigator: wheel stall detected (cmd_v=%.2f, odom_disp<%.3fm in %.1fs)",
+            self._last_cmd_linear,
+            self.stall_odom_displacement_m,
+            self.stall_window_sec,
+        )
+        self._start_localization_recovery(initial_pose_msg=None)
+
     def _start_localization_recovery(self, initial_pose_msg=None):
         """
         Halt navigation, optionally reset AMCL, back up, then spin to relocalize.
@@ -987,6 +1044,9 @@ class Navigator:
         rospy.loginfo("Switching from %s -> %s", self.mode, new_mode)
         if self.mode == Mode.ALIGN and new_mode != Mode.ALIGN:
             self._aligned_since = None
+        if new_mode == Mode.TRACK:
+            self.track_start_time = rospy.get_rostime().to_sec()
+            self._odom_history = []
         self.mode = new_mode
         self.state_pub.publish(self.mode.value)
 
@@ -1516,6 +1576,7 @@ class Navigator:
             om = 0.0
 
         self.prev_om = om
+        self._last_cmd_linear = V
 
         cmd_vel = Twist()
         cmd_vel.linear.x = V
@@ -1615,6 +1676,7 @@ class Navigator:
                         self.post_align_pause_sec,
                     )
             elif self.mode == Mode.TRACK:
+                self._maybe_recover_from_stall()
                 current_time = rospy.get_rostime().to_sec()
                 if self.near_goal():
                     self._enter_park_pose()

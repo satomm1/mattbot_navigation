@@ -41,7 +41,13 @@
   </node>
 
   <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate.py" output="screen">
-
+    <param name="stall_detection_enabled" value="true"/>
+    <param name="stall_cmd_vel_threshold" value="0.08"/>
+    <param name="stall_odom_displacement_m" value="0.02"/>
+    <param name="stall_window_sec" value="0.5"/>
+    <param name="backing_duration_sec" value="1.0"/>
+    <param name="relocalize_duration_sec" value="5.0"/>
+    <param name="track_stall_grace_sec" value="2.0"/>
   </node>
 
   <!-- Launch the patrol.py script only if patrol is true -->
