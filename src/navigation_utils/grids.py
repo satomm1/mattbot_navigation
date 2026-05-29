@@ -139,6 +139,42 @@ class StochOccupancyGrid2D(object):
 
         return (1. - p_total) < self.thresh
     
+    def find_nearest_free(self, state, max_radius=1.0, step=None):
+        """
+        Return (free_xy, distance_m) nearest to state within max_radius, or (None, None).
+        Uses the same is_free rules as path planning.
+        """
+        if step is None:
+            step = self.resolution
+        x0, y0 = float(state[0]), float(state[1])
+        snapped = self.snap_to_grid((x0, y0))
+        if self.is_free(snapped):
+            return snapped, 0.0
+
+        candidates = []
+        n = int(np.ceil(max_radius / step))
+        for i in range(-n, n + 1):
+            for j in range(-n, n + 1):
+                if i == 0 and j == 0:
+                    continue
+                cx = x0 + i * step
+                cy = y0 + j * step
+                if cx < self.extent[0] or cx > self.extent[1]:
+                    continue
+                if cy < self.extent[2] or cy > self.extent[3]:
+                    continue
+                cand = self.snap_to_grid((cx, cy))
+                if not self.is_free(cand):
+                    continue
+                d = np.hypot(cand[0] - x0, cand[1] - y0)
+                if d <= max_radius + 1e-9:
+                    candidates.append((d, cand))
+
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1], candidates[0][0]
+
     def update(self, new_probs):
         if new_probs.shape != self.probs.shape:
             raise ValueError("New probabilities must have the same shape as the existing grid")

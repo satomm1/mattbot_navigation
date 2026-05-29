@@ -240,6 +240,9 @@ class Navigator:
             '~relocalize_duration_sec', 5.0
         )
         self.backing_duration_sec = rospy.get_param('~backing_duration_sec', 1.0)
+        self.nearest_free_search_radius = rospy.get_param(
+            '~nearest_free_search_radius', 1.0
+        )
 
         self.stall_detection_enabled = rospy.get_param('~stall_detection_enabled', True)
         self.stall_cmd_vel_threshold = rospy.get_param('~stall_cmd_vel_threshold', 0.08)
@@ -1040,6 +1043,41 @@ class Navigator:
             rospy.logerr("Error snapping to grid: %s", e)
             return x
 
+    def _resolve_plan_start(self, x_raw, y_raw, occupancy):
+        """
+        Return a planner start snapped to grid; if occupied, use nearest free cell
+        within nearest_free_search_radius (same is_free rules as A*).
+        """
+        x_init = self.snap_to_grid((x_raw, y_raw))
+        if occupancy.is_free(x_init):
+            return x_init
+
+        nearest, dist = occupancy.find_nearest_free(
+            x_init,
+            max_radius=self.nearest_free_search_radius,
+            step=self.plan_resolution,
+        )
+        if nearest is None:
+            rospy.logwarn(
+                "Navigator: plan start (%.2f, %.2f) is occupied; "
+                "no free configuration within %.2fm",
+                x_init[0],
+                x_init[1],
+                self.nearest_free_search_radius,
+            )
+            return None
+
+        rospy.logwarn(
+            "Navigator: plan start occupied at (%.2f, %.2f); "
+            "using nearest free (%.2f, %.2f) d=%.2fm",
+            x_init[0],
+            x_init[1],
+            nearest[0],
+            nearest[1],
+            dist,
+        )
+        return nearest
+
     def switch_mode(self, new_mode):
         rospy.loginfo("Switching from %s -> %s", self.mode, new_mode)
         if self.mode == Mode.ALIGN and new_mode != Mode.ALIGN:
@@ -1362,7 +1400,10 @@ class Navigator:
 
         current_time = rospy.get_rostime()
  
-        x_init = self.snap_to_grid((self.x, self.y))
+        x_init = self._resolve_plan_start(self.x, self.y, self.occupancy)
+        if x_init is None:
+            self.switch_mode(Mode.IDLE)
+            return
         self.plan_start = x_init
         x_goal = self.snap_to_grid((self.x_g, self.y_g))
 
