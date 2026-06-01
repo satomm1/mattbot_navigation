@@ -20,7 +20,9 @@ times and a common ``execute_at`` wall clock before TRACK.
        (``dds_data_publisher`` forwards to DDS). Peers do the same for the same ``plan_id``.
     5. **Coordinator** (robot id ``min(fleet_robot_ids)``) runs **one** of:
        - **Simultaneous** (fleet size ≥ 2): ``MultiAgentSimultaneousPlanner`` MILP; publishes
-         ``MultiAgentTimingSolve`` for non-coordinator fleet members.
+         ``MultiAgentTimingSolve`` for non-coordinator fleet members. With
+         ``~multi_agent_distributed_constraints`` true, each robot detects assigned collision pairs
+         and publishes ``MultiAgentCollisionReport``; coordinator merges reports then solves.
        - **Sequential** (singleton fleet + peer ``MultiAgentActiveTrajectory`` in local cache):
          ``MultiAgentSequentialPlanner`` with time-shifted peer trajectories.
        - **Solo** (singleton, no usable peer cache): analytic cumulative times at ``max_velocity``.
@@ -56,6 +58,7 @@ from geometry_msgs.msg import Pose2D, PoseStamped, Twist
 from nav_msgs.msg import Path
 from mattbot_dds.msg import (
     MultiAgentActiveTrajectory,
+    MultiAgentCollisionReport,
     MultiAgentExecuteAt,
     MultiAgentPlannedPath,
     MultiAgentTimingSolve,
@@ -64,7 +67,17 @@ from mattbot_dds.msg import (
 from navigation_utils import compute_trajectory_from_timed_waypoints, plan_start_heading
 from social_path_planning.occupancy_grid import StochOccupancyGrid2D as SpStochOccupancyGrid2D
 from visualization_msgs.msg import Marker, MarkerArray
-from social_path_planning.multi_planning import MultiAgentSequentialPlanner, MultiAgentSimultaneousPlanner
+from social_path_planning.multi_planning import (
+    MultiAgentSequentialPlanner,
+    MultiAgentSimultaneousPlanner,
+    detect_collision_pairs_for_agent_pair,
+    merge_collision_reports,
+)
+from social_path_planning.distributed_pair_assignment import (
+    assigned_pairs_for_robot_id,
+    expected_pair_partition,
+    supports_distributed_assignment,
+)
 
 
 def _load_localize_and_navigate():
@@ -130,6 +143,12 @@ class MultiAgentNavigator(nav_impl.Navigator):
         self._multi_coordinated = False
         self._multi_source_agent = 0
         self._peer_multi_planned_paths = {}
+        self._peer_collision_reports = {}
+        self._distributed_detect_running = False
+        self._distributed_detect_done = False
+        self._distributed_detect_failed = False
+        self._distributed_detect_fallback = False
+        self._collision_report_wait_started_at = None
         self._multi_fleet_robot_ids = []
         # --- MULTI phase wall-clock (timeouts in publish_control) ---
         self._multi_phase_started_at = None
@@ -181,6 +200,15 @@ class MultiAgentNavigator(nav_impl.Navigator):
         self._multi_agent_plan_duration_slack_sec = float(
             rospy.get_param("~multi_agent_plan_duration_slack_sec", 5.0)
         )
+        self._multi_agent_distributed_constraints = bool(
+            rospy.get_param("~multi_agent_distributed_constraints", False)
+        )
+        self._multi_agent_collision_report_wait_timeout_sec = float(
+            rospy.get_param("~multi_agent_collision_report_wait_timeout_sec", 60.0)
+        )
+        self._multi_agent_distributed_constraints_allow_odd_fleet = bool(
+            rospy.get_param("~multi_agent_distributed_constraints_allow_odd_fleet", True)
+        )
         self._multi_agent_disable_person_and_peer_avoidance = bool(
             rospy.get_param("~multi_agent_disable_person_and_peer_avoidance", True)
         )
@@ -213,6 +241,27 @@ class MultiAgentNavigator(nav_impl.Navigator):
             "MultiAgentNavigator: DDS planned path pub=%s sub=%s",
             self._dds_planned_pub_topic,
             self._peer_planned_sub_topic,
+        )
+        self._dds_collision_report_pub_topic = rospy.get_param(
+            "~multi_agent_collision_report_for_dds_topic", "/multi_agent_collision_report_for_dds"
+        ).strip() or "/multi_agent_collision_report_for_dds"
+        self._multi_agent_collision_report_pub = rospy.Publisher(
+            self._dds_collision_report_pub_topic, MultiAgentCollisionReport, queue_size=10, latch=False
+        )
+        self._peer_collision_report_sub_topic = rospy.get_param(
+            "~multi_agent_collision_report_from_agent_topic", "/multi_agent_collision_report_from_agent"
+        ).strip() or "/multi_agent_collision_report_from_agent"
+        rospy.Subscriber(
+            self._peer_collision_report_sub_topic,
+            MultiAgentCollisionReport,
+            self._peer_collision_report_callback,
+            queue_size=20,
+        )
+        rospy.logdebug(
+            "MultiAgentNavigator: distributed_constraints=%s collision_report pub=%s sub=%s",
+            self._multi_agent_distributed_constraints,
+            self._dds_collision_report_pub_topic,
+            self._peer_collision_report_sub_topic,
         )
         # execute_at: wall time when t=0 of the pending timed spline begins (fleet-wide agreement).
         self._execute_at_sub_topic = rospy.get_param("~multi_agent_execute_at_topic", "/multi_agent_execute_at").strip() or "/multi_agent_execute_at"
@@ -349,6 +398,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
             return
 
         self._peer_multi_planned_paths = {}
+        self._peer_collision_reports = {}
         self._reset_timing_compute_state()
 
         self._replan_as_multi_from_external_goal_multi = False
@@ -411,6 +461,73 @@ class MultiAgentNavigator(nav_impl.Navigator):
         self._reset_timed_execute_state()
         self._clear_pre_multi_align_state()
         self._timing_solve_wait_started_at = None
+        self._peer_collision_reports = {}
+        self._distributed_detect_running = False
+        self._distributed_detect_done = False
+        self._distributed_detect_failed = False
+        self._distributed_detect_fallback = False
+        self._collision_report_wait_started_at = None
+
+    def _use_distributed_constraints(self):
+        """True when ring-based distributed collision detection should run for this fleet."""
+        if not self._multi_agent_distributed_constraints or self._distributed_detect_fallback:
+            return False
+        fleet = [int(x) for x in self._multi_fleet_robot_ids]
+        if len(fleet) < 2:
+            return False
+        return supports_distributed_assignment(
+            fleet,
+            allow_odd_fleet=self._multi_agent_distributed_constraints_allow_odd_fleet,
+        )
+
+    def _expected_collision_report_keys(self):
+        fleet = [int(x) for x in self._multi_fleet_robot_ids]
+        partition = expected_pair_partition(fleet)
+        keys = set()
+        for pairs in partition.values():
+            for a1, a2 in pairs:
+                rid_i = int(fleet[a1])
+                rid_j = int(fleet[a2])
+                keys.add((min(rid_i, rid_j), max(rid_i, rid_j)))
+        return keys
+
+    def _store_collision_report(self, msg):
+        rid_i = int(msg.robot_i)
+        rid_j = int(msg.robot_j)
+        key = (min(rid_i, rid_j), max(rid_i, rid_j))
+        self._peer_collision_reports[key] = msg
+
+    def _collision_reports_complete(self):
+        pid = (self._multi_plan_id or "").strip()
+        if not pid:
+            return False
+        expected = self._expected_collision_report_keys()
+        if not expected:
+            return True
+        for key in expected:
+            msg = self._peer_collision_reports.get(key)
+            if msg is None or (msg.plan_id or "").strip() != pid:
+                return False
+        return True
+
+    def _peer_collision_report_callback(self, msg):
+        """Coordinator caches peer distributed collision reports for the active plan_id."""
+        if int(msg.source_agent) == int(self.my_id):
+            return
+        pid = (self._multi_plan_id or "").strip()
+        if not pid or (msg.plan_id or "").strip() != pid:
+            return
+        self._store_collision_report(msg)
+        rospy.logdebug(
+            "MultiAgentNavigator: received collision report source=%s pair=(%s,%s) segments=%d complete=%s",
+            int(msg.source_agent),
+            int(msg.robot_i),
+            int(msg.robot_j),
+            len(msg.segment_i or []),
+            bool(msg.complete),
+        )
+        self._try_start_distributed_detect_if_ready()
+        self._try_simultaneous_plan_if_ready()
 
     def _fleet_coordinator_id(self):
         """Return ``min(_multi_fleet_robot_ids)`` or None if fleet empty.
@@ -1079,17 +1196,67 @@ class MultiAgentNavigator(nav_impl.Navigator):
         self._sticky_multi_timing_replan = False
         self._replan_as_multi_from_external_goal_multi = False
         self._peer_multi_planned_paths = {}
+        self._peer_collision_reports = {}
         self._reset_timing_compute_state()
         self.switch_mode(nav_impl.Mode.IDLE)
 
-    def _try_simultaneous_plan_if_ready(self):
-        """Coordinator-only entry: start exactly one timing worker when paths are ready.
+    def _finish_simultaneous_planner_success(self, optimized_times):
+        """Store simultaneous MILP result and publish ``MultiAgentTimingSolve`` when fleet size > 1."""
+        lens = [len(t) for t in optimized_times] if optimized_times else []
+        rospy.logdebug(
+            "MultiAgentNavigator: simultaneous plan solved plan_id=%s waypoint_time_lens=%s",
+            self._multi_plan_id,
+            lens,
+        )
+        self._simultaneous_optimized_times = optimized_times
+        self._simultaneous_solve_done = True
+        fleet = [int(x) for x in self._multi_fleet_robot_ids]
+        my_id = int(self.my_id)
+        ego_k = fleet.index(my_id) if my_id in fleet else 0
+        if optimized_times and ego_k < len(optimized_times):
+            self._armed_waypoint_times_for_snapshot = [float(x) for x in optimized_times[ego_k]]
+        if len(fleet) > 1:
+            ts_msg = MultiAgentTimingSolve()
+            ts_msg.plan_id = self._multi_plan_id
+            ts_msg.source_agent = int(self.my_id)
+            ts_msg.fleet_robot_ids = fleet
+            ts_msg.waypoint_counts = [len(t) for t in optimized_times]
+            flat = []
+            for t in optimized_times:
+                flat.extend(float(x) for x in t)
+            ts_msg.waypoint_times_flat = flat
+            self._multi_agent_timing_solve_for_dds_pub.publish(ts_msg)
+            rospy.logdebug(
+                "MultiAgentNavigator: published MultiAgentTimingSolve for DDS (%d agents) plan_id=%s",
+                len(fleet),
+                self._multi_plan_id,
+            )
 
-        Branches: simultaneous (|fleet|≥2), sequential (singleton + peer cache), else solo analytic.
+    def _try_start_distributed_detect_if_ready(self):
+        """All fleet robots: run assigned collision-pair detection once paths are complete."""
+        if not self._is_multiagent_computing_mode(self.mode):
+            return
+        if not self._use_distributed_constraints():
+            return
+        if len(self._multi_fleet_robot_ids) < 2:
+            return
+        if not self._fleet_paths_complete():
+            return
+        with self._simultaneous_lock:
+            if self._distributed_detect_done or self._distributed_detect_running or self._distributed_detect_failed:
+                return
+            self._distributed_detect_running = True
+        threading.Thread(target=self._distributed_detect_thread_main, daemon=True).start()
+
+    def _try_simultaneous_plan_if_ready(self):
+        """Start timing worker when paths (and distributed reports, if enabled) are ready.
+
+        Branches: distributed simultaneous, centralized simultaneous, sequential, solo.
         Non-coordinators stay in MULTI until they receive ``MultiAgentTimingSolve`` via callback.
         """
         if not self._is_multiagent_computing_mode(self.mode):
             return
+        self._try_start_distributed_detect_if_ready()
         if not self._i_am_coordinator():
             return
         with self._simultaneous_lock:
@@ -1099,23 +1266,112 @@ class MultiAgentNavigator(nav_impl.Navigator):
                 return
             self._simultaneous_solve_running = True
         fleet = [int(x) for x in self._multi_fleet_robot_ids]
-        branch = (
-            "simultaneous"
-            if len(fleet) >= 2
-            else ("sequential" if self._peer_active_obstacles_available() else "solo")
-        )
+        if len(fleet) >= 2 and self._use_distributed_constraints():
+            if not self._distributed_detect_done or not self._collision_reports_complete():
+                with self._simultaneous_lock:
+                    self._simultaneous_solve_running = False
+                return
+            branch = "simultaneous_distributed"
+            threading.Thread(target=self._simultaneous_planner_from_reports_thread_main, daemon=True).start()
+        elif len(fleet) >= 2:
+            branch = "simultaneous"
+            threading.Thread(target=self._simultaneous_planner_thread_main, daemon=True).start()
+        elif len(fleet) == 1 and self._peer_active_obstacles_available():
+            branch = "sequential"
+            threading.Thread(target=self._sequential_planner_thread_main, daemon=True).start()
+        else:
+            branch = "solo"
+            threading.Thread(target=self._solo_timing_thread_main, daemon=True).start()
         rospy.loginfo(
             "MultiAgentNavigator: timing solve plan_id=%s fleet=%s -> %s",
             self._multi_plan_id,
             fleet,
             branch,
         )
-        if len(fleet) >= 2:
-            threading.Thread(target=self._simultaneous_planner_thread_main, daemon=True).start()
-        elif len(fleet) == 1 and self._peer_active_obstacles_available():
-            threading.Thread(target=self._sequential_planner_thread_main, daemon=True).start()
-        else:
-            threading.Thread(target=self._solo_timing_thread_main, daemon=True).start()
+
+    def _distributed_detect_thread_main(self):
+        """Background: detect assigned collision segment pairs and publish ``MultiAgentCollisionReport``."""
+        try:
+            fleet = [int(x) for x in self._multi_fleet_robot_ids]
+            paths = self._assemble_paths_for_simultaneous()
+            if not paths or any(len(p) < 1 for p in paths):
+                raise RuntimeError("invalid paths for distributed collision detection")
+            my_id = int(self.my_id)
+            assigned = assigned_pairs_for_robot_id(my_id, fleet)
+            for idx, (a1, a2) in enumerate(assigned):
+                _a1, _a2, seg_i, seg_j = detect_collision_pairs_for_agent_pair(
+                    paths[a1], paths[a2], a1, a2, threshold=0.5
+                )
+                report = MultiAgentCollisionReport()
+                report.plan_id = self._multi_plan_id
+                report.source_agent = my_id
+                report.robot_i = int(fleet[a1])
+                report.robot_j = int(fleet[a2])
+                report.segment_i = seg_i
+                report.segment_j = seg_j
+                report.complete = idx == (len(assigned) - 1)
+                self._store_collision_report(report)
+                self._multi_agent_collision_report_pub.publish(report)
+                rospy.logdebug(
+                    "MultiAgentNavigator: published collision report pair=(%s,%s) segments=%d complete=%s",
+                    report.robot_i,
+                    report.robot_j,
+                    len(seg_i),
+                    report.complete,
+                )
+            self._distributed_detect_done = True
+            self._try_simultaneous_plan_if_ready()
+        except Exception as exc:
+            rospy.logerr("MultiAgentNavigator: distributed collision detect failed: %s", exc)
+            self._distributed_detect_failed = True
+            if self._i_am_coordinator():
+                self._distributed_detect_fallback = True
+        finally:
+            self._distributed_detect_running = False
+
+    def _simultaneous_planner_from_reports_thread_main(self):
+        """Background: merge distributed collision reports, build MILP, publish timing solve."""
+        try:
+            import social_path_planning.multi_planning as smp
+
+            smp.ROBOT_DIAMETER = float(self._multi_agent_robot_diameter)
+            smp.MAX_VELOCITY = float(self._multi_agent_max_velocity)
+            occ = self._build_sp_occupancy_grid()
+            if occ is None:
+                raise RuntimeError("occupancy grid missing for simultaneous planner")
+            paths = self._assemble_paths_for_simultaneous()
+            if not paths or any(len(p) < 1 for p in paths):
+                raise RuntimeError("invalid paths for simultaneous planner")
+            fleet = [int(x) for x in self._multi_fleet_robot_ids]
+            reports = []
+            for key in sorted(self._peer_collision_reports.keys()):
+                msg = self._peer_collision_reports[key]
+                if (msg.plan_id or "").strip() != (self._multi_plan_id or "").strip():
+                    continue
+                a1 = fleet.index(int(msg.robot_i))
+                a2 = fleet.index(int(msg.robot_j))
+                reports.append(
+                    {
+                        "a1": a1,
+                        "a2": a2,
+                        "segment_i": [int(x) for x in (msg.segment_i or [])],
+                        "segment_j": [int(x) for x in (msg.segment_j or [])],
+                    }
+                )
+            collision_pairs, max_z = merge_collision_reports(paths, reports, threshold=0.5)
+            v_list = [float(self._multi_agent_max_velocity)] * len(paths)
+            planner = MultiAgentSimultaneousPlanner(occ, paths=paths, norm=1, v=v_list)
+            optimized_times = planner.plan_from_collision_pairs(collision_pairs, max_z)
+            self._finish_simultaneous_planner_success(optimized_times)
+        except Exception as exc:
+            rospy.logerr("MultiAgentNavigator: distributed simultaneous plan failed: %s", exc)
+            try:
+                self._publish_timing_solve_abort_for_fleet()
+            except Exception as pub_exc:
+                rospy.logwarn("MultiAgentNavigator: fleet timing abort publish failed: %s", pub_exc)
+            self._simultaneous_solve_failed = True
+        finally:
+            self._simultaneous_solve_running = False
 
     def _solo_timing_thread_main(self):
         """Background: analytic times only; sets ``_simultaneous_optimized_times`` as a one-row list."""
@@ -1229,35 +1485,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
             v_list = [float(self._multi_agent_max_velocity)] * len(paths)
             planner = MultiAgentSimultaneousPlanner(occ, paths=paths, norm=1, v=v_list)
             optimized_times = planner.plan()
-            lens = [len(t) for t in optimized_times] if optimized_times else []
-            rospy.logdebug(
-                "MultiAgentNavigator: simultaneous plan solved plan_id=%s waypoint_time_lens=%s",
-                self._multi_plan_id,
-                lens,
-            )
-            self._simultaneous_optimized_times = optimized_times
-            self._simultaneous_solve_done = True
-            fleet = [int(x) for x in self._multi_fleet_robot_ids]
-            my_id = int(self.my_id)
-            ego_k = fleet.index(my_id) if my_id in fleet else 0
-            if optimized_times and ego_k < len(optimized_times):
-                self._armed_waypoint_times_for_snapshot = [float(x) for x in optimized_times[ego_k]]
-            if len(fleet) > 1:
-                ts_msg = MultiAgentTimingSolve()
-                ts_msg.plan_id = self._multi_plan_id
-                ts_msg.source_agent = int(self.my_id)
-                ts_msg.fleet_robot_ids = fleet
-                ts_msg.waypoint_counts = [len(t) for t in optimized_times]
-                flat = []
-                for t in optimized_times:
-                    flat.extend(float(x) for x in t)
-                ts_msg.waypoint_times_flat = flat
-                self._multi_agent_timing_solve_for_dds_pub.publish(ts_msg)
-                rospy.logdebug(
-                    "MultiAgentNavigator: published MultiAgentTimingSolve for DDS (%d agents) plan_id=%s",
-                    len(fleet),
-                    self._multi_plan_id,
-                )
+            self._finish_simultaneous_planner_success(optimized_times)
         except Exception as exc:
             rospy.logerr("MultiAgentNavigator: simultaneous plan failed: %s", exc)
             try:
@@ -1365,6 +1593,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
             return
 
         self._peer_multi_planned_paths = {}
+        self._peer_collision_reports = {}
         self._reset_timing_compute_state()
 
         self._replan_as_multi_from_external_goal_multi = True
@@ -1545,6 +1774,29 @@ class MultiAgentNavigator(nav_impl.Navigator):
                     )
                     self._abort_multi_to_idle()
                     return
+            # Coordinator: wait for distributed collision reports or fall back to centralized detection.
+            if (
+                self._i_am_coordinator()
+                and self._use_distributed_constraints()
+                and self._fleet_paths_complete()
+                and not self._collision_reports_complete()
+                and not self._simultaneous_solve_done
+                and not self._simultaneous_solve_running
+            ):
+                if self._collision_report_wait_started_at is None:
+                    self._collision_report_wait_started_at = rospy.Time.now()
+                elif (
+                    rospy.Time.now() - self._collision_report_wait_started_at
+                ).to_sec() > self._multi_agent_collision_report_wait_timeout_sec:
+                    rospy.logwarn(
+                        "MultiAgentNavigator: collision report timeout (%.1fs) plan_id=%s -> centralized fallback",
+                        self._multi_agent_collision_report_wait_timeout_sec,
+                        self._multi_plan_id or "?",
+                    )
+                    self._distributed_detect_fallback = True
+                    self._collision_report_wait_started_at = None
+            elif self._collision_reports_complete() or self._simultaneous_solve_done:
+                self._collision_report_wait_started_at = None
             # Paths ready but non-coordinator still needs MultiAgentTimingSolve from DDS/ROS.
             if (
                 self._fleet_paths_complete()
