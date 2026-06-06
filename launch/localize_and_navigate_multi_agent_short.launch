@@ -24,10 +24,14 @@
   <arg name="social" default="false"/>
   <param name="use_social_astar" value="$(arg social)"/>
 
+  <!-- Distributed collision-pair detection during MULTI timing (default off; coordinator runs full MILP when false). -->
+  <arg name="distributed_constraints" default="false"/>
+
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
   </node>
 
   <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate_multi_agent.py" output="screen">
+    <param name="multi_agent_distributed_constraints" value="$(arg distributed_constraints)"/>
   </node>
 
   <node name="patrol_node" pkg="mattbot_navigation" type="patrol.py" output="screen" if="$(arg patrol)">

@@ -5,7 +5,7 @@ Implements navigation for the mobile robot. Uses A* to plan paths, smooths them 
 ### Scripts
 
 - **localize_and_navigate.py**: Primary navigator (localize, ALIGN/TRACK/PARK, replanning, social A* optional).
-- **localize_and_navigate_multi_agent.py**: Extends the primary navigator with coordinated multi-robot timing and DDS planned-path handoff.
+- **localize_and_navigate_multi_agent.py**: Extends the primary navigator with coordinated multi-robot timing and DDS planned-path handoff. Optional distributed collision-pair detection (`~multi_agent_distributed_constraints`).
 - **localize_and_map.py**: Navigator variant with mapping/localization workflow.
 - **occupancy_grid_mapper.py**: Occupancy grid mapper from the Astra RGB-D camera.
 - **patrol.py**: Patrol behavior (optional in combined-map launches).
