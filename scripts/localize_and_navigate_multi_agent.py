@@ -23,6 +23,7 @@ times and a common ``execute_at`` wall clock before TRACK.
          ``MultiAgentTimingSolve`` for non-coordinator fleet members. With
          ``~multi_agent_distributed_constraints`` true, each robot detects assigned collision pairs
          and publishes ``MultiAgentCollisionReport``; coordinator merges reports then solves.
+         ``~multi_agent_waypoint_stride`` (>1) thins timed arrival vertices for MULTI only.
        - **Sequential** (singleton fleet + peer ``MultiAgentActiveTrajectory`` in local cache):
          ``MultiAgentSequentialPlanner`` with time-shifted peer trajectories.
        - **Solo** (singleton, no usable peer cache): analytic cumulative times at ``max_velocity``.
@@ -72,6 +73,7 @@ from social_path_planning.multi_planning import (
     MultiAgentSimultaneousPlanner,
     detect_collision_pairs_for_agent_pair,
     merge_collision_reports,
+    subsample_path_by_stride,
 )
 from social_path_planning.distributed_pair_assignment import (
     assigned_pairs_for_robot_id,
@@ -130,6 +132,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
     - ``_multi_fleet_robot_ids`` / ``_multi_plan_id``: roster and correlation id for DDS messages.
     - ``_peer_multi_planned_paths``: latest ``MultiAgentPlannedPath`` per **source_agent** (needed for
       simultaneous MILP when fleet size ≥ 2).
+    - ``_multi_timing_plan``: strided copy of ``unsmoothed_plan`` for MULTI timing only (DDS, MILP, arm).
     - ``_peer_active_trajectories``: cache of peers' **committed** timed plans (for sequential replanning).
     """
 
@@ -144,11 +147,13 @@ class MultiAgentNavigator(nav_impl.Navigator):
         self._multi_source_agent = 0
         self._peer_multi_planned_paths = {}
         self._peer_collision_reports = {}
+        self._ego_planned_path_last_republished_at = None
         self._distributed_detect_running = False
         self._distributed_detect_done = False
         self._distributed_detect_failed = False
         self._distributed_detect_fallback = False
         self._collision_report_wait_started_at = None
+        self._multi_timing_plan = []
         self._multi_fleet_robot_ids = []
         # --- MULTI phase wall-clock (timeouts in publish_control) ---
         self._multi_phase_started_at = None
@@ -182,6 +187,12 @@ class MultiAgentNavigator(nav_impl.Navigator):
             rospy.get_param("~multi_agent_timing_solve_wait_timeout_sec", 120.0)
         )
         self._multi_max_path_points = int(rospy.get_param("~multi_agent_max_path_points", 0))
+        self._multi_agent_waypoint_stride = max(1, int(rospy.get_param("~multi_agent_waypoint_stride", 1)))
+        if self._multi_agent_waypoint_stride < 1:
+            rospy.logwarn(
+                "MultiAgentNavigator: invalid ~multi_agent_waypoint_stride; using 1",
+            )
+            self._multi_agent_waypoint_stride = 1
         self._multi_agent_robot_diameter = float(rospy.get_param("~multi_agent_robot_diameter", 1.0))
         self._multi_agent_max_velocity = float(rospy.get_param("~multi_agent_max_velocity", 0.7))
         self._multi_agent_execute_max_lateness = float(rospy.get_param("~multi_agent_execute_max_lateness_sec", 5.0))
@@ -467,6 +478,88 @@ class MultiAgentNavigator(nav_impl.Navigator):
         self._distributed_detect_failed = False
         self._distributed_detect_fallback = False
         self._collision_report_wait_started_at = None
+        self._multi_timing_plan = []
+        self._ego_planned_path_last_republished_at = None
+
+    def _prune_stale_peer_multi_planned_paths(self):
+        """Drop peer paths outside the current fleet or with wrong/empty plan_id.
+
+        Keeps valid ``MultiAgentPlannedPath`` entries that arrive while ego is still replanning
+        (e.g. slow social A*), so a faster peer is not erased when geometric replan finishes.
+        """
+        pid = (self._multi_plan_id or "").strip()
+        fleet = {int(x) for x in self._multi_fleet_robot_ids}
+        my_id = int(self.my_id)
+        stale = []
+        for rid in list(self._peer_multi_planned_paths.keys()):
+            rid = int(rid)
+            msg = self._peer_multi_planned_paths.get(rid)
+            if rid == my_id or rid not in fleet:
+                stale.append(rid)
+                continue
+            if msg is None or (msg.plan_id or "").strip() != pid or len(msg.path.poses) == 0:
+                stale.append(rid)
+        for rid in stale:
+            self._peer_multi_planned_paths.pop(rid, None)
+        if stale:
+            rospy.logdebug(
+                "MultiAgentNavigator: pruned stale peer planned paths plan_id=%s removed=%s kept=%s",
+                pid,
+                stale,
+                sorted(int(x) for x in self._peer_multi_planned_paths.keys()),
+            )
+
+    def _missing_fleet_planned_path_ids(self):
+        """Robot ids in fleet (excluding ego) still missing a valid ``MultiAgentPlannedPath``."""
+        pid = (self._multi_plan_id or "").strip()
+        fleet = [int(x) for x in self._multi_fleet_robot_ids]
+        my_id = int(self.my_id)
+        missing = []
+        for rid in fleet:
+            if rid == my_id:
+                continue
+            p = self._peer_multi_planned_paths.get(rid)
+            if p is None or (p.plan_id or "").strip() != pid or len(p.path.poses) == 0:
+                missing.append(rid)
+        return missing
+
+    def _maybe_republish_ego_planned_path_for_peers(self, reason=""):
+        """Re-send ego ``MultiAgentPlannedPath`` so late-entering MULTI peers can cache it."""
+        if not self._is_multiagent_computing_mode(self.mode):
+            return
+        now = rospy.Time.now()
+        if self._ego_planned_path_last_republished_at is not None:
+            if (now - self._ego_planned_path_last_republished_at).to_sec() < 1.0:
+                return
+        self._ego_planned_path_last_republished_at = now
+        rospy.logdebug(
+            "MultiAgentNavigator: republishing ego planned path for peers (%s) plan_id=%s",
+            reason or "?",
+            self._multi_plan_id,
+        )
+        self._publish_planned_path_for_multi_dds()
+
+    def _rebuild_multi_timing_plan(self):
+        """Build ``_multi_timing_plan`` from ``unsmoothed_plan`` using ``~multi_agent_waypoint_stride``."""
+        plan = getattr(self, "unsmoothed_plan", None) or []
+        stride = int(self._multi_agent_waypoint_stride)
+        try:
+            self._multi_timing_plan = subsample_path_by_stride(plan, stride)
+        except ValueError as exc:
+            rospy.logwarn("MultiAgentNavigator: waypoint stride invalid (%s); using full plan", exc)
+            self._multi_timing_plan = list(plan)
+        if stride > 1:
+            rospy.logdebug(
+                "MultiAgentNavigator: multi timing plan stride=%d vertices %d -> %d",
+                stride,
+                len(plan),
+                len(self._multi_timing_plan),
+            )
+
+    def _multi_timing_plan_xy(self):
+        """Return ``_multi_timing_plan`` as ``(x, y)`` tuples for MILP / collision detect."""
+        plan = self._multi_timing_plan or []
+        return [(float(s[0]), float(s[1])) for s in plan]
 
     def _use_distributed_constraints(self):
         """True when ring-based distributed collision detection should run for this fleet."""
@@ -775,10 +868,10 @@ class MultiAgentNavigator(nav_impl.Navigator):
 
         my_id = int(self.my_id)
         ego_k = fleet_local.index(my_id)
-        plan = getattr(self, "unsmoothed_plan", None) or []
+        plan = self._multi_timing_plan or []
         if ego_k >= len(rows) or len(rows[ego_k]) != len(plan):
             rospy.logwarn(
-                "MultiAgentNavigator: ego timing len=%s vs plan len=%d; aborting multi",
+                "MultiAgentNavigator: ego timing len=%s vs multi_timing_plan len=%d; aborting multi",
                 len(rows[ego_k]) if ego_k < len(rows) else None,
                 len(plan),
             )
@@ -845,7 +938,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
             )
 
     def _maybe_arm_timed_trajectory(self):
-        """After timing solve: build spline from ``unsmoothed_plan`` + per-waypoint times; arm for execute_at.
+        """After timing solve: build spline from ``_multi_timing_plan`` + per-waypoint times; arm for execute_at.
 
         On success sets ``_timed_traj_armed`` and either uses ``_pending_execute_at_for_arm`` from the
         worker thread or schedules coordinator auto-publish. Short paths fall back to PARK and clear
@@ -866,10 +959,10 @@ class MultiAgentNavigator(nav_impl.Navigator):
             self._abort_multi_to_idle()
             return
         t_wp = np.asarray(opt[ego_k], dtype=float)
-        plan = getattr(self, "unsmoothed_plan", None) or []
+        plan = self._multi_timing_plan or []
         if len(t_wp) != len(plan):
             rospy.logwarn(
-                "MultiAgentNavigator: len(optimized_times)=%d != len(plan)=%d; aborting",
+                "MultiAgentNavigator: len(optimized_times)=%d != len(multi_timing_plan)=%d; aborting",
                 len(t_wp),
                 len(plan),
             )
@@ -999,7 +1092,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
         track_start = now
         t_new = self._pending_traj_times
         traj_new = self._pending_traj
-        planned_path = getattr(self, "unsmoothed_plan", None) or []
+        planned_path = self._multi_timing_plan or []
         dur_nom = float(t_new[-1])
         dur_slack = max(0.0, self._multi_agent_plan_duration_slack_sec)
 
@@ -1119,13 +1212,12 @@ class MultiAgentNavigator(nav_impl.Navigator):
         return [pts[i] for i in idx], [times[i] for i in idx]
 
     def _assemble_paths_for_simultaneous(self):
-        """Build list of polylines (ego from ``unsmoothed_plan``, peers from ``_peer_multi_planned_paths``)."""
+        """Build list of polylines for MILP (ego ``_multi_timing_plan``, peers from DDS planned paths)."""
         paths = []
         for rid in self._multi_fleet_robot_ids:
             rid = int(rid)
             if rid == int(self.my_id):
-                plan = getattr(self, "unsmoothed_plan", None) or []
-                pts = [(float(s[0]), float(s[1])) for s in plan]
+                pts = self._multi_timing_plan_xy()
             else:
                 peer = self._peer_multi_planned_paths[rid]
                 pts = [
@@ -1147,14 +1239,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
             return False
         if len(fleet) == 1:
             return True
-        my_id = int(self.my_id)
-        for rid in fleet:
-            if rid == my_id:
-                continue
-            p = self._peer_multi_planned_paths.get(rid)
-            if p is None or (p.plan_id or "").strip() != pid or len(p.path.poses) == 0:
-                return False
-        return True
+        return len(self._missing_fleet_planned_path_ids()) == 0
 
     def _publish_timing_solve_abort_for_fleet(self):
         """Coordinator only: broadcast empty timing payload so fleet peers leave MULTI (infeasible MILP, etc.)."""
@@ -1501,14 +1586,13 @@ class MultiAgentNavigator(nav_impl.Navigator):
         """True if ``mode`` is ``MultiagentComputingMode.MULTIAGENT_CONTROL_COMPUTING`` (value 12)."""
         return isinstance(mode, MultiagentComputingMode)
 
-    def _path_from_unsmoothed_plan(self):
-        """Build ``nav_msgs/Path`` from ``self.unsmoothed_plan`` rows ``[x, y, ...]`` (map frame)."""
+    def _path_from_plan_rows(self, plan_rows):
+        """Build ``nav_msgs/Path`` from plan rows ``[x, y, ...]`` (map frame)."""
         path_msg = Path()
         path_msg.header.frame_id = "map"
         path_msg.header.stamp = rospy.Time.now()
         hdr = path_msg.header
-        plan = getattr(self, "unsmoothed_plan", None) or []
-        for state in plan:
+        for state in plan_rows:
             pose_st = PoseStamped()
             pose_st.header = hdr
             pose_st.pose.position.x = float(state[0])
@@ -1517,9 +1601,19 @@ class MultiAgentNavigator(nav_impl.Navigator):
             path_msg.poses.append(pose_st)
         return path_msg
 
+    def _path_from_unsmoothed_plan(self):
+        """Build ``nav_msgs/Path`` from ``self.unsmoothed_plan`` rows ``[x, y, ...]`` (map frame)."""
+        plan = getattr(self, "unsmoothed_plan", None) or []
+        return self._path_from_plan_rows(plan)
+
+    def _path_from_multi_timing_plan(self):
+        """Build ``nav_msgs/Path`` from ``self._multi_timing_plan`` for DDS / fleet timing."""
+        return self._path_from_plan_rows(self._multi_timing_plan or [])
+
     def _publish_planned_path_for_multi_dds(self):
-        """Publish ego grid path for this ``plan_id`` so peers (and DDS) can run simultaneous timing."""
-        path_msg = self._path_from_unsmoothed_plan()
+        """Publish ego strided timing path for this ``plan_id`` (peers use same stride locally)."""
+        self._rebuild_multi_timing_plan()
+        path_msg = self._path_from_multi_timing_plan()
         if not path_msg.poses:
             rospy.logwarn("MultiAgentNavigator: unsmoothed plan empty; skipping DDS planned path publish")
             return
@@ -1528,11 +1622,20 @@ class MultiAgentNavigator(nav_impl.Navigator):
         out.source_agent = int(self.my_id)
         out.path = path_msg
         self._multi_agent_planned_path_pub.publish(out)
-        rospy.logdebug(
-            "MultiAgentNavigator: published MultiAgentPlannedPath for DDS (%d poses) plan_id=%s",
-            len(path_msg.poses),
-            self._multi_plan_id,
-        )
+        missing = self._missing_fleet_planned_path_ids()
+        if missing:
+            rospy.loginfo(
+                "MultiAgentNavigator: published MultiAgentPlannedPath (%d poses) plan_id=%s; waiting for robots %s",
+                len(path_msg.poses),
+                self._multi_plan_id,
+                missing,
+            )
+        else:
+            rospy.logdebug(
+                "MultiAgentNavigator: published MultiAgentPlannedPath for DDS (%d poses) plan_id=%s",
+                len(path_msg.poses),
+                self._multi_plan_id,
+            )
         self._try_simultaneous_plan_if_ready()
 
     def _peer_multi_agent_planned_path_callback(self, msg):
@@ -1544,13 +1647,15 @@ class MultiAgentNavigator(nav_impl.Navigator):
             return
         self._peer_multi_planned_paths[int(msg.source_agent)] = msg
         n_poses = len(msg.path.poses)
-        rospy.logdebug(
-            "MultiAgentNavigator: received peer planned path source_agent=%d plan_id=%s poses=%d",
+        rospy.loginfo(
+            "MultiAgentNavigator: received peer MultiAgentPlannedPath source_agent=%d plan_id=%s poses=%d fleet_complete=%s",
             int(msg.source_agent),
             msg.plan_id,
             n_poses,
+            self._fleet_paths_complete(),
         )
         self._try_simultaneous_plan_if_ready()
+        self._maybe_republish_ego_planned_path_for_peers("peer_multi_agent_planned_path")
 
     def external_goal_multi_callback(self, msg):
         """Handle ``MultiRobotExternalGoal``: fleet roster + ``plan_id`` + goal pose (typically from DDS).
@@ -1663,8 +1768,8 @@ class MultiAgentNavigator(nav_impl.Navigator):
                 self._multi_fleet_robot_ids = [int(self.my_id)]
                 fleet = [int(self.my_id)]
             elif len(fleet) >= 2:
-                # First coordinated solve: wait for fresh peer MultiAgentPlannedPath messages.
-                self._peer_multi_planned_paths = {}
+                # Keep peer MultiAgentPlannedPath messages that already match this mission.
+                self._prune_stale_peer_multi_planned_paths()
             self._reset_timing_compute_state()
             if sticky and not from_goal:
                 rospy.loginfo(
@@ -1764,6 +1869,13 @@ class MultiAgentNavigator(nav_impl.Navigator):
                 and not self._fleet_paths_complete()
                 and self._multi_phase_started_at is not None
             ):
+                missing = self._missing_fleet_planned_path_ids()
+                rospy.loginfo_throttle(
+                    10.0,
+                    "MultiAgentNavigator: waiting for MultiAgentPlannedPath from robots %s plan_id=%s",
+                    missing,
+                    self._multi_plan_id or "?",
+                )
                 elapsed = (rospy.Time.now() - self._multi_phase_started_at).to_sec()
                 if elapsed > self._multi_path_wait_timeout:
                     rospy.logwarn(

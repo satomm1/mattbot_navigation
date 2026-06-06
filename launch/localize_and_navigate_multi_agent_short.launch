@@ -26,12 +26,15 @@
 
   <!-- Distributed collision-pair detection during MULTI timing (default off; coordinator runs full MILP when false). -->
   <arg name="distributed_constraints" default="false"/>
+  <!-- Keep every Nth A* vertex for MULTI timing only (1 = all waypoints, 2 = every other, etc.). -->
+  <arg name="waypoint_stride" default="2"/>
 
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
   </node>
 
   <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate_multi_agent.py" output="screen">
     <param name="multi_agent_distributed_constraints" value="$(arg distributed_constraints)"/>
+    <param name="multi_agent_waypoint_stride" value="$(arg waypoint_stride)"/>
   </node>
 
   <node name="patrol_node" pkg="mattbot_navigation" type="patrol.py" output="screen" if="$(arg patrol)">
