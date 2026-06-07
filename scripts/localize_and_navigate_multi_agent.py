@@ -193,7 +193,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
                 "MultiAgentNavigator: invalid ~multi_agent_waypoint_stride; using 1",
             )
             self._multi_agent_waypoint_stride = 1
-        self._multi_agent_robot_diameter = float(rospy.get_param("~multi_agent_robot_diameter", 1.0))
+        self._multi_agent_robot_diameter = float(rospy.get_param("~multi_agent_robot_diameter", 0.25))
         self._multi_agent_max_velocity = float(rospy.get_param("~multi_agent_max_velocity", 0.7))
         self._multi_agent_execute_max_lateness = float(rospy.get_param("~multi_agent_execute_max_lateness_sec", 5.0))
         self._multi_agent_execute_late_policy = rospy.get_param("~multi_agent_execute_late_policy", "immediate").strip().lower()
@@ -1385,7 +1385,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
             assigned = assigned_pairs_for_robot_id(my_id, fleet)
             for idx, (a1, a2) in enumerate(assigned):
                 _a1, _a2, seg_i, seg_j = detect_collision_pairs_for_agent_pair(
-                    paths[a1], paths[a2], a1, a2, threshold=0.5
+                    paths[a1], paths[a2], a1, a2, threshold=self._multi_agent_robot_diameter
                 )
                 report = MultiAgentCollisionReport()
                 report.plan_id = self._multi_plan_id
@@ -1443,7 +1443,9 @@ class MultiAgentNavigator(nav_impl.Navigator):
                         "segment_j": [int(x) for x in (msg.segment_j or [])],
                     }
                 )
-            collision_pairs, max_z = merge_collision_reports(paths, reports, threshold=0.5)
+            collision_pairs, max_z = merge_collision_reports(
+                paths, reports, threshold=self._multi_agent_robot_diameter
+            )
             v_list = [float(self._multi_agent_max_velocity)] * len(paths)
             planner = MultiAgentSimultaneousPlanner(occ, paths=paths, norm=1, v=v_list)
             optimized_times = planner.plan_from_collision_pairs(collision_pairs, max_z)
