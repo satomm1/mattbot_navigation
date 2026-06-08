@@ -1463,7 +1463,8 @@ class MultiAgentNavigator(nav_impl.Navigator):
     def _solo_timing_thread_main(self):
         """Background: analytic times only; sets ``_simultaneous_optimized_times`` as a one-row list."""
         try:
-            plan = getattr(self, "unsmoothed_plan", None) or []
+            self._rebuild_multi_timing_plan()
+            plan = self._multi_timing_plan or []
             if len(plan) < 1:
                 raise RuntimeError("empty plan")
             times = self._solo_velocity_waypoint_times(plan)
@@ -1493,8 +1494,9 @@ class MultiAgentNavigator(nav_impl.Navigator):
             smp.MAX_VELOCITY = float(self._multi_agent_max_velocity)
             T_ego = rospy.Time.now() + rospy.Duration(max(0.05, self._multi_agent_sequential_budget_sec))
             t_ego_sec = T_ego.to_sec()
-            ego_plan = getattr(self, "unsmoothed_plan", None) or []
-            ego_path = [(float(s[0]), float(s[1])) for s in ego_plan]
+            self._rebuild_multi_timing_plan()
+            ego_plan = self._multi_timing_plan or []
+            ego_path = self._multi_timing_plan_xy()
             other_paths = []
             other_times_shifted = []
             with self._peer_traj_cache_lock:
