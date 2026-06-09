@@ -147,6 +147,10 @@ class MultiAgentNavigator(nav_impl.Navigator):
         self._multi_source_agent = 0
         self._peer_multi_planned_paths = {}
         self._peer_collision_reports = {}
+        self._path_comm_latency_ms = {}
+        self._constraint_comm_latency_ms = {}
+        self._distributed_detect_ms = None
+        self._centralized_detect_ms = None
         self._ego_planned_path_last_republished_at = None
         self._distributed_detect_running = False
         self._distributed_detect_done = False
@@ -222,6 +226,9 @@ class MultiAgentNavigator(nav_impl.Navigator):
         )
         self._multi_agent_disable_person_and_peer_avoidance = bool(
             rospy.get_param("~multi_agent_disable_person_and_peer_avoidance", True)
+        )
+        self._multi_agent_comm_latency_analysis = bool(
+            rospy.get_param("~multi_agent_comm_latency_analysis", False)
         )
         self._leader_execute_dds_topic = rospy.get_param(
             "~multi_agent_execute_at_dds_trigger_topic", "/multi_agent_execute_at_dds"
@@ -410,6 +417,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
 
         self._peer_multi_planned_paths = {}
         self._peer_collision_reports = {}
+        self._reset_comm_latency_state()
         self._reset_timing_compute_state()
 
         self._replan_as_multi_from_external_goal_multi = False
@@ -561,6 +569,22 @@ class MultiAgentNavigator(nav_impl.Navigator):
         plan = self._multi_timing_plan or []
         return [(float(s[0]), float(s[1])) for s in plan]
 
+    def _reset_comm_latency_state(self):
+        """Clear DDS comm-latency samples when a multi-agent mission boundary resets."""
+        self._path_comm_latency_ms = {}
+        self._constraint_comm_latency_ms = {}
+        self._distributed_detect_ms = None
+        self._centralized_detect_ms = None
+
+    @staticmethod
+    def _comm_latency_ms(sent_ros_time):
+        """End-to-end comm latency (ms) from a sender rospy stamp to now; None if stamp unset."""
+        if sent_ros_time is None:
+            return None
+        if int(sent_ros_time.secs) == 0 and int(sent_ros_time.nsecs) == 0:
+            return None
+        return float((rospy.Time.now() - sent_ros_time).to_sec() * 1000.0)
+
     def _use_distributed_constraints(self):
         """True when ring-based distributed collision detection should run for this fleet."""
         if not self._multi_agent_distributed_constraints or self._distributed_detect_fallback:
@@ -611,6 +635,22 @@ class MultiAgentNavigator(nav_impl.Navigator):
         if not pid or (msg.plan_id or "").strip() != pid:
             return
         self._store_collision_report(msg)
+        if (
+            self._multi_agent_comm_latency_analysis
+            and self._i_am_coordinator()
+            and int(msg.source_agent) != int(self.my_id)
+        ):
+            lat_ms = self._comm_latency_ms(rospy.Time.from_sec(float(msg.sent_stamp)))
+            if lat_ms is not None:
+                key = (int(msg.robot_i), int(msg.robot_j))
+                self._constraint_comm_latency_ms[key] = lat_ms
+                rospy.loginfo(
+                    "MultiAgentNavigator: constraint comm latency pair=(%s,%s) source=%s %.1f ms",
+                    int(msg.robot_i),
+                    int(msg.robot_j),
+                    int(msg.source_agent),
+                    lat_ms,
+                )
         rospy.logdebug(
             "MultiAgentNavigator: received collision report source=%s pair=(%s,%s) segments=%d complete=%s",
             int(msg.source_agent),
@@ -977,6 +1017,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
             self._multi_plan_id = ""
             self._multi_fleet_robot_ids = []
             self._peer_multi_planned_paths = {}
+            self._reset_comm_latency_state()
             self._sticky_multi_timing_replan = False
             self._replan_as_multi_from_external_goal_multi = False
             return
@@ -1282,6 +1323,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
         self._replan_as_multi_from_external_goal_multi = False
         self._peer_multi_planned_paths = {}
         self._peer_collision_reports = {}
+        self._reset_comm_latency_state()
         self._reset_timing_compute_state()
         self.switch_mode(nav_impl.Mode.IDLE)
 
@@ -1377,6 +1419,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
     def _distributed_detect_thread_main(self):
         """Background: detect assigned collision segment pairs and publish ``MultiAgentCollisionReport``."""
         try:
+            detect_t0 = time.perf_counter() if self._multi_agent_comm_latency_analysis else None
             fleet = [int(x) for x in self._multi_fleet_robot_ids]
             paths = self._assemble_paths_for_simultaneous()
             if not paths or any(len(p) < 1 for p in paths):
@@ -1395,6 +1438,8 @@ class MultiAgentNavigator(nav_impl.Navigator):
                 report.segment_i = seg_i
                 report.segment_j = seg_j
                 report.complete = idx == (len(assigned) - 1)
+                if self._multi_agent_comm_latency_analysis:
+                    report.sent_stamp = rospy.Time.now().to_sec()
                 self._store_collision_report(report)
                 self._multi_agent_collision_report_pub.publish(report)
                 rospy.logdebug(
@@ -1404,6 +1449,8 @@ class MultiAgentNavigator(nav_impl.Navigator):
                     len(seg_i),
                     report.complete,
                 )
+            if detect_t0 is not None:
+                self._distributed_detect_ms = float((time.perf_counter() - detect_t0) * 1000.0)
             self._distributed_detect_done = True
             self._try_simultaneous_plan_if_ready()
         except Exception as exc:
@@ -1413,6 +1460,36 @@ class MultiAgentNavigator(nav_impl.Navigator):
                 self._distributed_detect_fallback = True
         finally:
             self._distributed_detect_running = False
+
+    def _log_comm_latency_summary(self, distributed_branch):
+        """Coordinator-only summary of DDS comm latency vs local collision detection."""
+        if not self._multi_agent_comm_latency_analysis or not self._i_am_coordinator():
+            return
+        path_comm = dict(self._path_comm_latency_ms)
+        path_max = max(path_comm.values()) if path_comm else 0.0
+        if distributed_branch:
+            constraint_comm = dict(self._constraint_comm_latency_ms)
+            constraint_max = max(constraint_comm.values()) if constraint_comm else 0.0
+            rospy.loginfo(
+                "MultiAgentCommLatency plan_id=%s "
+                "path_comm_ms_max=%.1f path_comm_ms=%s "
+                "constraint_comm_ms_max=%.1f constraint_comm_ms=%s "
+                "distributed_detect_ms=%.1f centralized_detect_ms=%.1f",
+                self._multi_plan_id,
+                path_max,
+                path_comm,
+                constraint_max,
+                constraint_comm,
+                float(self._distributed_detect_ms or 0.0),
+                float(self._centralized_detect_ms or 0.0),
+            )
+        else:
+            rospy.loginfo(
+                "MultiAgentCommLatency plan_id=%s path_comm_ms_max=%.1f path_comm_ms=%s",
+                self._multi_plan_id,
+                path_max,
+                path_comm,
+            )
 
     def _simultaneous_planner_from_reports_thread_main(self):
         """Background: merge distributed collision reports, build MILP, publish timing solve."""
@@ -1428,6 +1505,13 @@ class MultiAgentNavigator(nav_impl.Navigator):
             if not paths or any(len(p) < 1 for p in paths):
                 raise RuntimeError("invalid paths for simultaneous planner")
             fleet = [int(x) for x in self._multi_fleet_robot_ids]
+            if self._multi_agent_comm_latency_analysis:
+                v_list = [float(self._multi_agent_max_velocity)] * len(paths)
+                centralized_t0 = time.perf_counter()
+                centralized_planner = MultiAgentSimultaneousPlanner(occ, paths=paths, norm=1, v=v_list)
+                centralized_planner.find_collision_pairs()
+                self._centralized_detect_ms = float((time.perf_counter() - centralized_t0) * 1000.0)
+                self._log_comm_latency_summary(distributed_branch=True)
             reports = []
             for key in sorted(self._peer_collision_reports.keys()):
                 msg = self._peer_collision_reports[key]
@@ -1561,6 +1645,8 @@ class MultiAgentNavigator(nav_impl.Navigator):
     def _simultaneous_planner_thread_main(self):
         """Background: ``MultiAgentSimultaneousPlanner`` MILP; coordinator publishes ``MultiAgentTimingSolve``."""
         try:
+            if self._multi_agent_comm_latency_analysis:
+                self._log_comm_latency_summary(distributed_branch=False)
             import social_path_planning.multi_planning as smp
 
             smp.ROBOT_DIAMETER = float(self._multi_agent_robot_diameter)
@@ -1621,6 +1707,8 @@ class MultiAgentNavigator(nav_impl.Navigator):
         if not path_msg.poses:
             rospy.logwarn("MultiAgentNavigator: unsmoothed plan empty; skipping DDS planned path publish")
             return
+        if self._multi_agent_comm_latency_analysis:
+            path_msg.header.stamp = rospy.Time.now()
         out = MultiAgentPlannedPath()
         out.plan_id = self._multi_plan_id
         out.source_agent = int(self.my_id)
@@ -1650,6 +1738,15 @@ class MultiAgentNavigator(nav_impl.Navigator):
         if not pid or (msg.plan_id or "").strip() != pid:
             return
         self._peer_multi_planned_paths[int(msg.source_agent)] = msg
+        if self._multi_agent_comm_latency_analysis:
+            lat_ms = self._comm_latency_ms(msg.path.header.stamp)
+            if lat_ms is not None:
+                self._path_comm_latency_ms[int(msg.source_agent)] = lat_ms
+                rospy.loginfo(
+                    "MultiAgentNavigator: path comm latency source_agent=%d %.1f ms",
+                    int(msg.source_agent),
+                    lat_ms,
+                )
         n_poses = len(msg.path.poses)
         rospy.loginfo(
             "MultiAgentNavigator: received peer MultiAgentPlannedPath source_agent=%d plan_id=%s poses=%d fleet_complete=%s",
@@ -1703,6 +1800,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
 
         self._peer_multi_planned_paths = {}
         self._peer_collision_reports = {}
+        self._reset_comm_latency_state()
         self._reset_timing_compute_state()
 
         self._replan_as_multi_from_external_goal_multi = True

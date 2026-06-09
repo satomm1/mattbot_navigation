@@ -30,6 +30,8 @@
   <arg name="waypoint_stride" default="3"/>
   <!-- Endpoint distance threshold (m) for pairwise collision-pair detection in simultaneous MILP. -->
   <arg name="robot_diameter" default="0.25"/>
+  <!-- Log end-to-end DDS path/constraint comm latency vs local detect time (coordinator summary). -->
+  <arg name="comm_latency_analysis" default="false"/>
 
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
   </node>
@@ -38,6 +40,7 @@
     <param name="multi_agent_distributed_constraints" value="$(arg distributed_constraints)"/>
     <param name="multi_agent_waypoint_stride" value="$(arg waypoint_stride)"/>
     <param name="multi_agent_robot_diameter" value="$(arg robot_diameter)"/>
+    <param name="multi_agent_comm_latency_analysis" value="$(arg comm_latency_analysis)"/>
   </node>
 
   <node name="patrol_node" pkg="mattbot_navigation" type="patrol.py" output="screen" if="$(arg patrol)">
