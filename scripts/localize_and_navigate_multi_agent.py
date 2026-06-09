@@ -194,7 +194,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
             )
             self._multi_agent_waypoint_stride = 1
         self._multi_agent_robot_diameter = float(rospy.get_param("~multi_agent_robot_diameter", 0.25))
-        self._multi_agent_max_velocity = float(rospy.get_param("~multi_agent_max_velocity", 0.7))
+        self._multi_agent_max_velocity = float(rospy.get_param("~multi_agent_max_velocity", 0.5))
         self._multi_agent_execute_max_lateness = float(rospy.get_param("~multi_agent_execute_max_lateness_sec", 5.0))
         self._multi_agent_execute_late_policy = rospy.get_param("~multi_agent_execute_late_policy", "immediate").strip().lower()
         self._multi_agent_execute_msg_wait_timeout = float(
