@@ -151,6 +151,9 @@ class MultiAgentNavigator(nav_impl.Navigator):
         self._constraint_comm_latency_ms = {}
         self._distributed_detect_ms = None
         self._centralized_detect_ms = None
+        self._constraints_phase_t0 = None
+        self._constraints_phase_started = False
+        self._constraints_ready_ms = None
         self._ego_planned_path_last_republished_at = None
         self._distributed_detect_running = False
         self._distributed_detect_done = False
@@ -575,6 +578,9 @@ class MultiAgentNavigator(nav_impl.Navigator):
         self._constraint_comm_latency_ms = {}
         self._distributed_detect_ms = None
         self._centralized_detect_ms = None
+        self._constraints_phase_t0 = None
+        self._constraints_phase_started = False
+        self._constraints_ready_ms = None
 
     @staticmethod
     def _comm_latency_ms(sent_ros_time):
@@ -584,6 +590,36 @@ class MultiAgentNavigator(nav_impl.Navigator):
         if int(sent_ros_time.secs) == 0 and int(sent_ros_time.nsecs) == 0:
             return None
         return float((rospy.Time.now() - sent_ros_time).to_sec() * 1000.0)
+
+    def _maybe_start_constraints_phase(self):
+        """Coordinator: stamp t0 when fleet paths are complete (post-path-exchange constraint phase)."""
+        if not self._multi_agent_comm_latency_analysis:
+            return
+        if not self._i_am_coordinator():
+            return
+        if self._constraints_phase_started:
+            return
+        if not self._fleet_paths_complete():
+            return
+        self._constraints_phase_t0 = time.perf_counter()
+        self._constraints_phase_started = True
+
+    def _maybe_finish_constraints_phase_distributed(self):
+        """Coordinator: record constraint-ready latency when all distributed reports are cached."""
+        if not self._multi_agent_comm_latency_analysis:
+            return
+        if not self._i_am_coordinator():
+            return
+        if not self._use_distributed_constraints():
+            return
+        if not self._constraints_phase_started or self._constraints_phase_t0 is None:
+            return
+        if not self._collision_reports_complete():
+            return
+        if self._constraints_ready_ms is not None:
+            return
+        self._constraints_ready_ms = float((time.perf_counter() - self._constraints_phase_t0) * 1000.0)
+        self._log_comm_latency_summary(distributed_branch=True)
 
     def _use_distributed_constraints(self):
         """True when ring-based distributed collision detection should run for this fleet."""
@@ -644,13 +680,14 @@ class MultiAgentNavigator(nav_impl.Navigator):
             if lat_ms is not None:
                 key = (int(msg.robot_i), int(msg.robot_j))
                 self._constraint_comm_latency_ms[key] = lat_ms
-                rospy.loginfo(
+                rospy.logdebug(
                     "MultiAgentNavigator: constraint comm latency pair=(%s,%s) source=%s %.1f ms",
                     int(msg.robot_i),
                     int(msg.robot_j),
                     int(msg.source_agent),
                     lat_ms,
                 )
+        self._maybe_finish_constraints_phase_distributed()
         rospy.logdebug(
             "MultiAgentNavigator: received collision report source=%s pair=(%s,%s) segments=%d complete=%s",
             int(msg.source_agent),
@@ -1442,6 +1479,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
                     report.sent_stamp = rospy.Time.now().to_sec()
                 self._store_collision_report(report)
                 self._multi_agent_collision_report_pub.publish(report)
+                self._maybe_finish_constraints_phase_distributed()
                 rospy.logdebug(
                     "MultiAgentNavigator: published collision report pair=(%s,%s) segments=%d complete=%s",
                     report.robot_i,
@@ -1462,33 +1500,34 @@ class MultiAgentNavigator(nav_impl.Navigator):
             self._distributed_detect_running = False
 
     def _log_comm_latency_summary(self, distributed_branch):
-        """Coordinator-only summary of DDS comm latency vs local collision detection."""
+        """Coordinator-only paper stats: post-path-exchange constraint acquisition latency."""
         if not self._multi_agent_comm_latency_analysis or not self._i_am_coordinator():
             return
-        path_comm = dict(self._path_comm_latency_ms)
-        path_max = max(path_comm.values()) if path_comm else 0.0
-        if distributed_branch:
-            constraint_comm = dict(self._constraint_comm_latency_ms)
-            constraint_max = max(constraint_comm.values()) if constraint_comm else 0.0
-            rospy.loginfo(
-                "MultiAgentCommLatency plan_id=%s "
-                "path_comm_ms_max=%.1f path_comm_ms=%s "
-                "constraint_comm_ms_max=%.1f constraint_comm_ms=%s "
-                "distributed_detect_ms=%.1f centralized_detect_ms=%.1f",
+        if self._path_comm_latency_ms:
+            rospy.logdebug(
+                "MultiAgentCommLatency plan_id=%s path_comm_ms=%s",
                 self._multi_plan_id,
-                path_max,
-                path_comm,
-                constraint_max,
-                constraint_comm,
+                dict(self._path_comm_latency_ms),
+            )
+        if self._constraint_comm_latency_ms:
+            rospy.logdebug(
+                "MultiAgentCommLatency plan_id=%s constraint_comm_ms=%s",
+                self._multi_plan_id,
+                dict(self._constraint_comm_latency_ms),
+            )
+        if distributed_branch:
+            rospy.loginfo(
+                "MultiAgentCommLatency plan_id=%s mode=distributed constraints_ready_ms=%.1f distributed_detect_ms=%.1f",
+                self._multi_plan_id,
+                float(self._constraints_ready_ms or 0.0),
                 float(self._distributed_detect_ms or 0.0),
-                float(self._centralized_detect_ms or 0.0),
             )
         else:
             rospy.loginfo(
-                "MultiAgentCommLatency plan_id=%s path_comm_ms_max=%.1f path_comm_ms=%s",
+                "MultiAgentCommLatency plan_id=%s mode=centralized constraints_ready_ms=%.1f centralized_detect_ms=%.1f",
                 self._multi_plan_id,
-                path_max,
-                path_comm,
+                float(self._constraints_ready_ms or 0.0),
+                float(self._centralized_detect_ms or 0.0),
             )
 
     def _simultaneous_planner_from_reports_thread_main(self):
@@ -1505,13 +1544,6 @@ class MultiAgentNavigator(nav_impl.Navigator):
             if not paths or any(len(p) < 1 for p in paths):
                 raise RuntimeError("invalid paths for simultaneous planner")
             fleet = [int(x) for x in self._multi_fleet_robot_ids]
-            if self._multi_agent_comm_latency_analysis:
-                v_list = [float(self._multi_agent_max_velocity)] * len(paths)
-                centralized_t0 = time.perf_counter()
-                centralized_planner = MultiAgentSimultaneousPlanner(occ, paths=paths, norm=1, v=v_list)
-                centralized_planner.find_collision_pairs()
-                self._centralized_detect_ms = float((time.perf_counter() - centralized_t0) * 1000.0)
-                self._log_comm_latency_summary(distributed_branch=True)
             reports = []
             for key in sorted(self._peer_collision_reports.keys()):
                 msg = self._peer_collision_reports[key]
@@ -1645,8 +1677,6 @@ class MultiAgentNavigator(nav_impl.Navigator):
     def _simultaneous_planner_thread_main(self):
         """Background: ``MultiAgentSimultaneousPlanner`` MILP; coordinator publishes ``MultiAgentTimingSolve``."""
         try:
-            if self._multi_agent_comm_latency_analysis:
-                self._log_comm_latency_summary(distributed_branch=False)
             import social_path_planning.multi_planning as smp
 
             smp.ROBOT_DIAMETER = float(self._multi_agent_robot_diameter)
@@ -1659,7 +1689,19 @@ class MultiAgentNavigator(nav_impl.Navigator):
                 raise RuntimeError("invalid paths for simultaneous planner")
             v_list = [float(self._multi_agent_max_velocity)] * len(paths)
             planner = MultiAgentSimultaneousPlanner(occ, paths=paths, norm=1, v=v_list)
-            optimized_times = planner.plan()
+            if self._multi_agent_comm_latency_analysis:
+                self._maybe_start_constraints_phase()
+                detect_t0 = time.perf_counter()
+                collision_pairs, max_z = planner.find_collision_pairs()
+                self._centralized_detect_ms = float((time.perf_counter() - detect_t0) * 1000.0)
+                if self._constraints_phase_t0 is not None:
+                    self._constraints_ready_ms = float(
+                        (time.perf_counter() - self._constraints_phase_t0) * 1000.0
+                    )
+                self._log_comm_latency_summary(distributed_branch=False)
+                optimized_times = planner.plan_from_collision_pairs(collision_pairs, max_z)
+            else:
+                optimized_times = planner.plan()
             self._finish_simultaneous_planner_success(optimized_times)
         except Exception as exc:
             rospy.logerr("MultiAgentNavigator: simultaneous plan failed: %s", exc)
@@ -1728,6 +1770,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
                 len(path_msg.poses),
                 self._multi_plan_id,
             )
+        self._maybe_start_constraints_phase()
         self._try_simultaneous_plan_if_ready()
 
     def _peer_multi_agent_planned_path_callback(self, msg):
@@ -1742,7 +1785,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
             lat_ms = self._comm_latency_ms(msg.path.header.stamp)
             if lat_ms is not None:
                 self._path_comm_latency_ms[int(msg.source_agent)] = lat_ms
-                rospy.loginfo(
+                rospy.logdebug(
                     "MultiAgentNavigator: path comm latency source_agent=%d %.1f ms",
                     int(msg.source_agent),
                     lat_ms,
@@ -1755,6 +1798,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
             n_poses,
             self._fleet_paths_complete(),
         )
+        self._maybe_start_constraints_phase()
         self._try_simultaneous_plan_if_ready()
         self._maybe_republish_ego_planned_path_for_peers("peer_multi_agent_planned_path")
 
