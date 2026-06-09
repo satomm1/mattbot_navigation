@@ -153,6 +153,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
         self._centralized_detect_ms = None
         self._constraints_phase_t0 = None
         self._constraints_phase_started = False
+        self._constraints_phase_plan_id = ""
         self._constraints_ready_ms = None
         self._ego_planned_path_last_republished_at = None
         self._distributed_detect_running = False
@@ -491,6 +492,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
         self._collision_report_wait_started_at = None
         self._multi_timing_plan = []
         self._ego_planned_path_last_republished_at = None
+        self._reset_constraints_phase_timer()
 
     def _prune_stale_peer_multi_planned_paths(self):
         """Drop peer paths outside the current fleet or with wrong/empty plan_id.
@@ -572,15 +574,20 @@ class MultiAgentNavigator(nav_impl.Navigator):
         plan = self._multi_timing_plan or []
         return [(float(s[0]), float(s[1])) for s in plan]
 
+    def _reset_constraints_phase_timer(self):
+        """Clear constraint-ready phase timing (each MULTI timing cycle / plan_id gets a fresh t0)."""
+        self._constraints_phase_t0 = None
+        self._constraints_phase_started = False
+        self._constraints_phase_plan_id = ""
+        self._constraints_ready_ms = None
+
     def _reset_comm_latency_state(self):
         """Clear DDS comm-latency samples when a multi-agent mission boundary resets."""
         self._path_comm_latency_ms = {}
         self._constraint_comm_latency_ms = {}
         self._distributed_detect_ms = None
         self._centralized_detect_ms = None
-        self._constraints_phase_t0 = None
-        self._constraints_phase_started = False
-        self._constraints_ready_ms = None
+        self._reset_constraints_phase_timer()
 
     @staticmethod
     def _comm_latency_ms(sent_ros_time):
@@ -597,12 +604,18 @@ class MultiAgentNavigator(nav_impl.Navigator):
             return
         if not self._i_am_coordinator():
             return
-        if self._constraints_phase_started:
+        pid = (self._multi_plan_id or "").strip()
+        if not pid:
             return
+        if self._constraints_phase_started:
+            if self._constraints_phase_plan_id == pid and self._constraints_ready_ms is None:
+                return
+            self._reset_constraints_phase_timer()
         if not self._fleet_paths_complete():
             return
         self._constraints_phase_t0 = time.perf_counter()
         self._constraints_phase_started = True
+        self._constraints_phase_plan_id = pid
 
     def _maybe_finish_constraints_phase_distributed(self):
         """Coordinator: record constraint-ready latency when all distributed reports are cached."""
@@ -611,6 +624,9 @@ class MultiAgentNavigator(nav_impl.Navigator):
         if not self._i_am_coordinator():
             return
         if not self._use_distributed_constraints():
+            return
+        pid = (self._multi_plan_id or "").strip()
+        if not pid or self._constraints_phase_plan_id != pid:
             return
         if not self._constraints_phase_started or self._constraints_phase_t0 is None:
             return
@@ -680,7 +696,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
             if lat_ms is not None:
                 key = (int(msg.robot_i), int(msg.robot_j))
                 self._constraint_comm_latency_ms[key] = lat_ms
-                rospy.logdebug(
+                rospy.loginfo(
                     "MultiAgentNavigator: constraint comm latency pair=(%s,%s) source=%s %.1f ms",
                     int(msg.robot_i),
                     int(msg.robot_j),
@@ -1504,13 +1520,13 @@ class MultiAgentNavigator(nav_impl.Navigator):
         if not self._multi_agent_comm_latency_analysis or not self._i_am_coordinator():
             return
         if self._path_comm_latency_ms:
-            rospy.logdebug(
+            rospy.loginfo(
                 "MultiAgentCommLatency plan_id=%s path_comm_ms=%s",
                 self._multi_plan_id,
                 dict(self._path_comm_latency_ms),
             )
         if self._constraint_comm_latency_ms:
-            rospy.logdebug(
+            rospy.loginfo(
                 "MultiAgentCommLatency plan_id=%s constraint_comm_ms=%s",
                 self._multi_plan_id,
                 dict(self._constraint_comm_latency_ms),
@@ -1785,7 +1801,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
             lat_ms = self._comm_latency_ms(msg.path.header.stamp)
             if lat_ms is not None:
                 self._path_comm_latency_ms[int(msg.source_agent)] = lat_ms
-                rospy.logdebug(
+                rospy.loginfo(
                     "MultiAgentNavigator: path comm latency source_agent=%d %.1f ms",
                     int(msg.source_agent),
                     lat_ms,
