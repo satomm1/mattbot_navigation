@@ -27,7 +27,7 @@
   <!-- Distributed collision-pair detection during MULTI timing (default off; coordinator runs full MILP when false). -->
   <arg name="distributed_constraints" default="false"/>
   <!-- Keep every Nth A* vertex for MULTI timing only (1 = all waypoints, 2 = every other, etc.). -->
-  <arg name="waypoint_stride" default="3"/>
+  <arg name="waypoint_stride" default="1"/>
   <!-- Endpoint distance threshold (m) for pairwise collision-pair detection in simultaneous MILP. -->
   <arg name="robot_diameter" default="0.25"/>
   <!-- Log end-to-end DDS path/constraint comm latency vs local detect time (coordinator summary). -->
