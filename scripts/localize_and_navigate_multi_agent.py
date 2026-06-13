@@ -19,13 +19,13 @@ times and a common ``execute_at`` wall clock before TRACK.
     4. Mode ``MULTIAGENT_CONTROL_COMPUTING`` (value 12): ego publishes ``MultiAgentPlannedPath`` to ROS
        (``dds_data_publisher`` forwards to DDS). Peers do the same for the same ``plan_id``.
     5. **Coordinator** (robot id ``min(fleet_robot_ids)``) runs **one** of:
-       - **Simultaneous** (fleet size ≥ 2): ``MultiAgentSimultaneousPlanner`` MILP; publishes
-         ``MultiAgentTimingSolve`` for non-coordinator fleet members. With
-         ``~multi_agent_distributed_constraints`` true, each robot detects assigned collision pairs
-         and publishes ``MultiAgentCollisionReport``; coordinator merges reports then solves.
-         ``~multi_agent_waypoint_stride`` (>1) thins timed arrival vertices for MULTI only.
+       - **Simultaneous** (fleet size ≥ 2): event-based ``EventMultiAgentSimultaneousPlanner`` MILP on
+         interest waypoints; sparse schedules expand onto strided paths before ``MultiAgentTimingSolve``.
+         With ``~multi_agent_distributed_constraints`` true, each robot detects assigned collision pairs
+         and publishes ``MultiAgentCollisionReport``; coordinator builds ``EventPathAnalysis`` from
+         reports then solves. ``~multi_agent_waypoint_stride`` (>1) thins timed arrival vertices for MULTI only.
        - **Sequential** (singleton fleet + peer ``MultiAgentActiveTrajectory`` in local cache):
-         ``MultiAgentSequentialPlanner`` with time-shifted peer trajectories.
+         ``EventMultiAgentSequentialPlanner`` with time-shifted peer trajectories.
        - **Solo** (singleton, no usable peer cache): analytic cumulative times at ``max_velocity``.
     6. Pending spline is **armed**; robots wait for ``MultiAgentExecuteAt`` (or coordinator auto-publishes
        after ``~multi_agent_auto_execute_delay_sec``). At ``execute_at``, ``_commit_timed_trajectory()``
@@ -68,11 +68,15 @@ from mattbot_dds.msg import (
 from navigation_utils import compute_trajectory_from_timed_waypoints, plan_start_heading
 from social_path_planning.occupancy_grid import StochOccupancyGrid2D as SpStochOccupancyGrid2D
 from visualization_msgs.msg import Marker, MarkerArray
+from social_path_planning.event_multi_planning import (
+    EventMultiAgentSequentialPlanner,
+    EventMultiAgentSimultaneousPlanner,
+    analyze_event_paths_from_segment_reports,
+    expand_event_times_to_original_path,
+    _resolve_fixed_event_times,
+)
 from social_path_planning.multi_planning import (
-    MultiAgentSequentialPlanner,
-    MultiAgentSimultaneousPlanner,
     detect_collision_pairs_for_agent_pair,
-    merge_collision_reports,
     subsample_path_by_stride,
 )
 from social_path_planning.distributed_pair_assignment import (
@@ -233,6 +237,9 @@ class MultiAgentNavigator(nav_impl.Navigator):
         )
         self._multi_agent_comm_latency_analysis = bool(
             rospy.get_param("~multi_agent_comm_latency_analysis", False)
+        )
+        self._multi_agent_event_print_constraints = bool(
+            rospy.get_param("~multi_agent_event_print_constraints", False)
         )
         self._leader_execute_dds_topic = rospy.get_param(
             "~multi_agent_execute_at_dds_trigger_topic", "/multi_agent_execute_at_dds"
@@ -794,7 +801,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
     def _peer_active_trajectory_callback(self, msg):
         """Ingest ``MultiAgentActiveTrajectory`` from ROS (often bridged from DDS).
 
-        Stores polyline + cumulative waypoint times + execute_at so ``MultiAgentSequentialPlanner`` can
+        Stores polyline + cumulative waypoint times + execute_at so ``EventMultiAgentSequentialPlanner`` can
         shift peers into ego's time base. Inactive messages remove that robot from the cache.
         """
         if int(msg.robot_id) == int(self.my_id):
@@ -1271,7 +1278,7 @@ class MultiAgentNavigator(nav_impl.Navigator):
             )
 
     def _build_sp_occupancy_grid(self):
-        """`social_path_planning` grid copy for MultiAgentSimultaneousPlanner (same geometry as self.occupancy)."""
+        """`social_path_planning` grid copy for event multi-agent planner (same geometry as self.occupancy)."""
         occ = getattr(self, "occupancy", None)
         if occ is None:
             return None
@@ -1319,6 +1326,116 @@ class MultiAgentNavigator(nav_impl.Navigator):
                 ]
             paths.append(self._maybe_downsample_path_xy(pts))
         return paths
+
+    def _collect_distributed_segment_reports(self):
+        """Build segment report rows from cached ``MultiAgentCollisionReport`` messages."""
+        fleet = [int(x) for x in self._multi_fleet_robot_ids]
+        pid = (self._multi_plan_id or "").strip()
+        reports = []
+        for key in sorted(self._peer_collision_reports.keys()):
+            msg = self._peer_collision_reports[key]
+            if (msg.plan_id or "").strip() != pid:
+                continue
+            a1 = fleet.index(int(msg.robot_i))
+            a2 = fleet.index(int(msg.robot_j))
+            reports.append(
+                {
+                    "a1": a1,
+                    "a2": a2,
+                    "segment_i": [int(x) for x in (msg.segment_i or [])],
+                    "segment_j": [int(x) for x in (msg.segment_j or [])],
+                }
+            )
+        return reports
+
+    @staticmethod
+    def _expand_event_schedules(planner, event_times, paths):
+        """Expand sparse event schedules onto each agent's strided path vertices."""
+        analysis = planner.analysis
+        if analysis is None:
+            raise RuntimeError("event planner missing analysis after solve")
+        dense_times = [
+            expand_event_times_to_original_path(agent_path, agent_event_times)
+            for agent_path, agent_event_times in zip(analysis.agents, event_times)
+        ]
+        for path, dense, sparse, agent_path in zip(paths, dense_times, event_times, analysis.agents):
+            if len(dense) != len(path):
+                raise RuntimeError(
+                    "expanded event schedule length {} != path length {} "
+                    "(sparse={} interest={})".format(
+                        len(dense),
+                        len(path),
+                        len(sparse),
+                        len(agent_path.interest_waypoints),
+                    )
+                )
+        return dense_times
+
+    def _log_event_milp_summary(self, planner, event_times, dense_times):
+        """Log event MILP statistics and sparse vs dense schedule sizes."""
+        analysis = planner.analysis
+        if analysis is None:
+            return
+        interest_total = sum(len(agent.interest_waypoints) for agent in analysis.agents)
+        sparse_lens = [len(t) for t in (event_times or [])]
+        dense_lens = [len(t) for t in (dense_times or [])]
+        rospy.loginfo(
+            "MultiAgentNavigator: event MILP plan_id=%s agents=%d encounters=%d "
+            "interest_waypoints=%d binaries=%d mutex_constraints=%d solver_s=%.3f "
+            "sparse_lens=%s dense_lens=%s",
+            self._multi_plan_id,
+            len(analysis.agents),
+            len(analysis.encounters),
+            interest_total,
+            int(getattr(planner, "num_z", 0) or 0),
+            int(getattr(planner, "mutex_constraint_count", 0) or 0),
+            float(getattr(planner, "solver_runtime_s", 0.0) or 0.0),
+            sparse_lens,
+            dense_lens,
+        )
+
+    def _run_event_simultaneous_milp(self, paths, occ, segment_reports=None):
+        """Run event simultaneous MILP; return dense schedules aligned with ``paths``."""
+        v_list = [float(self._multi_agent_max_velocity)] * len(paths)
+        threshold = float(self._multi_agent_robot_diameter)
+        planner = EventMultiAgentSimultaneousPlanner(occ, paths=paths, norm=1, v=v_list)
+        planner.assign_velocities(v_list)
+        print_constraints = bool(self._multi_agent_event_print_constraints)
+
+        if segment_reports is not None:
+            analysis = analyze_event_paths_from_segment_reports(
+                paths, segment_reports, threshold=threshold
+            )
+            event_times = planner.plan_from_analysis(
+                analysis,
+                verbose=False,
+                print_constraints=print_constraints,
+            )
+        else:
+            if self._multi_agent_comm_latency_analysis:
+                detect_t0 = time.perf_counter()
+                analysis = planner.analyze(threshold=threshold)
+                self._centralized_detect_ms = float((time.perf_counter() - detect_t0) * 1000.0)
+                event_times = planner.plan_from_analysis(
+                    analysis,
+                    verbose=False,
+                    print_constraints=print_constraints,
+                )
+                if self._constraints_phase_t0 is not None:
+                    self._constraints_ready_ms = float(
+                        (time.perf_counter() - self._constraints_phase_t0) * 1000.0
+                    )
+                self._log_comm_latency_summary(distributed_branch=False)
+            else:
+                event_times = planner.plan(
+                    verbose=False,
+                    threshold=threshold,
+                    print_constraints=print_constraints,
+                )
+
+        dense_times = self._expand_event_schedules(planner, event_times, paths)
+        self._log_event_milp_summary(planner, event_times, dense_times)
+        return dense_times
 
     def _fleet_paths_complete(self):
         """True when ego has a non-empty plan and every **other** fleet member has a matching ``plan_id`` path."""
@@ -1547,41 +1664,17 @@ class MultiAgentNavigator(nav_impl.Navigator):
             )
 
     def _simultaneous_planner_from_reports_thread_main(self):
-        """Background: merge distributed collision reports, build MILP, publish timing solve."""
+        """Background: build event analysis from distributed reports, solve, publish timing."""
         try:
-            import social_path_planning.multi_planning as smp
-
-            smp.ROBOT_DIAMETER = float(self._multi_agent_robot_diameter)
-            smp.MAX_VELOCITY = float(self._multi_agent_max_velocity)
             occ = self._build_sp_occupancy_grid()
             if occ is None:
                 raise RuntimeError("occupancy grid missing for simultaneous planner")
             paths = self._assemble_paths_for_simultaneous()
             if not paths or any(len(p) < 1 for p in paths):
                 raise RuntimeError("invalid paths for simultaneous planner")
-            fleet = [int(x) for x in self._multi_fleet_robot_ids]
-            reports = []
-            for key in sorted(self._peer_collision_reports.keys()):
-                msg = self._peer_collision_reports[key]
-                if (msg.plan_id or "").strip() != (self._multi_plan_id or "").strip():
-                    continue
-                a1 = fleet.index(int(msg.robot_i))
-                a2 = fleet.index(int(msg.robot_j))
-                reports.append(
-                    {
-                        "a1": a1,
-                        "a2": a2,
-                        "segment_i": [int(x) for x in (msg.segment_i or [])],
-                        "segment_j": [int(x) for x in (msg.segment_j or [])],
-                    }
-                )
-            collision_pairs, max_z = merge_collision_reports(
-                paths, reports, threshold=self._multi_agent_robot_diameter
-            )
-            v_list = [float(self._multi_agent_max_velocity)] * len(paths)
-            planner = MultiAgentSimultaneousPlanner(occ, paths=paths, norm=1, v=v_list)
-            optimized_times = planner.plan_from_collision_pairs(collision_pairs, max_z)
-            self._finish_simultaneous_planner_success(optimized_times)
+            reports = self._collect_distributed_segment_reports()
+            dense_times = self._run_event_simultaneous_milp(paths, occ, segment_reports=reports)
+            self._finish_simultaneous_planner_success(dense_times)
         except Exception as exc:
             rospy.logerr("MultiAgentNavigator: distributed simultaneous plan failed: %s", exc)
             try:
@@ -1615,15 +1708,13 @@ class MultiAgentNavigator(nav_impl.Navigator):
             self._simultaneous_solve_running = False
 
     def _sequential_planner_thread_main(self):
-        """Background: ``MultiAgentSequentialPlanner`` using cached peer active trajectories (time-shifted).
+        """Background: ``EventMultiAgentSequentialPlanner`` using cached peer active trajectories.
 
         If no valid peer geometry is available, falls back to the same analytic times as solo mode.
         """
         try:
-            import social_path_planning.multi_planning as smp
-
-            smp.ROBOT_DIAMETER = float(self._multi_agent_robot_diameter)
-            smp.MAX_VELOCITY = float(self._multi_agent_max_velocity)
+            threshold = float(self._multi_agent_robot_diameter)
+            velocity = float(self._multi_agent_max_velocity)
             T_ego = rospy.Time.now() + rospy.Duration(max(0.05, self._multi_agent_sequential_budget_sec))
             t_ego_sec = T_ego.to_sec()
             self._rebuild_multi_timing_plan()
@@ -1668,20 +1759,45 @@ class MultiAgentNavigator(nav_impl.Navigator):
             occ = self._build_sp_occupancy_grid()
             if occ is None:
                 raise RuntimeError("occupancy grid missing for sequential planner")
-            planner = MultiAgentSequentialPlanner(
-                occ, other_paths, other_times_shifted, path=ego_path, v=float(self._multi_agent_max_velocity)
+            placeholder_times = [[0.0] for _ in other_paths]
+            planner = EventMultiAgentSequentialPlanner(
+                occ,
+                other_paths,
+                placeholder_times,
+                path=ego_path,
+                v=velocity,
             )
-            ego_times = planner.plan()
-            if len(ego_times) != len(ego_plan):
-                raise RuntimeError("sequential times length mismatch vs ego plan")
-            self._simultaneous_optimized_times = [ego_times]
-            self._armed_waypoint_times_for_snapshot = list(ego_times)
+            analysis = planner.analyze(threshold=threshold)
+            planner.other_agent_times = [
+                _resolve_fixed_event_times(
+                    analysis.agents[1 + k],
+                    peer_dense_shifted,
+                    velocity,
+                )
+                for k, peer_dense_shifted in enumerate(other_times_shifted)
+            ]
+            ego_event_times = planner.plan(
+                verbose=False,
+                threshold=threshold,
+                print_constraints=self._multi_agent_event_print_constraints,
+            )
+            ego_dense = expand_event_times_to_original_path(analysis.agents[0], ego_event_times)
+            if len(ego_dense) != len(ego_plan):
+                raise RuntimeError(
+                    "sequential expanded times length {} != ego plan length {}".format(
+                        len(ego_dense), len(ego_plan)
+                    )
+                )
+            self._simultaneous_optimized_times = [ego_dense]
+            self._armed_waypoint_times_for_snapshot = list(ego_dense)
             self._simultaneous_solve_done = True
-            rospy.logdebug(
-                "MultiAgentNavigator: sequential plan solved plan_id=%s T_ego=%s ego_wp=%d peers=%d",
+            rospy.loginfo(
+                "MultiAgentNavigator: sequential event plan solved plan_id=%s T_ego=%s "
+                "sparse_wp=%d dense_wp=%d peers=%d",
                 self._multi_plan_id,
                 T_ego,
-                len(ego_times),
+                len(ego_event_times),
+                len(ego_dense),
                 len(other_paths),
             )
         except Exception as exc:
@@ -1691,34 +1807,18 @@ class MultiAgentNavigator(nav_impl.Navigator):
             self._simultaneous_solve_running = False
 
     def _simultaneous_planner_thread_main(self):
-        """Background: ``MultiAgentSimultaneousPlanner`` MILP; coordinator publishes ``MultiAgentTimingSolve``."""
+        """Background: event simultaneous MILP; coordinator publishes ``MultiAgentTimingSolve``."""
         try:
-            import social_path_planning.multi_planning as smp
-
-            smp.ROBOT_DIAMETER = float(self._multi_agent_robot_diameter)
-            smp.MAX_VELOCITY = float(self._multi_agent_max_velocity)
             occ = self._build_sp_occupancy_grid()
             if occ is None:
                 raise RuntimeError("occupancy grid missing for simultaneous planner")
             paths = self._assemble_paths_for_simultaneous()
             if not paths or any(len(p) < 1 for p in paths):
                 raise RuntimeError("invalid paths for simultaneous planner")
-            v_list = [float(self._multi_agent_max_velocity)] * len(paths)
-            planner = MultiAgentSimultaneousPlanner(occ, paths=paths, norm=1, v=v_list)
             if self._multi_agent_comm_latency_analysis:
                 self._maybe_start_constraints_phase()
-                detect_t0 = time.perf_counter()
-                collision_pairs, max_z = planner.find_collision_pairs()
-                self._centralized_detect_ms = float((time.perf_counter() - detect_t0) * 1000.0)
-                if self._constraints_phase_t0 is not None:
-                    self._constraints_ready_ms = float(
-                        (time.perf_counter() - self._constraints_phase_t0) * 1000.0
-                    )
-                self._log_comm_latency_summary(distributed_branch=False)
-                optimized_times = planner.plan_from_collision_pairs(collision_pairs, max_z)
-            else:
-                optimized_times = planner.plan()
-            self._finish_simultaneous_planner_success(optimized_times)
+            dense_times = self._run_event_simultaneous_milp(paths, occ, segment_reports=None)
+            self._finish_simultaneous_planner_success(dense_times)
         except Exception as exc:
             rospy.logerr("MultiAgentNavigator: simultaneous plan failed: %s", exc)
             try:
