@@ -29,7 +29,7 @@
   <!-- Keep every Nth A* vertex for MULTI timing only (1 = all waypoints, 2 = every other, etc.). -->
   <arg name="waypoint_stride" default="1"/>
   <!-- Endpoint distance threshold (m) for pairwise collision-pair detection in simultaneous MILP. -->
-  <arg name="robot_diameter" default="0.25"/>
+  <arg name="robot_diameter" default="0.45"/>
   <!-- Log end-to-end DDS path/constraint comm latency vs local detect time (coordinator summary). -->
   <arg name="comm_latency_analysis" default="false"/>
 
@@ -41,6 +41,7 @@
     <param name="multi_agent_waypoint_stride" value="$(arg waypoint_stride)"/>
     <param name="multi_agent_robot_diameter" value="$(arg robot_diameter)"/>
     <param name="multi_agent_comm_latency_analysis" value="$(arg comm_latency_analysis)"/>
+    <param name="stall_detection_enabled" value="false"/>
   </node>
 
   <node name="patrol_node" pkg="mattbot_navigation" type="patrol.py" output="screen" if="$(arg patrol)">
