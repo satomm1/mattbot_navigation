@@ -203,6 +203,9 @@ class Navigator:
         # Applied once when canonicalizing loaded heatmap graph keys to ROS map (col, row).
         self.use_frequent_graph_cache = rospy.get_param("~use_frequent_graph_cache", True)
         self.force_rebuild_frequent_graph = rospy.get_param("~force_rebuild_frequent_graph", False)
+        # robot_clearance: planning radius from robot center (m). StochOccupancyGrid2D.is_free()
+        # expects diameter robot_d, so we double clearance for footprint collision checks.
+        self.robot_d = 2.0 * float(rospy.get_param("~robot_clearance", 0.3))
 
         self.person_occupancy = None
         self.robot_stopped_by_person = False
@@ -648,7 +651,8 @@ class Navigator:
                 self.map_origin[1],
                 5,
                 self.map_probs,
-                wall_distance_cache_path=wall_distance_cache
+                robot_d=self.robot_d,
+                wall_distance_cache_path=wall_distance_cache,
             )
             self._init_dynamic_occupancy_grids()
 
@@ -744,6 +748,7 @@ class Navigator:
                 self.map_origin[1],
                 5,
                 empty,
+                robot_d=self.robot_d,
             )
         if self.person_occupancy is None:
             self.person_occupancy = StochOccupancyGrid2D(
@@ -754,6 +759,7 @@ class Navigator:
                 self.map_origin[1],
                 5,
                 empty,
+                robot_d=self.robot_d,
             )
         if self.object_near_occupancy is None:
             self.object_near_occupancy = StochOccupancyGrid2D(
@@ -764,6 +770,7 @@ class Navigator:
                 self.map_origin[1],
                 5,
                 empty,
+                robot_d=self.robot_d,
             )
 
     def object_map_callback(self, msg):
@@ -782,6 +789,7 @@ class Navigator:
                 self.map_origin[1],
                 5,
                 msg.data,
+                robot_d=self.robot_d,
             )
 
     def odom_callback(self, msg):
