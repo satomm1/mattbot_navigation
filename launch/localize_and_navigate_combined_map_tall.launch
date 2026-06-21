@@ -33,6 +33,9 @@
   <param name="kdx" value="1.8"/>
   <param name="kdy" value="1.8"/>
 
+  <!-- Planning radius from robot center (m); navigator doubles for footprint collision checks. -->
+  <arg name="robot_clearance" default="0.3"/>
+
   <!-- Launch the occupancy grid mapper -->
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
     
@@ -47,6 +50,7 @@
     <param name="relocalize_duration_sec" value="5.0"/>
     <param name="track_stall_grace_sec" value="1.0"/>
     <param name="nearest_free_search_radius" value="1.0"/>
+    <param name="robot_clearance" value="$(arg robot_clearance)"/>
   </node>
 
   <!-- Launch the patrol.py script only if patrol is true -->
