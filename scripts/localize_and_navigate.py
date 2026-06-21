@@ -302,8 +302,8 @@ class Navigator:
         # trajectory tracking controller parameters
         self.kpx = rospy.get_param('/kpx', 2)
         self.kpy = rospy.get_param('/kpy', 2)
-        self.kdx = rospy.get_param('/kdx', 1.5)
-        self.kdy = rospy.get_param('/kdy', 1.5)
+        self.kdx = rospy.get_param('/kdx', 2.3)
+        self.kdy = rospy.get_param('/kdy', 2.3)
 
         self.om_prev = 0.0
 
