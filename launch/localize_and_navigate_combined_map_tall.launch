@@ -11,7 +11,7 @@
   <!-- Set alpha values depending on whether 'car' is true -->
   <group if="$(arg car)">
     <param name="alpha1" value="0.05" />
-    <param name="alpha2" value="0.1" />
+    <param name="alpha2" value="0.2" />
     <param name="alpha3" value="0.1" />
     <param name="alpha4" value="0.05" />
   </group>
@@ -28,13 +28,13 @@
 
   <param name="cruising_velocity" value="0.40"/>
 
-  <param name="kpx" value="2.0"/>
-  <param name="kpy" value="2.0"/>
+  <param name="kpx" value="1.8"/>
+  <param name="kpy" value="1.8"/>
   <param name="kdx" value="1.8"/>
   <param name="kdy" value="1.8"/>
 
   <!-- Planning radius from robot center (m); navigator doubles for footprint collision checks. -->
-  <arg name="robot_clearance" default="0.3"/>
+  <arg name="robot_clearance" default="0.4"/>
 
   <!-- Launch the occupancy grid mapper -->
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
