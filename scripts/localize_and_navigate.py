@@ -305,19 +305,19 @@ class Navigator:
         # trajectory tracking controller parameters
         self.kpx = rospy.get_param('/kpx', 2)
         self.kpy = rospy.get_param('/kpy', 2)
-        self.kdx = rospy.get_param('/kdx', 1.5)
-        self.kdy = rospy.get_param('/kdy', 1.5)
+        self.kdx = rospy.get_param('/kdx', 2.3)
+        self.kdy = rospy.get_param('/kdy', 2.3)
 
         self.om_prev = 0.0
 
         # Get AMCL parameters to use
-        self.alpha1 = rospy.get_param('/alpha1', 0.8)
-        self.alpha2 = rospy.get_param('/alpha2', 0.8)
-        self.alpha3 = rospy.get_param('/alpha3', 0.8)
-        self.alpha4 = rospy.get_param('/alpha4', 0.8)
+        self.alpha1 = rospy.get_param('/alpha1', 0.1)
+        self.alpha2 = rospy.get_param('/alpha2', 0.1)
+        self.alpha3 = rospy.get_param('/alpha3', 0.1)
+        self.alpha4 = rospy.get_param('/alpha4', 0.1)
         self.z_hit = rospy.get_param('/z_hit', 0.95)
         self.z_rand = rospy.get_param('/z_rand', 0.05)
-        self.sigma_hit = rospy.get_param('/sigma_hit', 0.01)
+        self.sigma_hit = rospy.get_param('/sigma_hit', 0.15)
 
         self.track_accel_max = rospy.get_param('~track_accel_max', 0.3)
         self.track_soft_start_sec = rospy.get_param('~track_soft_start_sec', 1.5)

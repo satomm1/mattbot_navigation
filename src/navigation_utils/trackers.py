@@ -11,7 +11,7 @@ class TrajectoryTracker:
     """ Trajectory tracking controller using differential flatness """
 
     def __init__(self, kpx, kpy, kdx, kdy,
-                 V_max=0.6, om_max=1, a_max=0.3, soft_start_sec=1.5,
+                 V_max=0.6, om_max=2, a_max=0.3, soft_start_sec=1.5,
                  hold_enter_speed=0.03, hold_exit_speed=0.08,
                  hold_pos_tol=0.08, hold_kp_pos=1.8, hold_kp_heading=2.5):
         self.kpx = kpx
