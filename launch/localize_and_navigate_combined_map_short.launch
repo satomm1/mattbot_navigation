@@ -6,13 +6,13 @@
 
   <arg name="patrol" default="false" />
 
-  <param name="alpha1" value="0.8"/>
-  <param name="alpha2" value="0.8"/>
-  <param name="alpha3" value="0.8"/>
-  <param name="alpha4" value="0.8"/>
-  <param name="z_hit"  value="0.95"/>
-  <param name="z_rand" value="0.05"/>
-  <param name="sigma_hit" value="0.2"/>
+  <param name="alpha1" value="0.05"/>
+  <param name="alpha2" value="0.1"/>
+  <param name="alpha3" value="0.1"/>
+  <param name="alpha4" value="0.05"/>
+  <param name="z_hit"  value="0.90"/>
+  <param name="z_rand" value="0.10"/>
+  <param name="sigma_hit" value="0.15"/>
 
   <param name="cruising_velocity" value="0.40"/>
 
