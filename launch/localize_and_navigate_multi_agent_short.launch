@@ -5,6 +5,9 @@
   <param name="camera_inverted" type="bool" value="false" />
 
   <arg name="patrol" default="false" />
+  <arg name="enable_depth_occupancy_grid" default="false" />
+
+  <param name="enable_depth_occupancy_grid" value="$(arg enable_depth_occupancy_grid)"/>
 
   <param name="alpha1" value="0.8"/>
   <param name="alpha2" value="0.8"/>
