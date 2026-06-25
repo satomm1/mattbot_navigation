@@ -9,7 +9,7 @@
 
   <!-- Launch the occupancy grid mapper -->
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
-    
+    <param name="enable_depth_occupancy_grid" value="false"/>
   </node>
 
 </launch>

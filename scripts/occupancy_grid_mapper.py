@@ -27,10 +27,13 @@ class Map:
         self.robot_d = rospy.get_param('robot_d', 0.6)
         self.camera_inverted = rospy.get_param('camera_inverted', False)
         self.is_test = rospy.get_param('is_test', False)
-
-        # Tuning parameters for the inverse range sensor model
-        self.alpha = 0.2   # 0.1 meters
-        self.beta = 0.035  # 2 radians
+        self.enable_depth_occupancy_grid = rospy.get_param(
+            'enable_depth_occupancy_grid', False
+        )
+        if self.enable_depth_occupancy_grid:
+            rospy.loginfo("Depth occupancy grid enabled")
+        else:
+            rospy.loginfo("Depth occupancy grid disabled")
 
         self.trans_listener = tf.TransformListener()
 
@@ -52,26 +55,75 @@ class Map:
         self.robot_mode = 0
         self.robot_mode_subscriber = rospy.Subscriber('/robot_mode', Int32, self.robot_mode_callback, queue_size=10)
 
-        self.new_map = OccupancyGrid()
-        self.new_map.header = self.map_msg.header
-        self.new_map.info = self.map_msg.info
-        self.new_map.data = self.map_msg.data
         self.width = self.map_msg.info.width
         self.height = self.map_msg.info.height
         self.resolution = self.map_msg.info.resolution
 
-        self.new_map_as_np = StochOccupancyGrid2D(self.new_map.info.resolution, 
-                                                       self.new_map.info.width, 
-                                                      self.new_map.info.height, 
-                                           self.new_map.info.origin.position.x, 
-                                           self.new_map.info.origin.position.y, 
-                                                                             5,                     
-                                                             self.new_map.data)
+        self.new_map = None
+        self.new_map_as_np = None
+        self.new_map_publisher = None
+
+        # Publisher if valid points or not (due to being too close)
+        self.valid_points = True
+        self.valid_points_pub = rospy.Publisher('/valid_points', Bool, queue_size=10)
+
+        # Prepare the combined map and the publisher (contains objects + occupancy grid map)
+        self.combined_map = OccupancyGrid()
+        self.combined_map.header = self.map_msg.header
+        self.combined_map.info = self.map_msg.info
+        self.combined_map_publisher = rospy.Publisher(
+            '/navigation_map', OccupancyGrid, queue_size=1, latch=True
+        )
+        self.object_map_publisher = rospy.Publisher('/object_map', OccupancyGrid, queue_size=10)
+
+        if self.enable_depth_occupancy_grid:
+            self._init_depth_occupancy_grid()
+        else:
+            self.valid_points_pub.publish(Bool(data=True))
+
+        self.proposed_objects = []
+        self.detected_objects = []
+        self.num_detected_objects = 0
+        self.object_marker_array = MarkerArray()
+
+        self.detected_object_map = np.ones((self.height, self.width))*-1
+        self.confirmed_object_publisher = rospy.Publisher('/confirmed_objects', DetectedObject, queue_size=10)
+        self.object_marker_publisher = rospy.Publisher('/object_array', MarkerArray, queue_size=10)
+
+        self.person_static_map = np.ones((self.height, self.width))*-1  # Map for tracking people
+        self.person_moving_map = np.ones((self.height, self.width))*-1  # Map for tracking people
+        self.person_dict = dict()  # Dictionary for tracking people
+        self.person_subscriber = rospy.Subscriber('/person', PersonArray, self.person_callback, queue_size=10)
+
+        # Baseline /navigation_map from static SLAM + mod layers so navigators do not depend
+        # on the first depth frame (which may be delayed or skipped).
+        self._publish_navigation_map()
+
+    def _init_depth_occupancy_grid(self):
+        """Initialize camera-depth stochastic occupancy grid (optional, CPU-heavy)."""
+        # Tuning parameters for the inverse range sensor model
+        self.alpha = 0.2   # 0.1 meters
+        self.beta = 0.035  # 2 radians
+
+        self.new_map = OccupancyGrid()
+        self.new_map.header = self.map_msg.header
+        self.new_map.info = self.map_msg.info
+        self.new_map.data = self.map_msg.data
+
+        self.new_map_as_np = StochOccupancyGrid2D(
+            self.new_map.info.resolution,
+            self.new_map.info.width,
+            self.new_map.info.height,
+            self.new_map.info.origin.position.x,
+            self.new_map.info.origin.position.y,
+            5,
+            self.new_map.data,
+        )
 
         # Load the saved occupancy grid 
         rospack = rospkg.RosPack()
         package_path = rospack.get_path('mattbot_navigation')
-        
+
         print("\n\n****************")
         try:
             with open(os.path.join(package_path, 'maps', 'occupancy_grid_map.json'), 'r') as f:
@@ -98,19 +150,6 @@ class Map:
         # Publish the occupancy grid map
         self.new_map_publisher = rospy.Publisher('/new_map', OccupancyGrid, queue_size=10)
         self.new_map_publisher.publish(self.new_map)
-
-        # Publisher if valid points or not (due to being too close)
-        self.valid_points = True
-        self.valid_points_pub = rospy.Publisher('/valid_points', Bool, queue_size=10)
-
-        # Prepare the combined map and the publisher (contains objects + occupancy grid map)
-        self.combined_map = OccupancyGrid()
-        self.combined_map.header = self.map_msg.header
-        self.combined_map.info = self.map_msg.info
-        self.combined_map_publisher = rospy.Publisher(
-            '/navigation_map', OccupancyGrid, queue_size=1, latch=True
-        )
-        self.object_map_publisher = rospy.Publisher('/object_map', OccupancyGrid, queue_size=10)
 
         camera_info_msg = rospy.wait_for_message("/camera/color/camera_info", CameraInfo)
         camera_info = camera_info_msg.K
@@ -147,24 +186,6 @@ class Map:
         self.is_turning = False
 
         self.no_see_radius = self.camera_height / np.tan(0.7941248)  # Orbecc has 45.5 degrees vertical FOV, can't see this distance so don't update
-
-        self.proposed_objects = []
-        self.detected_objects = []
-        self.num_detected_objects = 0
-        self.object_marker_array = MarkerArray()
-
-        self.detected_object_map = np.ones((self.height, self.width))*-1
-        self.confirmed_object_publisher = rospy.Publisher('/confirmed_objects', DetectedObject, queue_size=10)
-        self.object_marker_publisher = rospy.Publisher('/object_array', MarkerArray, queue_size=10)
-
-        self.person_static_map = np.ones((self.height, self.width))*-1  # Map for tracking people
-        self.person_moving_map = np.ones((self.height, self.width))*-1  # Map for tracking people
-        self.person_dict = dict()  # Dictionary for tracking people
-        self.person_subscriber = rospy.Subscriber('/person', PersonArray, self.person_callback, queue_size=10)
-
-        # Baseline /navigation_map from static SLAM + mod layers so navigators do not depend
-        # on the first depth frame (which may be delayed or skipped).
-        self._publish_navigation_map()
 
     def _build_combined_map_data(self, camera_location=None):
         """Merge static SLAM, map_mod, and dynamic layers into one grid (height, width)."""
@@ -880,8 +901,11 @@ class Map:
         self.sensor_objects = dict()
         self.num_removed_objects = 0
 
-        self.cmd_vel_subscriber = rospy.Subscriber('/cmd_vel', Twist, self.cmd_vel_callback, queue_size=1)
-        self.point_cloud_subscriber = rospy.Subscriber('/camera/depth_registered/points', PointCloud2, self.point_callback, queue_size=1)
+        if self.enable_depth_occupancy_grid:
+            self.cmd_vel_subscriber = rospy.Subscriber('/cmd_vel', Twist, self.cmd_vel_callback, queue_size=1)
+            self.point_cloud_subscriber = rospy.Subscriber(
+                '/camera/depth_registered/points', PointCloud2, self.point_callback, queue_size=1
+            )
         self.detected_object_subscriber = rospy.Subscriber('/detected_objects', DetectedObjectArray, self.detected_objects_callback, queue_size=10)
         self.object_from_agent_subscriber = rospy.Subscriber('/object_from_agent', DetectedObject, self.object_from_agent_callback, queue_size=10)
         self.object_from_sensor_subscriber = rospy.Subscriber('/object_from_sensor', DetectedObjectArray, self.object_from_sensor_callback, queue_size=10)
@@ -890,7 +914,10 @@ class Map:
 
     def shutdown(self):
         rospy.loginfo("Shutting down Occupancy Grid Mapper")
-        
+
+        if not self.enable_depth_occupancy_grid or self.new_map_as_np is None:
+            return
+
         # Only save if self.new_map_as_np is not all zeros
         if np.sum(np.abs(self.new_map_as_np.l)) == 0:
             return
