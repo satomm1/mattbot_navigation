@@ -35,11 +35,14 @@ class Map:
         else:
             rospy.loginfo("Depth occupancy grid disabled")
 
+        self.enable_object_blockout = rospy.get_param('enable_object_blockout', True)
         self.max_object_blockout_width = float(
             rospy.get_param('max_object_blockout_width', 0.5)
         )
         rospy.loginfo(
-            "Max object planning blockout width: %.2fm", self.max_object_blockout_width
+            "Object map blockout: %s (max width %.2fm)",
+            "enabled" if self.enable_object_blockout else "disabled",
+            self.max_object_blockout_width,
         )
 
         self.trans_listener = tf.TransformListener()
@@ -120,14 +123,17 @@ class Map:
         return x_min, x_max, y_min, y_max, blockout_w
 
     def _set_detected_object_blockout(self, x, y, width):
-        x_min, x_max, y_min, y_max, blockout_w = self._detected_object_blockout_indices(
-            x, y, width
-        )
+        blockout_w = self._planning_blockout_width(width)
+        if not self.enable_object_blockout:
+            return blockout_w
+        x_min, x_max, y_min, y_max, _ = self._detected_object_blockout_indices(x, y, width)
         if x_min < x_max and y_min < y_max:
             self.detected_object_map[y_min:y_max, x_min:x_max] = 100
         return blockout_w
 
     def _clear_detected_object_blockout(self, x, y, blockout_width):
+        if not self.enable_object_blockout:
+            return
         x_min, x_max, y_min, y_max, _ = self._detected_object_blockout_indices(
             x, y, blockout_width
         )
