@@ -39,11 +39,19 @@ class Map:
         self.max_object_blockout_width = float(
             rospy.get_param('max_object_blockout_width', 0.5)
         )
+        self.object_blockout_ttl_sec = float(
+            rospy.get_param('object_blockout_ttl_sec', 30.0)
+        )
         rospy.loginfo(
             "Object map blockout: %s (max width %.2fm)",
             "enabled" if self.enable_object_blockout else "disabled",
             self.max_object_blockout_width,
         )
+        if self.enable_object_blockout and self.object_blockout_ttl_sec > 0:
+            rospy.loginfo(
+                "Object blockout TTL: %.1fs (remove only in IDLE)",
+                self.object_blockout_ttl_sec,
+            )
 
         self.trans_listener = tf.TransformListener()
 
@@ -139,6 +147,35 @@ class Map:
         )
         if x_min < x_max and y_min < y_max:
             self.detected_object_map[y_min:y_max, x_min:x_max] = -1
+
+    def _remove_detected_object(self, x, y, blockout_w):
+        """Clear blockout cells, delete RViz marker, republish /object_map and /object_array."""
+        self._clear_detected_object_blockout(x, y, blockout_w)
+        for j in range(len(self.object_marker_array.markers)):
+            marker = self.object_marker_array.markers[j]
+            if np.sqrt((marker.pose.position.x - x)**2 + (marker.pose.position.y - y)**2) < blockout_w:
+                self.object_marker_array.markers[j].action = Marker.DELETE
+                break
+        map_data = self.detected_object_map.flatten().astype(int).tolist()
+        self.object_map_publisher.publish(
+            OccupancyGrid(header=self.map_msg.header, info=self.map_msg.info, data=map_data)
+        )
+        self.object_marker_publisher.publish(self.object_marker_array)
+        self.num_removed_objects += 1
+
+    def _expire_detected_objects(self, _event):
+        if not self.enable_object_blockout or self.object_blockout_ttl_sec <= 0:
+            return
+        # Navigator Mode.IDLE == 0; do not clear blockouts during ALIGN/TRACK/etc.
+        if self.robot_mode != 0:
+            return
+        # TTL is fixed from add time; may elapse during nav, but removal waits for IDLE.
+        now = rospy.get_rostime().to_sec()
+        for i in range(len(self.detected_objects) - 1, -1, -1):
+            x, y, w, t_added = self.detected_objects[i]
+            if now - t_added >= self.object_blockout_ttl_sec:
+                self.detected_objects.pop(i)
+                self._remove_detected_object(x, y, w)
 
     def _init_depth_occupancy_grid(self):
         """Initialize camera-depth stochastic occupancy grid (optional, CPU-heavy)."""
@@ -687,7 +724,7 @@ class Map:
 
                             # Matches a proposed object, add to detected objects 
                             blockout_w = self._set_detected_object_blockout(x, y, obj.width)
-                            self.detected_objects.append([x, y, blockout_w])
+                            self.detected_objects.append([x, y, blockout_w, rospy.get_rostime().to_sec()])  # [x, y, w, t_added]
                             self.num_detected_objects += 1
                             print("Number of detected objects: ", self.num_detected_objects - self.num_removed_objects)
 
@@ -738,7 +775,7 @@ class Map:
 
         # If the object does not already exist, add it to the detected objects
         blockout_w = self._set_detected_object_blockout(x, y, width)
-        self.detected_objects.append([x, y, blockout_w])
+        self.detected_objects.append([x, y, blockout_w, rospy.get_rostime().to_sec()])  # [x, y, w, t_added]
         self.num_detected_objects += 1
         print("Added object from other agent")
         print("Number of detected objects: ", self.num_detected_objects - self.num_removed_objects)
@@ -786,7 +823,7 @@ class Map:
             # If the object does not already exist, add it to the detected objects
             if not obj_exists:
                 blockout_w = self._set_detected_object_blockout(x, y, width)
-                self.detected_objects.append([x, y, blockout_w])
+                self.detected_objects.append([x, y, blockout_w, rospy.get_rostime().to_sec()])  # [x, y, w, t_added]
                 self.num_detected_objects += 1
                 print("Added object from sensor")
                 print("Number of detected objects: ", self.num_detected_objects - self.num_removed_objects)
@@ -805,27 +842,12 @@ class Map:
                 if i not in sensed_object_indx:
                     old_x, old_y, old_width = self.sensor_objects[sensor_id][i]
                     for j in range(len(self.detected_objects)):
-                        obj  = self.detected_objects[j]
+                        obj = self.detected_objects[j]
                         if np.sqrt((obj[0] - old_x)**2 + (obj[1] - old_y)**2) < old_width:
-                            self.detected_objects.remove(obj)
-                            self._clear_detected_object_blockout(obj[0], obj[1], obj[2])
-
-                            # Publish updated map
-                            map_data = self.detected_object_map.flatten().astype(int).tolist()
-                            self.object_map_publisher.publish(OccupancyGrid(header=self.map_msg.header, info=self.map_msg.info, data=map_data))
-                            
+                            self.detected_objects.pop(j)
+                            print("Removed object from sensor")
+                            self._remove_detected_object(obj[0], obj[1], obj[2])
                             break
-                    # Remove the marker
-                    print("Removed object from sensor")
-                    self.num_removed_objects += 1
-
-                    # Remove corresponding marker
-                    for j in range(len(self.object_marker_array.markers)):
-                        marker = self.object_marker_array.markers[j]
-                        if np.sqrt((marker.pose.position.x - old_x)**2 + (marker.pose.position.y - old_y)**2) < old_width:
-                            self.object_marker_array.markers[j].action = Marker.DELETE
-                            break
-                    self.object_marker_publisher.publish(self.object_marker_array)
 
         # Update the sensor objects
         self.sensor_objects[sensor_id] = new_object_list
@@ -931,6 +953,8 @@ class Map:
         self.object_from_agent_subscriber = rospy.Subscriber('/object_from_agent', DetectedObject, self.object_from_agent_callback, queue_size=10)
         self.object_from_sensor_subscriber = rospy.Subscriber('/object_from_sensor', DetectedObjectArray, self.object_from_sensor_callback, queue_size=10)
         self.labeled_sub = rospy.Subscriber("/labeled_unknown_objects", LabeledObjectArray, self.labeled_callback, queue_size=10)
+        if self.enable_object_blockout and self.object_blockout_ttl_sec > 0:
+            rospy.Timer(rospy.Duration(1.0), self._expire_detected_objects, oneshot=False)
         rospy.spin()
 
     def shutdown(self):
