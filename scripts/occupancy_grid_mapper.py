@@ -610,9 +610,6 @@ class Map:
             if obj.class_name == "unknown" or obj.class_name == "person":
                 continue
 
-            if obj.class_name != "cone":
-                continue
-
             # Check if the object already exists in the detected objects
             already_exists = False
             x = obj.pose.position.x
