@@ -35,6 +35,13 @@ class Map:
         else:
             rospy.loginfo("Depth occupancy grid disabled")
 
+        self.max_object_blockout_width = float(
+            rospy.get_param('max_object_blockout_width', 0.5)
+        )
+        rospy.loginfo(
+            "Max object planning blockout width: %.2fm", self.max_object_blockout_width
+        )
+
         self.trans_listener = tf.TransformListener()
 
         self.is_localized = False
@@ -98,6 +105,34 @@ class Map:
         # Baseline /navigation_map from static SLAM + mod layers so navigators do not depend
         # on the first depth frame (which may be delayed or skipped).
         self._publish_navigation_map()
+
+    def _planning_blockout_width(self, width):
+        """Cap reported object width used for /object_map and detected_object_map."""
+        return min(float(width), self.max_object_blockout_width)
+
+    def _detected_object_blockout_indices(self, x, y, width):
+        """Grid index bounds for a square blockout centered at (x, y), clipped to the map."""
+        blockout_w = self._planning_blockout_width(width)
+        x_min = max(int((x - blockout_w / 2) / self.resolution), 0)
+        x_max = min(int((x + blockout_w / 2) / self.resolution), self.width)
+        y_min = max(int((y - blockout_w / 2) / self.resolution), 0)
+        y_max = min(int((y + blockout_w / 2) / self.resolution), self.height)
+        return x_min, x_max, y_min, y_max, blockout_w
+
+    def _set_detected_object_blockout(self, x, y, width):
+        x_min, x_max, y_min, y_max, blockout_w = self._detected_object_blockout_indices(
+            x, y, width
+        )
+        if x_min < x_max and y_min < y_max:
+            self.detected_object_map[y_min:y_max, x_min:x_max] = 100
+        return blockout_w
+
+    def _clear_detected_object_blockout(self, x, y, blockout_width):
+        x_min, x_max, y_min, y_max, _ = self._detected_object_blockout_indices(
+            x, y, blockout_width
+        )
+        if x_min < x_max and y_min < y_max:
+            self.detected_object_map[y_min:y_max, x_min:x_max] = -1
 
     def _init_depth_occupancy_grid(self):
         """Initialize camera-depth stochastic occupancy grid (optional, CPU-heavy)."""
@@ -645,16 +680,10 @@ class Map:
                             self.proposed_objects.pop(ii)
 
                             # Matches a proposed object, add to detected objects 
-                            self.detected_objects.append([x, y, obj.width])
+                            blockout_w = self._set_detected_object_blockout(x, y, obj.width)
+                            self.detected_objects.append([x, y, blockout_w])
                             self.num_detected_objects += 1
                             print("Number of detected objects: ", self.num_detected_objects - self.num_removed_objects)
-
-                            # Block out area in map based on the width of the object
-                            x_min = int((x - obj.width/2)/self.resolution)
-                            x_max = int((x + obj.width/2)/self.resolution)
-                            y_min = int((y - obj.width/2)/self.resolution)
-                            y_max = int((y + obj.width/2)/self.resolution)
-                            self.detected_object_map[y_min:y_max, x_min:x_max] = 100
 
                             # Create a marker for the object to show in RViz
                             marker = self.get_marker(x, y, self.num_detected_objects)
@@ -702,16 +731,11 @@ class Map:
                 return
 
         # If the object does not already exist, add it to the detected objects
-        self.detected_objects.append([x, y, width])
+        blockout_w = self._set_detected_object_blockout(x, y, width)
+        self.detected_objects.append([x, y, blockout_w])
         self.num_detected_objects += 1
         print("Added object from other agent")
         print("Number of detected objects: ", self.num_detected_objects - self.num_removed_objects)
-
-        x_min = int((x - width/2)/self.resolution)
-        x_max = int((x + width/2)/self.resolution)
-        y_min = int((y - width/2)/self.resolution)
-        y_max = int((y + width/2)/self.resolution)
-        self.detected_object_map[y_min:y_max, x_min:x_max] = 100
 
         # Create a marker for the object to show in RViz
         marker = self.get_marker(x, y, self.num_detected_objects)
@@ -755,16 +779,11 @@ class Map:
 
             # If the object does not already exist, add it to the detected objects
             if not obj_exists:
-                self.detected_objects.append([x, y, width])
+                blockout_w = self._set_detected_object_blockout(x, y, width)
+                self.detected_objects.append([x, y, blockout_w])
                 self.num_detected_objects += 1
                 print("Added object from sensor")
                 print("Number of detected objects: ", self.num_detected_objects - self.num_removed_objects)
-
-                x_min = int((x - width/2)/self.resolution)
-                x_max = int((x + width/2)/self.resolution)
-                y_min = int((y - width/2)/self.resolution)
-                y_max = int((y + width/2)/self.resolution)
-                self.detected_object_map[y_min:y_max, x_min:x_max] = 100
 
                 # Publish updated map
                 map_data = self.detected_object_map.flatten().astype(int).tolist()
@@ -783,11 +802,7 @@ class Map:
                         obj  = self.detected_objects[j]
                         if np.sqrt((obj[0] - old_x)**2 + (obj[1] - old_y)**2) < old_width:
                             self.detected_objects.remove(obj)
-                            x_min = int((obj[0] - obj[2]/2)/self.resolution)
-                            x_max = int((obj[0] + obj[2]/2)/self.resolution)
-                            y_min = int((obj[1] - obj[2]/2)/self.resolution)
-                            y_max = int((obj[1] + obj[2]/2)/self.resolution)
-                            self.detected_object_map[y_min:y_max, x_min:x_max] = -1
+                            self._clear_detected_object_blockout(obj[0], obj[1], obj[2])
 
                             # Publish updated map
                             map_data = self.detected_object_map.flatten().astype(int).tolist()
