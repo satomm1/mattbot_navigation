@@ -152,6 +152,7 @@ DELTA_THRES = 0.1
 
 PERSON_STOP_DISTANCE = 1.6  # distance to closest person at which we stop the robot
 PERSON_SLOW_DISTANCE = 2.5  # distance to closest person at which we slow down the robot
+PERSON_SLOW_SCALE = 0.5  # cmd_vel scale in slow zone; plan clock uses same factor
 OBJECT_STOP_DISTANCE = 1.5
 AGENT_STOP_DISTANCE = 2
 
@@ -229,6 +230,7 @@ class Navigator:
         self.person_occupancy = None
         self.robot_stopped_by_person = False
         self.robot_slowed_by_person = False
+        self._plan_clock_last_wall = None  # rospy.Time; for per-cycle dt in clock slip
         self.person_in_path = False
         self.person_list1 = []
         self.person_list2 = []
@@ -1112,6 +1114,7 @@ class Navigator:
         if new_mode == Mode.TRACK:
             self.track_start_time = rospy.get_rostime().to_sec()
             self._odom_history = []
+            self._reset_plan_clock_slip()
         self.mode = new_mode
         self.state_pub.publish(self.mode.value)
 
@@ -1309,47 +1312,33 @@ class Navigator:
 
     def modify_velocity_for_person(self, V, om):
         """
-        Modifies the velocity based on the distance to the closest person.
-        If the distance is less than a threshold, it slows down or stops the robot.
+        Scale cmd_vel for nearby people (TRACK mode only).
+        Full stop -> STOPPED_FOR_PERSON mode + replan on resume (run loop).
+        Slow zone -> scale by PERSON_SLOW_SCALE; plan clock slip in publish_control.
         """
         if self.distance_to_person < PERSON_STOP_DISTANCE and self.person_in_path:
             self.robot_slowed_by_person = False
-            # Stop
             V = 0.0
             om = 0.0
-            
-            # Keep track of how long we've been stopped
             if not self.robot_stopped_by_person:
                 self.stopped_for_person_time = rospy.get_rostime().to_sec()
                 _nav_loginfo("Stopping for person")
-
-                data = {'query': "Excuse Me!", 'query_type': 'print_to_screen'}
-                try:
-                    response = requests.post(self.url, json=data)
-                except requests.exceptions.RequestException as e:
-                    _nav_loginfo("Error sending request: %s", e)
-
+                # data = {'query': "Excuse Me!", 'query_type': 'print_to_screen'}
+                # try:
+                #     requests.post(self.url, json=data)
+                # except requests.exceptions.RequestException as e:
+                #     _nav_loginfo("Error sending request: %s", e)
                 self.switch_mode(Mode.STOPPED_FOR_PERSON)
-
             self.robot_stopped_by_person = True
-        elif self.distance_to_person < PERSON_SLOW_DISTANCE:
+            return V, om
+
+        if self.distance_to_person < PERSON_SLOW_DISTANCE:
             if not self.robot_slowed_by_person:
                 _nav_loginfo("Slowing down for person")
                 self.robot_slowed_by_person = True
-            # Slow down
-            V *= 0.5
-            om *= 0.5
-        elif self.robot_stopped_by_person:
-            self.robot_slowed_by_person = False
-            # If we were stopped by a person, we can start moving again
-            self.robot_stopped_by_person = False
+            return V * PERSON_SLOW_SCALE, om * PERSON_SLOW_SCALE
 
-            _nav_loginfo("Resuming motion after stopping for person")
-
-            self.replan()
-        else:
-            self.robot_slowed_by_person = False
-
+        self.robot_slowed_by_person = False
         return V, om
 
     def replan_for_object(self):
@@ -1409,6 +1398,22 @@ class Navigator:
         # returns the time since the current plan started
         t = (rospy.get_rostime() - self.current_plan_start_time).to_sec()
         return max(0.0, t)  # clip negative time to 0
+
+    def _reset_plan_clock_slip(self):
+        self._plan_clock_last_wall = None
+
+    def _advance_plan_clock_slip(self, ref_scale):
+        """
+        Slip plan start forward so reference time advances at ref_scale.
+        Paired with PERSON_SLOW_SCALE so the tracker does not fall behind and surge on exit
+        (same idea as TrajectoryTracker soft-start reference lag).
+        """
+        now = rospy.get_rostime()
+        if self._plan_clock_last_wall is not None:
+            dt = (now - self._plan_clock_last_wall).to_sec()
+            if dt > 0:
+                self.current_plan_start_time += rospy.Duration(dt * (1.0 - ref_scale))
+        self._plan_clock_last_wall = now
 
     def replan(self, obj_x=[], obj_y=[], obj_d=[]):
         """
@@ -1561,6 +1566,7 @@ class Navigator:
         self.unsmoothed_plan = planned_path
 
         self.current_plan_start_time = rospy.get_rostime()
+        self._reset_plan_clock_slip()
         self.current_plan_duration = t_new[-1]
 
         self._set_park_goal_from_traj(traj_new)
@@ -1626,8 +1632,11 @@ class Navigator:
                 self.x, self.y, self.theta, t
             )
 
-            # Check if we need to modify the velocity for a person
             V, om = self.modify_velocity_for_person(V, om)
+            if self.robot_slowed_by_person:
+                self._advance_plan_clock_slip(PERSON_SLOW_SCALE)
+            else:
+                self._reset_plan_clock_slip()
         elif self.mode == Mode.ALIGN:
             if self._in_post_align_pause():
                 V, om = 0.0, 0.0
@@ -1784,7 +1793,7 @@ class Navigator:
                     self.replan()
                 elif len(self.waypoints) > 0 and not self.robot_stopped_by_person:
                     # If we have waypoints, check if we have reached them in time
-                    if current_time - self.current_plan_start_time.to_sec() > self.waypoints[0][2]:
+                    if self.get_current_plan_time() > self.waypoints[0][2]:
                         _nav_loginfo("Backing up because haven't reached waypoint")
                         self.backing_start_time = current_time
                         self.backing_for_waypoints = True
@@ -1823,7 +1832,7 @@ class Navigator:
                 #     # Now replan
                 #     self.replan(obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
 
-                if ((rospy.get_rostime() - self.current_plan_start_time).to_sec() > self.current_plan_duration * 1.2):
+                if self.get_current_plan_time() > self.current_plan_duration * 1.2:
                     if (self.x_g is not None and self.y_g is not None and np.linalg.norm(np.array([self.x - self.x_g, self.y - self.y_g])) > 0.5):
                         _nav_loginfo("replanning because out of time")
 
