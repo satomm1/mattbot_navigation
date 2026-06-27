@@ -494,7 +494,7 @@ class Navigator:
         Callback for RViz goals, transforms the goal to the map frame and checks if it is valid
         """
         
-        print("RViz goal received")
+        _nav_loginfo("RViz goal received")
         origin_frame = "map"
         try:
             nav_pose_origin = self.trans_listener.transformPose(origin_frame, msg)
@@ -511,8 +511,7 @@ class Navigator:
             self.external_goal_callback(new_msg)
 
         except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
-            print("RVIZ Goal exception:")
-            print(e)
+            _nav_loginfo("RVIZ Goal exception: %s", e)
 
     def map_md_callback(self, msg):
         """
@@ -727,9 +726,7 @@ class Navigator:
             and self.occupancy is None
         ):
 
-            print("+"*50)
-            print("Assigned Occupancy Grid Map!")
-            print("+"*50)
+            _nav_loginfo("Assigned Occupancy Grid Map!")
 
             wall_distance_cache = None
             if self.use_social_astar:
@@ -1330,7 +1327,7 @@ class Navigator:
                 try:
                     response = requests.post(self.url, json=data)
                 except requests.exceptions.RequestException as e:
-                    print(f"Error sending request: {e}")
+                    _nav_loginfo("Error sending request: %s", e)
 
                 self.switch_mode(Mode.STOPPED_FOR_PERSON)
 
@@ -1374,7 +1371,7 @@ class Navigator:
         for point in path:
             xy = np.asarray(point, dtype=float).reshape(-1)[:2]
             if not self.object_occupancy.is_free(xy):
-                print("Path no longer valid...")
+                _nav_loginfo("Path no longer valid...")
                 return False
         return True
     
@@ -1486,10 +1483,10 @@ class Navigator:
                     desired_dist_right_extra=0.25,
                 )
 
-                print("+"*5 + "Using social A* with graph" + "+"*5)
+                _nav_loginfo("+"*5 + "Using social A* with graph" + "+"*5)
             else:
                 problem = SocialAStar(state_min, state_max, x_init, x_goal, combined_occupancy, self.plan_resolution)
-                print("+"*5 + "Using social A*" + "+"*5)
+                _nav_loginfo("+"*5 + "Using social A*" + "+"*5)
         else:
             problem = AStar(
                 state_min,
@@ -1703,7 +1700,7 @@ class Navigator:
                     _nav_loginfo("waiting for state info")
                 if self.mode != Mode.IDLE and self.mode != Mode.WAITING_FOR_INIT:
                     self.switch_mode(Mode.IDLE)
-                    print(e)
+                    _nav_loginfo("Error occurred while looking up transform: %s", e)
                 pass
 
             self.replanning_from_object = False
@@ -1753,7 +1750,7 @@ class Navigator:
                         'odom_alpha4': self.alpha4
                     }
                     client.update_configuration(params)
-                    print("Updated AMCL parameters for better localization after initial pose.")
+                    _nav_loginfo("Updated AMCL parameters for better localization after initial pose.")
 
             elif self.mode == Mode.ALIGN:
                 if self._aligned_since is not None:
@@ -1788,27 +1785,23 @@ class Navigator:
                 elif len(self.waypoints) > 0 and not self.robot_stopped_by_person:
                     # If we have waypoints, check if we have reached them in time
                     if current_time - self.current_plan_start_time.to_sec() > self.waypoints[0][2]:
-                        print("******************************************")
-                        print("Backing up because haven't reached waypoint")
-                        print("******************************************")
+                        _nav_loginfo("Backing up because haven't reached waypoint")
                         self.backing_start_time = current_time
                         self.backing_for_waypoints = True
                         self.switch_mode(Mode.BACKING)
                     elif np.linalg.norm(np.array([self.x - self.waypoints[0][0], self.y - self.waypoints[0][1]])) < 0.35:
-                        # print("Waypoint reached")
+                        # _nav_loginfo("Waypoint reached")
                         self.waypoints.pop(0)  # Remove the first waypoint since we are close to it
                 
                 if self.agent_intersect_path() and not self.is_lowest_id:
                     # self.switch_mode(Mode.STOPPED_FOR_AGENT)
-                    # print("Agent in Path---Stopping")
+                    # _nav_loginfo("Agent in Path---Stopping")
                     # self.stopped_for_agents = True
                     pass
 
                 # if self.replan_for_object():
                 #     # If we are too close to an object, stop and replan
-                #     print("******************************************")
-                #     print("Replanning because object in path")
-                #     print("******************************************")
+                #     _nav_loginfo("Replanning because object in path")
 
                 #     self.replanning_from_object = True
 
@@ -1907,9 +1900,7 @@ class Navigator:
                 current_time = rospy.get_rostime().to_sec()
                 if current_time - self.stopped_for_person_time > 5:
                     # If we have been stopped by a person for more than 5 seconds, replan
-                    print("******************************************")
-                    print("Replanning because person in path")
-                    print("******************************************")
+                    _nav_loginfo("Replanning because person in path")
 
                     self.switch_mode(Mode.IDLE)
                     self.robot_stopped_by_person = False
@@ -1923,9 +1914,7 @@ class Navigator:
 
                     self.replan(obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
                 elif self.distance_to_person > PERSON_STOP_DISTANCE:
-                    print("******************************************")
-                    print("Replanning because person no longer in path")
-                    print("******************************************")
+                    _nav_loginfo("Replanning because person no longer in path")
                     
                     self.switch_mode(Mode.IDLE)
                     self.robot_stopped_by_person = False
@@ -1935,9 +1924,7 @@ class Navigator:
 
                 if not self.agent_intersect_path():
                     # If there are no agents in the path, we can replan
-                    print("******************************************")
-                    print("Replanning because agent no longer in path")
-                    print("******************************************")
+                    _nav_loginfo("Replanning because agent no longer in path")
 
                     self.switch_mode(Mode.IDLE)
                     self.replan()
@@ -1946,11 +1933,9 @@ class Navigator:
                     moving_agents_in_path = self.agents_in_path.intersection(set(self.other_agents_not_static))
                     if len(moving_agents_in_path) == 0:
                         # No moving agents, replan around the static agents:
-                        print("******************************************")
-                        print("Replanning because no moving agents in path")
-                        print("******************************************")
-                        print("Agents in path:", self.agents_in_path)
-                        print("other agents not static:", self.other_agents_not_static)                        
+                        _nav_loginfo("Replanning because no moving agents in path")
+                        _nav_loginfo("Agents in path: %s", self.agents_in_path)
+                        _nav_loginfo("Other agents not static: %s", self.other_agents_not_static)
                         self.replan()
                     else:
                         # We have moving agents in the path, the smallest agent_id has priority
@@ -1958,9 +1943,7 @@ class Navigator:
                         lowest_agent_id = min(moving_agents_in_path)
                         if self.my_id <= lowest_agent_id:
                             # If we are the lowest agent, we can replan
-                            print("******************************************")
-                            print("Replanning because we are the lowest agent in path")
-                            print("******************************************")
+                            _nav_loginfo("Replanning because we are the lowest agent in path")
                             self.is_lowest_id = True
                             self.replan()
 
