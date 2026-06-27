@@ -35,9 +35,6 @@ from navigation_utils import (
     compute_smoothed_traj,
     plan_start_heading,
 )
-from social_path_planning import AStar as SocialAStar, AStar_With_Graph as SocialAStar_With_Graph
-from social_path_planning import FrequentSubgraph
-from social_path_planning.wall_distance_cache import fingerprint_probs
 
 
 V_PREV_THRES = 0.0001
@@ -56,6 +53,8 @@ def _sha256_file(path):
 
 def _expected_frequent_graph_cache_meta(occupancy, heatmap_npy_path, threshold, min_component_size):
     """Fingerprint everything that affects build_graph / prune / canonicalize."""
+    from social_path_planning.wall_distance_cache import fingerprint_probs
+
     return {
         "cache_version": FREQUENT_GRAPH_CACHE_VERSION,
         "sparse_graph_threshold": float(threshold),
@@ -195,14 +194,24 @@ class Navigator:
         self.occupancy = None
         self.occupancy_updated = False
         self.object_occupancy = None
-        self.frequent = None  # The frequent subgraph
-        self.sparse_graph_threshold = rospy.get_param('/sparse_graph_threshold', 5)  # Threshold for building the frequent subgraph
-        self.sparse_graph_components = rospy.get_param('/sparse_graph_components', 15)  # Minimum component size for pruning the frequent subgraph
-        self.map_frame_id = rospy.get_param('~frequent_graph_map_frame', 'map')
-        self.publish_frequent_graph_viz = rospy.get_param('~publish_frequent_graph_viz', True)
-        # Applied once when canonicalizing loaded heatmap graph keys to ROS map (col, row).
-        self.use_frequent_graph_cache = rospy.get_param("~use_frequent_graph_cache", True)
-        self.force_rebuild_frequent_graph = rospy.get_param("~force_rebuild_frequent_graph", False)
+        self.frequent = None  # The frequent subgraph (social A* with graph only)
+        self.use_social_astar = rospy.get_param('/use_social_astar', False)
+        if self.use_social_astar:
+            rospy.loginfo("Using social A* for path planning")
+            self.sparse_graph_threshold = rospy.get_param('/sparse_graph_threshold', 5)
+            self.sparse_graph_components = rospy.get_param('/sparse_graph_components', 15)
+            self.map_frame_id = rospy.get_param('~frequent_graph_map_frame', 'map')
+            self.publish_frequent_graph_viz = rospy.get_param('~publish_frequent_graph_viz', True)
+            self.use_frequent_graph_cache = rospy.get_param("~use_frequent_graph_cache", True)
+            self.force_rebuild_frequent_graph = rospy.get_param("~force_rebuild_frequent_graph", False)
+        else:
+            rospy.loginfo("Using regular A* for path planning")
+            self.sparse_graph_threshold = 5
+            self.sparse_graph_components = 15
+            self.map_frame_id = 'map'
+            self.publish_frequent_graph_viz = False
+            self.use_frequent_graph_cache = False
+            self.force_rebuild_frequent_graph = False
         # robot_clearance: planning radius from robot center (m). StochOccupancyGrid2D.is_free()
         # expects diameter robot_d, so we double clearance for footprint collision checks.
         self.robot_d = 2.0 * float(rospy.get_param("~robot_clearance", 0.3))
@@ -349,20 +358,16 @@ class Navigator:
         )
         self.nav_vel_pub = rospy.Publisher("/cmd_vel_mux/input/nav_vel", Twist, queue_size=10)
 
-        # Get whether to use social A* or Regular A*
-        self.use_social_astar = rospy.get_param('/use_social_astar', False)
-        if self.use_social_astar:
-            rospy.loginfo("Using social A* for path planning")
-        else:
-            rospy.loginfo("Using regular A* for path planning")
-
         #Publishes current state of robot (IDLE, ALIGN, etc)
         self.state_pub = rospy.Publisher("/robot_mode", Int32, queue_size=10)
 
         self.waypoint_pub = rospy.Publisher("/waypoints", MarkerArray, queue_size=10)
-        self.frequent_graph_viz_pub = rospy.Publisher(
-            "/frequent_graph_viz", Marker, queue_size=1, latch=True
-        )
+        if self.use_social_astar:
+            self.frequent_graph_viz_pub = rospy.Publisher(
+                "/frequent_graph_viz", Marker, queue_size=1, latch=True
+            )
+        else:
+            self.frequent_graph_viz_pub = None
 
         self.trans_listener = tf.TransformListener()
 
@@ -556,7 +561,7 @@ class Navigator:
 
     def publish_frequent_graph_rviz(self):
         """Publish the loaded frequent subgraph as a LINE_LIST Marker in ``map_frame_id``."""
-        if not self.publish_frequent_graph_viz:
+        if not self.publish_frequent_graph_viz or self.frequent_graph_viz_pub is None:
             return
         if self.frequent is None or self.occupancy is None:
             return
@@ -608,6 +613,82 @@ class Navigator:
             self.map_frame_id,
         )
 
+    def _load_frequent_subgraph(self):
+        """Load or build the heatmap sparse graph for social A* with graph."""
+        from social_path_planning import FrequentSubgraph
+
+        rospack = rospkg.RosPack()
+        pkg_path = rospack.get_path('path_planning')
+        heatmap_prefix = pkg_path + '/ros_map'
+        heatmap_name = heatmap_prefix + "_heatmap.npy"
+        if not os.path.isfile(heatmap_name):
+            rospy.logwarn(
+                "Heatmap file %s not found, skipping loading frequent subgraph.",
+                heatmap_name,
+            )
+            return
+
+        cache_pkl = heatmap_prefix + "_frequent_pruned_graph.pkl"
+        cache_meta = heatmap_prefix + "_frequent_graph_cache_meta.json"
+        expected_meta = _expected_frequent_graph_cache_meta(
+            self.occupancy,
+            heatmap_name,
+            self.sparse_graph_threshold,
+            self.sparse_graph_components,
+        )
+        loaded_graph = None
+        if self.use_frequent_graph_cache and not self.force_rebuild_frequent_graph:
+            loaded_graph = _try_load_frequent_graph_cache(
+                cache_pkl, cache_meta, expected_meta
+            )
+        if loaded_graph is not None:
+            self.frequent = FrequentSubgraph(
+                self.occupancy, heat_map_filename=heatmap_prefix
+            )
+            self.frequent.graph = loaded_graph
+            rospy.loginfo(
+                "Loaded pruned frequent subgraph from cache (%s, %d nodes, %d edges)",
+                cache_pkl,
+                self.frequent.graph.number_of_nodes(),
+                self.frequent.graph.number_of_edges(),
+            )
+        else:
+            self.frequent = FrequentSubgraph(
+                self.occupancy, heat_map_filename=heatmap_prefix
+            )
+            self.frequent.build_graph(
+                threshold=self.sparse_graph_threshold, reset_graph=True
+            )
+            rospy.logwarn(
+                "Number of nodes/edges in graph before pruning = %d/%d",
+                self.frequent.graph.number_of_nodes(),
+                self.frequent.graph.number_of_edges(),
+            )
+            self.frequent.prune_graph(
+                min_component_size=self.sparse_graph_components
+            )
+            rospy.logwarn(
+                "Number of nodes/edges in graph = %d/%d",
+                self.frequent.graph.number_of_nodes(),
+                self.frequent.graph.number_of_edges(),
+            )
+            self._canonicalize_frequent_graph()
+            if self.use_frequent_graph_cache:
+                try:
+                    _save_frequent_graph_cache(
+                        self.frequent.graph, cache_pkl, cache_meta, expected_meta
+                    )
+                    rospy.loginfo(
+                        "Saved pruned frequent subgraph cache to %s", cache_pkl
+                    )
+                except OSError as exc:
+                    rospy.logwarn(
+                        "Could not write frequent subgraph cache (%s): %s",
+                        cache_pkl,
+                        exc,
+                    )
+        self.publish_frequent_graph_rviz()
+
     def map_callback(self, msg):
         """
         receives new map info and updates the map
@@ -639,11 +720,15 @@ class Navigator:
             print("Assigned Occupancy Grid Map!")
             print("+"*50)
 
-            
-            rospack = rospkg.RosPack()
-            pkg_path = rospack.get_path('path_planning')
-            wall_distance_cache = pkg_path + '/src/social_path_planning/environments/y2e2_aligned_wall_dist.npz'
-            
+            wall_distance_cache = None
+            if self.use_social_astar:
+                rospack = rospkg.RosPack()
+                pkg_path = rospack.get_path('path_planning')
+                wall_distance_cache = (
+                    pkg_path
+                    + '/src/social_path_planning/environments/y2e2_aligned_wall_dist.npz'
+                )
+
             self.occupancy = StochOccupancyGrid2D(
                 self.map_resolution,
                 self.map_width,
@@ -657,83 +742,8 @@ class Navigator:
             )
             self._init_dynamic_occupancy_grids()
 
-            if self.frequent is None:  # Don't load the graph every time
-                # Get Heat Map File Name Prefix
-                rospack = rospkg.RosPack()
-                pkg_path = rospack.get_path('path_planning')
-                heatmap_prefix = pkg_path + '/ros_map'
-
-                # Check if heatmap file actually exists before trying to load it
-                heatmap_name = heatmap_prefix + "_heatmap.npy"
-                if os.path.isfile(heatmap_name):
-                    cache_pkl = heatmap_prefix + "_frequent_pruned_graph.pkl"
-                    cache_meta = heatmap_prefix + "_frequent_graph_cache_meta.json"
-                    expected_meta = _expected_frequent_graph_cache_meta(
-                        self.occupancy,
-                        heatmap_name,
-                        self.sparse_graph_threshold,
-                        self.sparse_graph_components,
-                    )
-                    loaded_graph = None
-                    if (
-                        self.use_frequent_graph_cache
-                        and not self.force_rebuild_frequent_graph
-                    ):
-                        loaded_graph = _try_load_frequent_graph_cache(
-                            cache_pkl, cache_meta, expected_meta
-                        )
-                    if loaded_graph is not None:
-                        self.frequent = FrequentSubgraph(
-                            self.occupancy, heat_map_filename=heatmap_prefix
-                        )
-                        self.frequent.graph = loaded_graph
-                        rospy.loginfo(
-                            "Loaded pruned frequent subgraph from cache (%s, %d nodes, %d edges)",
-                            cache_pkl,
-                            self.frequent.graph.number_of_nodes(),
-                            self.frequent.graph.number_of_edges(),
-                        )
-                    else:
-                        self.frequent = FrequentSubgraph(
-                            self.occupancy, heat_map_filename=heatmap_prefix
-                        )
-                        self.frequent.build_graph(
-                            threshold=self.sparse_graph_threshold, reset_graph=True
-                        )
-                        rospy.logwarn(
-                            "Number of nodes/edges in graph before pruning = %d/%d",
-                            self.frequent.graph.number_of_nodes(),
-                            self.frequent.graph.number_of_edges(),
-                        )
-                        self.frequent.prune_graph(
-                            min_component_size=self.sparse_graph_components
-                        )
-                        rospy.logwarn(
-                            "Number of nodes/edges in graph = %d/%d",
-                            self.frequent.graph.number_of_nodes(),
-                            self.frequent.graph.number_of_edges(),
-                        )
-                        self._canonicalize_frequent_graph()
-                        if self.use_frequent_graph_cache:
-                            try:
-                                _save_frequent_graph_cache(
-                                    self.frequent.graph, cache_pkl, cache_meta, expected_meta
-                                )
-                                rospy.loginfo(
-                                    "Saved pruned frequent subgraph cache to %s", cache_pkl
-                                )
-                            except OSError as exc:
-                                rospy.logwarn(
-                                    "Could not write frequent subgraph cache (%s): %s",
-                                    cache_pkl,
-                                    exc,
-                                )
-                    self.publish_frequent_graph_rviz()
-                else:
-                    rospy.logwarn(
-                        "Heatmap file %s not found, skipping loading frequent subgraph.",
-                        heatmap_name,
-                    )
+            if self.use_social_astar and self.frequent is None:
+                self._load_frequent_subgraph()
 
     def _init_dynamic_occupancy_grids(self):
         """Initialize stochastic layers for dynamic obstacle checks."""
@@ -1439,6 +1449,9 @@ class Navigator:
         state_max = (float(ext[1]), float(ext[3]))
 
         if self.use_social_astar:
+            from social_path_planning import AStar as SocialAStar
+            from social_path_planning import AStar_With_Graph as SocialAStar_With_Graph
+
             # First determine if a social graph is available to use, if not, fall back to regular social A*
             if self.frequent is not None:
                 # Graph nodes are occupancy map cells: get_index must use occ.resolution (same as heat_map / sim).
