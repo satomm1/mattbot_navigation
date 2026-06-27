@@ -37,6 +37,8 @@
 
   <!-- Planning radius from robot center (m); navigator doubles for footprint collision checks. -->
   <arg name="robot_clearance" default="0.4"/>
+  <!-- Max wall-clock time (s) for A* before giving up on a plan. -->
+  <arg name="max_plan_time_sec" default="15.0"/>
 
   <!-- Launch the occupancy grid mapper -->
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
@@ -53,6 +55,7 @@
     <param name="track_stall_grace_sec" value="1.0"/>
     <param name="nearest_free_search_radius" value="1.0"/>
     <param name="robot_clearance" value="$(arg robot_clearance)"/>
+    <param name="max_plan_time_sec" value="$(arg max_plan_time_sec)"/>
   </node>
 
   <!-- Launch the patrol.py script only if patrol is true -->

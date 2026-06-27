@@ -5,7 +5,7 @@ from queue import PriorityQueue
 class AStar(object):
     """Represents a motion planning problem to be solved using A*"""
 
-    def __init__(self, statespace_lo, statespace_hi, x_init, x_goal, occupancy, resolution=1, robots_x=None, robots_y=None, obj_x=None, obj_y=None, obj_d=None, robots_d=0.4):
+    def __init__(self, statespace_lo, statespace_hi, x_init, x_goal, occupancy, resolution=1, robots_x=None, robots_y=None, obj_x=None, obj_y=None, obj_d=None, robots_d=0.4, max_plan_time_sec=15.0):
         self.statespace_lo = np.array(statespace_lo)  # state space lower bound (e.g., [-5, -5])
         self.statespace_hi = np.array(statespace_hi)  # state space upper bound (e.g., [5, 5])
         self.occupancy = occupancy  # occupancy grid (a DetOccupancyGrid2D object)
@@ -36,6 +36,7 @@ class AStar(object):
         self.obj_x = obj_x
         self.obj_y = obj_y
         self.obj_d = obj_d
+        self.max_plan_time_sec = float(max_plan_time_sec)
 
     def is_free(self, x):
         """
@@ -195,17 +196,9 @@ class AStar(object):
                 set membership efficiently using the syntax "if item in set".
         """
         ########## Code starts here ##########
-        time_limit = 120    
+        time_limit = self.max_plan_time_sec
 
         print("step resolution: ", step_resolution)
-
-        dist_to_goal = self.distance(self.x_init, self.x_goal)
-        if dist_to_goal < 20:
-            time_limit = 5
-        elif dist_to_goal < 40:
-            time_limit = 20
-        else:
-            time_limit = 30
 
         start = time.time()        
         print(self.x_init)
@@ -242,7 +235,7 @@ class AStar(object):
         ########## Code ends here ##########
 
     def solve(self, step_resolution=1):
-        time_limit = 120    
+        time_limit = self.max_plan_time_sec
 
         t_start = time.time()  
         while self.priority_queue.qsize() > 0:

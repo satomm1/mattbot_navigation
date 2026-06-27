@@ -262,6 +262,7 @@ class Navigator:
 
         # plan parameters
         self.plan_resolution = 0.05
+        self.max_plan_time_sec = rospy.get_param('~max_plan_time_sec', 15.0)
 
         # time when we started following the plan
         self.current_plan_start_time = rospy.get_rostime()
@@ -1460,8 +1461,20 @@ class Navigator:
                 problem = SocialAStar(state_min, state_max, x_init, x_goal, combined_occupancy, self.plan_resolution)
                 print("+"*5 + "Using social A*" + "+"*5)
         else:
-            problem = AStar(state_min, state_max, x_init, x_goal, combined_occupancy, self.plan_resolution,
-            robots_x=robots_x, robots_y=robots_y, obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
+            problem = AStar(
+                state_min,
+                state_max,
+                x_init,
+                x_goal,
+                combined_occupancy,
+                self.plan_resolution,
+                robots_x=robots_x,
+                robots_y=robots_y,
+                obj_x=obj_x,
+                obj_y=obj_y,
+                obj_d=obj_d,
+                max_plan_time_sec=self.max_plan_time_sec,
+            )
 
         rospy.loginfo("Navigator: computing navigation plan")
         success = False
