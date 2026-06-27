@@ -218,6 +218,7 @@ class Navigator:
 
         self.person_occupancy = None
         self.robot_stopped_by_person = False
+        self.robot_slowed_by_person = False
         self.person_in_path = False
         self.person_list1 = []
         self.person_list2 = []
@@ -1305,6 +1306,7 @@ class Navigator:
         If the distance is less than a threshold, it slows down or stops the robot.
         """
         if self.distance_to_person < PERSON_STOP_DISTANCE and self.person_in_path:
+            self.robot_slowed_by_person = False
             # Stop
             V = 0.0
             om = 0.0
@@ -1312,7 +1314,7 @@ class Navigator:
             # Keep track of how long we've been stopped
             if not self.robot_stopped_by_person:
                 self.stopped_for_person_time = rospy.get_rostime().to_sec()
-                print("Stopping for person")
+                rospy.loginfo("Stopping for person")
 
                 data = {'query': "Excuse Me!", 'query_type': 'print_to_screen'}
                 try:
@@ -1324,17 +1326,22 @@ class Navigator:
 
             self.robot_stopped_by_person = True
         elif self.distance_to_person < PERSON_SLOW_DISTANCE:
-            print("Slowing down for person")
+            if not self.robot_slowed_by_person:
+                rospy.loginfo("Slowing down for person")
+                self.robot_slowed_by_person = True
             # Slow down
             V *= 0.5
             om *= 0.5
         elif self.robot_stopped_by_person:
+            self.robot_slowed_by_person = False
             # If we were stopped by a person, we can start moving again
             self.robot_stopped_by_person = False
 
-            print("Resuming motion after stopping for person")
+            rospy.loginfo("Resuming motion after stopping for person")
 
             self.replan()
+        else:
+            self.robot_slowed_by_person = False
 
         return V, om
 
@@ -1778,7 +1785,7 @@ class Navigator:
                         self.backing_for_waypoints = True
                         self.switch_mode(Mode.BACKING)
                     elif np.linalg.norm(np.array([self.x - self.waypoints[0][0], self.y - self.waypoints[0][1]])) < 0.35:
-                        print("Waypoint reached")
+                        # print("Waypoint reached")
                         self.waypoints.pop(0)  # Remove the first waypoint since we are close to it
                 
                 if self.agent_intersect_path() and not self.is_lowest_id:
