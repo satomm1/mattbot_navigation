@@ -42,6 +42,16 @@ V_PREV_THRES = 0.0001
 # Bump when cache contents / canonicalization meaning changes (invalidates old pickles).
 FREQUENT_GRAPH_CACHE_VERSION = 1
 
+_NAV_LOG_PREFIX = "[Navigator] "
+
+
+def _nav_loginfo(msg, *args, **kwargs):
+    rospy.loginfo(_NAV_LOG_PREFIX + msg, *args, **kwargs)
+
+
+def _nav_logwarn(msg, *args, **kwargs):
+    rospy.logwarn(_NAV_LOG_PREFIX + msg, *args, **kwargs)
+
 
 def _sha256_file(path):
     h = hashlib.sha256()
@@ -197,7 +207,7 @@ class Navigator:
         self.frequent = None  # The frequent subgraph (social A* with graph only)
         self.use_social_astar = rospy.get_param('/use_social_astar', False)
         if self.use_social_astar:
-            rospy.loginfo("Using social A* for path planning")
+            _nav_loginfo("Using social A* for path planning")
             self.sparse_graph_threshold = rospy.get_param('/sparse_graph_threshold', 5)
             self.sparse_graph_components = rospy.get_param('/sparse_graph_components', 15)
             self.map_frame_id = rospy.get_param('~frequent_graph_map_frame', 'map')
@@ -205,7 +215,7 @@ class Navigator:
             self.use_frequent_graph_cache = rospy.get_param("~use_frequent_graph_cache", True)
             self.force_rebuild_frequent_graph = rospy.get_param("~force_rebuild_frequent_graph", False)
         else:
-            rospy.loginfo("Using regular A* for path planning")
+            _nav_loginfo("Using regular A* for path planning")
             self.sparse_graph_threshold = 5
             self.sparse_graph_components = 15
             self.map_frame_id = 'map'
@@ -446,7 +456,7 @@ class Navigator:
             and self.theta_g is not None
             and (msg.x == self.x_g and msg.y == self.y_g and msg.theta == self.theta_g)
         ):
-            rospy.loginfo("External goal is the same as current goal, ignoring")
+            _nav_loginfo("External goal is the same as current goal, ignoring")
             return
 
         if self.mode == Mode.WAITING_FOR_INIT or self.mode == Mode.LOCALIZING:
@@ -464,7 +474,7 @@ class Navigator:
 
         # Make sure we have an occupancy grid and that the goal is valid
         if self.occupancy is not None and not self.occupancy.is_free((msg.x, msg.y)):
-            rospy.loginfo("Not a valid goal")
+            _nav_loginfo("Not a valid goal")
             # Publish an invalid goal message
             invalid_goal_msg = Pose2D()
             invalid_goal_msg.x = msg.x
@@ -540,7 +550,7 @@ class Navigator:
             try:
                 ci, ri = int(node[0]), int(node[1])
             except (TypeError, ValueError, IndexError):
-                rospy.logwarn("Skipping non-integer frequent graph node: %r", node)
+                _nav_logwarn("Skipping non-integer frequent graph node: %r", node)
                 continue
             new_node = self._canonical_cell_from_heatmap_indices(ci, ri)
             mapping[node] = new_node
@@ -553,7 +563,7 @@ class Navigator:
         # in-place relabel then raises NetworkXUnfeasible (cycle / overlapping label sets).
         self.frequent.graph = nx.relabel_nodes(g, mapping, copy=True)
         g = self.frequent.graph
-        rospy.loginfo(
+        _nav_loginfo(
             "Canonicalized frequent subgraph to ROS map cells: %d nodes, %d edges%s",
             g.number_of_nodes(),
             g.number_of_edges(),
@@ -568,7 +578,7 @@ class Navigator:
             return
         g = self.frequent.graph
         if g.number_of_edges() == 0:
-            rospy.logwarn("Frequent graph has no edges; skipping RViz visualization.")
+            _nav_logwarn("Frequent graph has no edges; skipping RViz visualization.")
             return
 
         m = Marker()
@@ -607,7 +617,7 @@ class Navigator:
             m.points.append(Point(x=x1, y=y1, z=z))
 
         self.frequent_graph_viz_pub.publish(m)
-        rospy.loginfo(
+        _nav_loginfo(
             "Published /frequent_graph_viz: %d edges (%d line vertices) frame=%s",
             g.number_of_edges(),
             len(m.points),
@@ -623,7 +633,7 @@ class Navigator:
         heatmap_prefix = pkg_path + '/ros_map'
         heatmap_name = heatmap_prefix + "_heatmap.npy"
         if not os.path.isfile(heatmap_name):
-            rospy.logwarn(
+            _nav_logwarn(
                 "Heatmap file %s not found, skipping loading frequent subgraph.",
                 heatmap_name,
             )
@@ -647,7 +657,7 @@ class Navigator:
                 self.occupancy, heat_map_filename=heatmap_prefix
             )
             self.frequent.graph = loaded_graph
-            rospy.loginfo(
+            _nav_loginfo(
                 "Loaded pruned frequent subgraph from cache (%s, %d nodes, %d edges)",
                 cache_pkl,
                 self.frequent.graph.number_of_nodes(),
@@ -660,7 +670,7 @@ class Navigator:
             self.frequent.build_graph(
                 threshold=self.sparse_graph_threshold, reset_graph=True
             )
-            rospy.logwarn(
+            _nav_logwarn(
                 "Number of nodes/edges in graph before pruning = %d/%d",
                 self.frequent.graph.number_of_nodes(),
                 self.frequent.graph.number_of_edges(),
@@ -668,7 +678,7 @@ class Navigator:
             self.frequent.prune_graph(
                 min_component_size=self.sparse_graph_components
             )
-            rospy.logwarn(
+            _nav_logwarn(
                 "Number of nodes/edges in graph = %d/%d",
                 self.frequent.graph.number_of_nodes(),
                 self.frequent.graph.number_of_edges(),
@@ -679,11 +689,11 @@ class Navigator:
                     _save_frequent_graph_cache(
                         self.frequent.graph, cache_pkl, cache_meta, expected_meta
                     )
-                    rospy.loginfo(
+                    _nav_loginfo(
                         "Saved pruned frequent subgraph cache to %s", cache_pkl
                     )
                 except OSError as exc:
-                    rospy.logwarn(
+                    _nav_logwarn(
                         "Could not write frequent subgraph cache (%s): %s",
                         cache_pkl,
                         exc,
@@ -839,8 +849,8 @@ class Navigator:
         if now - self._last_stall_recovery_time < self.stall_recovery_cooldown_sec:
             return
         self._last_stall_recovery_time = now
-        rospy.logwarn(
-            "Navigator: wheel stall detected (cmd_v=%.2f, odom_disp<%.3fm in %.1fs)",
+        _nav_logwarn(
+            "wheel stall detected (cmd_v=%.2f, odom_disp<%.3fm in %.1fs)",
             self._last_cmd_linear,
             self.stall_odom_displacement_m,
             self.stall_window_sec,
@@ -854,13 +864,13 @@ class Navigator:
         """
         if self.mode in (Mode.BACKING, Mode.RELOCALIZING):
             rospy.logdebug(
-                "Navigator: localization recovery already active (mode=%s)",
+                "localization recovery already active (mode=%s)",
                 self.mode,
             )
             return False
         if self.mode != Mode.TRACK:
-            rospy.logwarn(
-                "Navigator: localization recovery ignored in mode %s",
+            _nav_logwarn(
+                "localization recovery ignored in mode %s",
                 self.mode,
             )
             return False
@@ -871,8 +881,8 @@ class Navigator:
         self.backing_from_bad_localization = True
         self.pending_replan_after_recovery = True
         self.switch_mode(Mode.BACKING)
-        rospy.loginfo(
-            "Navigator: starting localization recovery (inject_pose=%s)",
+        _nav_loginfo(
+            "starting localization recovery (inject_pose=%s)",
             initial_pose_msg is not None,
         )
         return True
@@ -885,7 +895,7 @@ class Navigator:
         """
         Callback for initial pose, sets the robot's position and orientation
         """        
-        rospy.loginfo("Navigator: Initial pose received")
+        _nav_loginfo("Initial pose received")
         self.received_initial_pose = True
 
         if self.initialpose_subscriber is not None:
@@ -899,7 +909,7 @@ class Navigator:
             return
         if self.mode in (Mode.BACKING, Mode.RELOCALIZING):
             return
-        rospy.logwarn("Navigator: lost localization signal received")
+        _nav_logwarn("lost localization signal received")
         self._start_localization_recovery(initial_pose_msg=None)
 
     def agent_location_callback(self, msg):
@@ -926,7 +936,7 @@ class Navigator:
 
     def valid_points_callback(self, msg):
         if not msg.data:
-            rospy.logwarn("Invalid points received, stopping the robot.")
+            _nav_logwarn("Invalid points received, stopping the robot.")
 
             if self.mode == Mode.TRACK:
                 # For now, use backing for waypoints
@@ -1078,8 +1088,8 @@ class Navigator:
             step=self.plan_resolution,
         )
         if nearest is None:
-            rospy.logwarn(
-                "Navigator: plan start (%.2f, %.2f) is occupied; "
+            _nav_logwarn(
+                "plan start (%.2f, %.2f) is occupied; "
                 "no free configuration within %.2fm",
                 x_init[0],
                 x_init[1],
@@ -1087,8 +1097,8 @@ class Navigator:
             )
             return None
 
-        rospy.logwarn(
-            "Navigator: plan start occupied at (%.2f, %.2f); "
+        _nav_logwarn(
+            "plan start occupied at (%.2f, %.2f); "
             "using nearest free (%.2f, %.2f) d=%.2fm",
             x_init[0],
             x_init[1],
@@ -1099,7 +1109,7 @@ class Navigator:
         return nearest
 
     def switch_mode(self, new_mode):
-        rospy.loginfo("Switching from %s -> %s", self.mode, new_mode)
+        _nav_loginfo("Switching from %s -> %s", self.mode, new_mode)
         if self.mode == Mode.ALIGN and new_mode != Mode.ALIGN:
             self._aligned_since = None
         if new_mode == Mode.TRACK:
@@ -1314,7 +1324,7 @@ class Navigator:
             # Keep track of how long we've been stopped
             if not self.robot_stopped_by_person:
                 self.stopped_for_person_time = rospy.get_rostime().to_sec()
-                rospy.loginfo("Stopping for person")
+                _nav_loginfo("Stopping for person")
 
                 data = {'query': "Excuse Me!", 'query_type': 'print_to_screen'}
                 try:
@@ -1327,7 +1337,7 @@ class Navigator:
             self.robot_stopped_by_person = True
         elif self.distance_to_person < PERSON_SLOW_DISTANCE:
             if not self.robot_slowed_by_person:
-                rospy.loginfo("Slowing down for person")
+                _nav_loginfo("Slowing down for person")
                 self.robot_slowed_by_person = True
             # Slow down
             V *= 0.5
@@ -1337,7 +1347,7 @@ class Navigator:
             # If we were stopped by a person, we can start moving again
             self.robot_stopped_by_person = False
 
-            rospy.loginfo("Resuming motion after stopping for person")
+            _nav_loginfo("Resuming motion after stopping for person")
 
             self.replan()
         else:
@@ -1416,8 +1426,8 @@ class Navigator:
         """
         # Make sure we have a map
         if not self.occupancy:
-            rospy.loginfo(
-                "Navigator: replanning canceled, waiting for occupancy map."
+            _nav_loginfo(
+                "replanning canceled, waiting for occupancy map."
             )
             self.switch_mode(Mode.IDLE)
             return  
@@ -1496,16 +1506,16 @@ class Navigator:
                 max_plan_time_sec=self.max_plan_time_sec,
             )
 
-        rospy.loginfo("Navigator: computing navigation plan")
+        _nav_loginfo("computing navigation plan")
         success = False
         while not success:
             success = problem.solve()
             if not success and (self.mode == Mode.IDLE or self.mode == Mode.STOPPED_FOR_AGENT):
-                rospy.loginfo("Planning failed")
+                _nav_loginfo("Planning failed")
                 self.times_planned_failed += 1
 
                 if self.times_planned_failed > 1:
-                    rospy.loginfo("Planning failed too many times, stopping")
+                    _nav_loginfo("Planning failed too many times, stopping")
                     self.times_planned_failed = 0
 
                     self.x_g = None
@@ -1515,13 +1525,13 @@ class Navigator:
                     return
             else:
                 self.times_planned_failed = 0
-                rospy.loginfo("Planning Succeeded")
+                _nav_loginfo("Planning Succeeded")
                 planned_path = problem.path
 
         if self.use_social_astar and self.frequent is not None:
             tel = getattr(problem, "last_solve_telemetry", None)
             if isinstance(tel, dict):
-                rospy.loginfo(
+                _nav_loginfo(
                     "social A* with graph: path_fraction_on_graph=%s on_graph=%s/%s "
                     "graph_edge_cost_evals=%s off_graph_social_evals=%s",
                     tel.get("path_fraction_on_graph"),
@@ -1535,7 +1545,7 @@ class Navigator:
         if planned_path == None:
             return
         elif len(planned_path) < 4:
-            rospy.loginfo("Path too short to track")
+            _nav_loginfo("Path too short to track")
             # self._set_park_goal_from_traj(self._traj_endpoint_for_park(planned_path))
             self._enter_park_pose()
             return
@@ -1588,11 +1598,11 @@ class Navigator:
         self.waypoint_pub.publish(marker_arr)
 
         if not self.aligned():
-            rospy.loginfo("Not aligned with start direction")
+            _nav_loginfo("Not aligned with start direction")
             self.switch_mode(Mode.ALIGN)
             return
         else:
-            rospy.loginfo(
+            _nav_loginfo(
                 "Already aligned; pausing %.1fs before TRACK", self.post_align_pause_sec
             )
             self._aligned_since = rospy.get_rostime()
@@ -1690,7 +1700,7 @@ class Navigator:
             ) as e:
                 self.current_plan = []
                 if self.received_initial_pose:
-                    rospy.loginfo("Navigator: waiting for state info")
+                    _nav_loginfo("waiting for state info")
                 if self.mode != Mode.IDLE and self.mode != Mode.WAITING_FOR_INIT:
                     self.switch_mode(Mode.IDLE)
                     print(e)
@@ -1700,7 +1710,7 @@ class Navigator:
 
             # # If not localized, switch to LOCALIZING mode
             # if not self.is_localized and self.mode != Mode.LOCALIZING:
-            #     rospy.loginfo("Navigator: not localized, switching to LOCALIZING mode")
+            #     _nav_loginfo("not localized, switching to LOCALIZING mode")
             #     self.switch_mode(Mode.LOCALIZING)
 
             # STATE MACHINE LOGIC
@@ -1709,7 +1719,7 @@ class Navigator:
                 pass
             elif self.mode == Mode.WAITING_FOR_INIT:
                 if self.received_initial_pose:
-                    rospy.loginfo("Navigator: Have initial pose, switching to Localize to Get better estimate")
+                    _nav_loginfo("Have initial pose, switching to Localize to Get better estimate")
                     self.localize_begin_time = rospy.get_rostime()
                     self.switch_mode(Mode.LOCALIZING)
             elif self.mode == Mode.LOCALIZING:
@@ -1721,7 +1731,7 @@ class Navigator:
             elif self.mode == Mode.LOCALIZING2:
                 # if time spent localizing > 5 sec, switch to ALIGN mode
                 if self.localize_begin_time is not None and rospy.get_rostime() - self.localize_begin_time > rospy.Duration(5):
-                    rospy.loginfo("Navigator: localized, ready for navigation")
+                    _nav_loginfo("localized, ready for navigation")
                     self.is_localized = True
                     self.localized_pub.publish(True)
                     self.switch_mode(Mode.IDLE)
@@ -1729,7 +1739,7 @@ class Navigator:
                     client = Client('amcl', timeout=30)
                     # Get current configuration
                     config = client.get_configuration()
-                    # rospy.loginfo("Current configuration: %s", config)
+                    # _nav_loginfo("Current configuration: %s", config)
 
                     # Update parameters to emphasize sensor measurements
                     params = {
@@ -1753,7 +1763,7 @@ class Navigator:
                         self.switch_mode(Mode.TRACK)
                 elif self.aligned():
                     self._aligned_since = rospy.get_rostime()
-                    rospy.loginfo(
+                    _nav_loginfo(
                         "Aligned; pausing %.1fs before TRACK",
                         self.post_align_pause_sec,
                     )
@@ -1764,7 +1774,7 @@ class Navigator:
                     self._enter_park_pose()
                 elif(not self.path_still_valid(self.current_plan)):
                     # Path no longer valid ---> replan
-                    rospy.loginfo("replanning because path is no longer valid")
+                    _nav_loginfo("replanning because path is no longer valid")
 
                     # Stop the robot
                     self.switch_mode(Mode.IDLE)
@@ -1822,20 +1832,20 @@ class Navigator:
 
                 if ((rospy.get_rostime() - self.current_plan_start_time).to_sec() > self.current_plan_duration * 1.2):
                     if (self.x_g is not None and self.y_g is not None and np.linalg.norm(np.array([self.x - self.x_g, self.y - self.y_g])) > 0.5):
-                        rospy.loginfo("replanning because out of time")
+                        _nav_loginfo("replanning because out of time")
 
                         # Stop attempting current plan
                         self.switch_mode(Mode.IDLE)
                         self.replan()  # we aren't near the goal but we thought we should have been, so replan
                     else:
-                        rospy.loginfo("Navigator: Going to park because out of time and near goal")
+                        _nav_loginfo("Going to park because out of time and near goal")
                         self._enter_park_pose()
 
             elif self.mode == Mode.PARK_POSE:
                 if self.at_park_pose():
                     self.heading_controller.load_goal(self.theta_g)
                     self.switch_mode(Mode.PARK_HEADING)
-                    rospy.loginfo("Navigator: park pose reached, aligning final heading")
+                    _nav_loginfo("park pose reached, aligning final heading")
 
             elif self.mode == Mode.PARK_HEADING:
                 if self.aligned_goal():
@@ -1852,23 +1862,23 @@ class Navigator:
                     self.nav_vel_pub.publish(cmd_vel)
 
                     if self.backing_from_bad_localization:
-                        rospy.loginfo(
-                            "Navigator: backing complete, relocalizing in place"
+                        _nav_loginfo(
+                            "backing complete, relocalizing in place"
                         )
                         self.backing_from_bad_localization = False
                         self.relocalizing_start_time = current_time
                         self.switch_mode(Mode.RELOCALIZING)
                     elif self.backing_for_waypoints:
-                        rospy.loginfo(
-                            "Navigator: backing for waypoints, relocalizing in place"
+                        _nav_loginfo(
+                            "backing for waypoints, relocalizing in place"
                         )
                         self.backing_for_waypoints = False
                         self.pending_replan_after_recovery = True
                         self.relocalizing_start_time = current_time
                         self.switch_mode(Mode.RELOCALIZING)
                     else:
-                        rospy.loginfo(
-                            "Navigator: backing complete, returning to IDLE"
+                        _nav_loginfo(
+                            "backing complete, returning to IDLE"
                         )
                         self.switch_mode(Mode.IDLE)
                         self.replan()
@@ -1885,13 +1895,13 @@ class Navigator:
                     self.switch_mode(Mode.IDLE)
 
                     if should_replan:
-                        rospy.loginfo(
-                            "Navigator: relocalize complete, replanning"
+                        _nav_loginfo(
+                            "relocalize complete, replanning"
                         )
                         self.replan()
                     else:
-                        rospy.loginfo(
-                            "Navigator: relocalize complete, staying IDLE"
+                        _nav_loginfo(
+                            "relocalize complete, staying IDLE"
                         )
             elif self.mode == Mode.STOPPED_FOR_PERSON:
                 current_time = rospy.get_rostime().to_sec()
