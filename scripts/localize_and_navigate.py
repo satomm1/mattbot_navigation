@@ -264,20 +264,20 @@ class Navigator:
         self.relocalize_duration_sec = rospy.get_param(
             '~relocalize_duration_sec', 5.0
         )
-        self.backing_duration_sec = rospy.get_param('~backing_duration_sec', 1.0)
+        self.backing_duration_sec = rospy.get_param('~backing_duration_sec', 1.25)
         self.nearest_free_search_radius = rospy.get_param(
             '~nearest_free_search_radius', 1.0
         )
 
         self.stall_detection_enabled = rospy.get_param('~stall_detection_enabled', True)
         self.stall_cmd_vel_threshold = rospy.get_param('~stall_cmd_vel_threshold', 0.08)
-        self.stall_odom_displacement_m = rospy.get_param('~stall_odom_displacement_m', 0.02)
+        self.stall_odom_displacement_m = rospy.get_param('~stall_odom_displacement_m', 0.04)
         self.stall_window_sec = rospy.get_param('~stall_window_sec', 0.5)
         self._last_cmd_linear = 0.0
         self._odom_history = []
         self._last_stall_recovery_time = 0.0
         self.stall_recovery_cooldown_sec = rospy.get_param(
-            '~stall_recovery_cooldown_sec', 15.0
+            '~stall_recovery_cooldown_sec', 5.0
         )
         self.track_stall_grace_sec = rospy.get_param('~track_stall_grace_sec', 2.0)
         self.track_start_time = 0.0
