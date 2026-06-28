@@ -30,10 +30,10 @@
   <arg name="cruising_velocity" default="0.40"/>
   <param name="cruising_velocity" value="$(arg cruising_velocity)"/>
 
-  <param name="kpx" value="1.5"/>
-  <param name="kpy" value="1.5"/>
-  <param name="kdx" value="1.8"/>
-  <param name="kdy" value="1.8"/>
+  <param name="kpx" value="1.3"/>
+  <param name="kpy" value="1.3"/>
+  <param name="kdx" value="2.2"/>
+  <param name="kdy" value="2.2"/>
 
   <!-- Planning radius from robot center (m); navigator doubles for footprint collision checks. -->
   <arg name="robot_clearance" default="0.4"/>
