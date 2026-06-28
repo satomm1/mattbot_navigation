@@ -6,22 +6,22 @@
 
   <arg name="patrol" default="false" />
 
-  <param name="alpha1" value="0.05"/>
+  <param name="alpha1" value="0.075"/>
   <param name="alpha2" value="0.2"/>
   <param name="alpha3" value="0.1"/>
-  <param name="alpha4" value="0.05"/>
-  <param name="z_hit"  value="0.90"/>
-  <param name="z_rand" value="0.10"/>
+  <param name="alpha4" value="0.075"/>
+  <param name="z_hit"  value="0.95"/>
+  <param name="z_rand" value="0.05"/>
   <param name="sigma_hit" value="0.15"/>
 
     <!-- Nominal trajectory speed (m/s); override from bringup via launch arg when included. -->
   <arg name="cruising_velocity" default="0.40"/>
   <param name="cruising_velocity" value="$(arg cruising_velocity)"/>
 
-  <param name="kpx" value="1.8"/>
-  <param name="kpy" value="1.8"/>
-  <param name="kdx" value="1.8"/>
-  <param name="kdy" value="1.8"/>
+  <param name="kpx" value="1.3"/>
+  <param name="kpy" value="1.3"/>
+  <param name="kdx" value="2.2"/>
+  <param name="kdy" value="2.2"/>
 
   <arg name="social" default="false"/>
   <param name="use_social_astar" value="$(arg social)"/>
@@ -39,7 +39,7 @@
   <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate.py" output="screen">
     <param name="stall_detection_enabled" value="true"/>
     <param name="stall_cmd_vel_threshold" value="0.08"/>
-    <param name="stall_odom_displacement_m" value="0.03"/>
+    <param name="stall_odom_displacement_m" value="0.02"/>
     <param name="stall_window_sec" value="0.5"/>
     <param name="backing_duration_sec" value="1.0"/>
     <param name="relocalize_duration_sec" value="5.0"/>
