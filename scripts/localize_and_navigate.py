@@ -169,6 +169,8 @@ class Mode(Enum):
     RELOCALIZING = 9
     STOPPED_FOR_PERSON = 10
     STOPPED_FOR_AGENT = 11
+    POSE_REFINE = 13       # stopped after backup; wait for pose inject
+    RECOVERY_VALIDATE = 14 # reserved for stage 2
 
 class Navigator:
     """
@@ -267,6 +269,22 @@ class Navigator:
         self.backing_duration_sec = rospy.get_param('~backing_duration_sec', 1.25)
         self.nearest_free_search_radius = rospy.get_param(
             '~nearest_free_search_radius', 1.0
+        )
+        self.post_backing_settle_sec = rospy.get_param('~post_backing_settle_sec', 0.3)
+        self.pose_refine_timeout_sec = rospy.get_param('~pose_refine_timeout_sec', 2.0)
+        self.pose_refine_start_time = 0.0
+        self._recovery_pose_ready = False
+        self.recovery_validate_start_time = 0.0
+        self._recovery_validated = None
+        self.recovery_attempt_count = 0
+        self.recovery_validate_timeout_sec = rospy.get_param(
+            '~recovery_validate_timeout_sec', 3.0
+        )
+        self.recovery_validate_min_sec = rospy.get_param(
+            '~recovery_validate_min_sec', 0.5
+        )
+        self.max_recovery_attempts = rospy.get_param(
+            '~max_recovery_attempts', 2
         )
 
         self.stall_detection_enabled = rospy.get_param('~stall_detection_enabled', True)
@@ -398,9 +416,10 @@ class Navigator:
         rospy.Subscriber("/external_goal", Pose2D, self.external_goal_callback)
         rospy.Subscriber("/voice_goal", Pose2D, self.external_goal_callback)
         rospy.Subscriber("/agent_location", AgentLocation, self.agent_location_callback)
-        rospy.Subscriber("/initialpose_relocalize", PoseWithCovarianceStamped, self.initial_pose_relocalize_callback)
         self.initialpose_subscriber = rospy.Subscriber("/initialpose", PoseWithCovarianceStamped, self.initial_pose_callback)
         rospy.Subscriber("/lost_localization", Bool, self.lost_localization_callback)
+        rospy.Subscriber("/recovery_pose_ready", Bool, self.recovery_pose_ready_callback, queue_size=1)
+        rospy.Subscriber("/recovery_validated", Bool, self.recovery_validated_callback, queue_size=1)
         rospy.Subscriber("/detected_objects", DetectedObjectArray, self.detected_objects_callback)
         rospy.Subscriber("/valid_points", Bool, self.valid_points_callback)
         stop_topic = rospy.get_param("~/stop_topic", "/stop").strip() or "/stop"
@@ -854,14 +873,14 @@ class Navigator:
             self.stall_odom_displacement_m,
             self.stall_window_sec,
         )
-        self._start_localization_recovery(initial_pose_msg=None)
+        self._start_localization_recovery()
 
-    def _start_localization_recovery(self, initial_pose_msg=None):
+    def _start_localization_recovery(self):
         """
-        Halt navigation, optionally reset AMCL, back up, then spin to relocalize.
+        Halt navigation, back up, pose refine (inject), then spin to relocalize.
         Replan only after RELOCALIZING completes (pending_replan_after_recovery).
         """
-        if self.mode in (Mode.BACKING, Mode.RELOCALIZING):
+        if self.mode in (Mode.BACKING, Mode.POSE_REFINE, Mode.RELOCALIZING, Mode.RECOVERY_VALIDATE):
             rospy.logdebug(
                 "localization recovery already active (mode=%s)",
                 self.mode,
@@ -874,21 +893,35 @@ class Navigator:
             )
             return False
 
-        if initial_pose_msg is not None:
-            self.initialpose_pub.publish(initial_pose_msg)
+        self._recovery_pose_ready = False
+        self._recovery_validated = None
+        self.recovery_attempt_count = 0
         self.backing_start_time = rospy.get_rostime().to_sec()
         self.backing_from_bad_localization = True
         self.pending_replan_after_recovery = True
         self.switch_mode(Mode.BACKING)
-        _nav_loginfo(
-            "starting localization recovery (inject_pose=%s)",
-            initial_pose_msg is not None,
-        )
+        _nav_loginfo("starting localization recovery (inject after backing)")
         return True
 
-    def initial_pose_relocalize_callback(self, msg):
-        """Inject corrected pose into AMCL and run recovery (back, then relocalize spin)."""
-        self._start_localization_recovery(initial_pose_msg=msg)
+    def recovery_pose_ready_callback(self, msg):
+        if msg.data:
+            self._recovery_pose_ready = True
+            _nav_loginfo("[Navigator][Recovery] recovery_pose_ready received")
+
+    def recovery_validated_callback(self, msg):
+        if self.mode != Mode.RECOVERY_VALIDATE:
+            return
+        if not msg.data:
+            elapsed = (
+                rospy.get_rostime().to_sec() - self.recovery_validate_start_time
+            )
+            if elapsed < self.recovery_validate_min_sec:
+                return
+        self._recovery_validated = bool(msg.data)
+        _nav_loginfo(
+            "[Navigator][Recovery] recovery_validated=%s",
+            self._recovery_validated,
+        )
 
     def initial_pose_callback(self, msg):
         """
@@ -903,13 +936,13 @@ class Navigator:
 
 
     def lost_localization_callback(self, msg):
-        """Halt and run recovery FSM; pose injection may follow via initialpose_relocalize."""
+        """Halt and run recovery FSM; pose inject happens in POSE_REFINE after backing."""
         if not msg.data:
             return
-        if self.mode in (Mode.BACKING, Mode.RELOCALIZING):
+        if self.mode in (Mode.BACKING, Mode.POSE_REFINE, Mode.RELOCALIZING, Mode.RECOVERY_VALIDATE):
             return
         _nav_logwarn("lost localization signal received")
-        self._start_localization_recovery(initial_pose_msg=None)
+        self._start_localization_recovery()
 
     def agent_location_callback(self, msg):
         """
@@ -1647,6 +1680,9 @@ class Navigator:
         elif self.mode == Mode.BACKING:
             V = -0.3
             om = 0.0
+        elif self.mode in (Mode.POSE_REFINE, Mode.RECOVERY_VALIDATE):
+            V = 0.0
+            om = 0.0
         elif self.mode == Mode.LOCALIZING or self.mode == Mode.RELOCALIZING:
             V = 0.0
             om = 1.5
@@ -1865,25 +1901,46 @@ class Navigator:
 
                     if self.backing_from_bad_localization:
                         _nav_loginfo(
-                            "backing complete, relocalizing in place"
+                            "backing complete, entering POSE_REFINE"
                         )
                         self.backing_from_bad_localization = False
-                        self.relocalizing_start_time = current_time
-                        self.switch_mode(Mode.RELOCALIZING)
+                        self.pose_refine_start_time = current_time
+                        self._recovery_pose_ready = False
+                        self.switch_mode(Mode.POSE_REFINE)
                     elif self.backing_for_waypoints:
                         _nav_loginfo(
-                            "backing for waypoints, relocalizing in place"
+                            "backing for waypoints, entering POSE_REFINE"
                         )
                         self.backing_for_waypoints = False
                         self.pending_replan_after_recovery = True
-                        self.relocalizing_start_time = current_time
-                        self.switch_mode(Mode.RELOCALIZING)
+                        self.pose_refine_start_time = current_time
+                        self._recovery_pose_ready = False
+                        self.switch_mode(Mode.POSE_REFINE)
                     else:
                         _nav_loginfo(
                             "backing complete, returning to IDLE"
                         )
                         self.switch_mode(Mode.IDLE)
                         self.replan()
+
+            elif self.mode == Mode.POSE_REFINE:
+                current_time = rospy.get_rostime().to_sec()
+                elapsed = current_time - self.pose_refine_start_time
+                if self._recovery_pose_ready and elapsed >= self.post_backing_settle_sec:
+                    _nav_loginfo("[Navigator][Recovery] POSE_REFINE done, relocalizing")
+                    self.relocalizing_start_time = current_time
+                    self.switch_mode(Mode.RELOCALIZING)
+                elif (
+                    not self._recovery_pose_ready
+                    and elapsed >= self.pose_refine_timeout_sec
+                ):
+                    _nav_logwarn(
+                        "[Navigator][Recovery] POSE_REFINE timeout (%.1fs), "
+                        "proceeding to relocalize",
+                        self.pose_refine_timeout_sec,
+                    )
+                    self.relocalizing_start_time = current_time
+                    self.switch_mode(Mode.RELOCALIZING)
             elif self.mode == Mode.RELOCALIZING:
                 current_time = rospy.get_rostime().to_sec()
                 if current_time - self.relocalizing_start_time > self.relocalize_duration_sec:
@@ -1891,20 +1948,68 @@ class Navigator:
                     cmd_vel.linear.x = 0.0
                     cmd_vel.angular.z = 0.0
                     self.nav_vel_pub.publish(cmd_vel)
+                    _nav_loginfo(
+                        "[Navigator][Recovery] relocalize spin done, validating"
+                    )
+                    self.recovery_validate_start_time = current_time
+                    self._recovery_validated = None
+                    self.switch_mode(Mode.RECOVERY_VALIDATE)
 
+            elif self.mode == Mode.RECOVERY_VALIDATE:
+                current_time = rospy.get_rostime().to_sec()
+                elapsed = current_time - self.recovery_validate_start_time
+                if self._recovery_validated is True:
                     should_replan = self.pending_replan_after_recovery
                     self.pending_replan_after_recovery = False
+                    self.recovery_attempt_count = 0
                     self.switch_mode(Mode.IDLE)
-
                     if should_replan:
-                        _nav_loginfo(
-                            "relocalize complete, replanning"
+                        x_init = self._resolve_plan_start(
+                            self.x, self.y, self.occupancy
                         )
-                        self.replan()
+                        if x_init is None:
+                            _nav_logwarn(
+                                "[Navigator][Recovery] validated but plan "
+                                "start not free; staying IDLE"
+                            )
+                        else:
+                            _nav_loginfo(
+                                "[Navigator][Recovery] validated, replanning"
+                            )
+                            self.replan()
                     else:
                         _nav_loginfo(
-                            "relocalize complete, staying IDLE"
+                            "[Navigator][Recovery] validated, staying IDLE"
                         )
+                elif self._recovery_validated is False or (
+                    self._recovery_validated is None
+                    and elapsed >= self.recovery_validate_timeout_sec
+                ):
+                    if self._recovery_validated is None:
+                        _nav_logwarn(
+                            "[Navigator][Recovery] validation timeout "
+                            "(%.1fs)",
+                            self.recovery_validate_timeout_sec,
+                        )
+                    self.recovery_attempt_count += 1
+                    if self.recovery_attempt_count < self.max_recovery_attempts:
+                        _nav_logwarn(
+                            "[Navigator][Recovery] validation failed, "
+                            "retry spin (%d/%d)",
+                            self.recovery_attempt_count,
+                            self.max_recovery_attempts,
+                        )
+                        self._recovery_validated = None
+                        self.relocalizing_start_time = current_time
+                        self.switch_mode(Mode.RELOCALIZING)
+                    else:
+                        _nav_logwarn(
+                            "[Navigator][Recovery] validation failed, "
+                            "aborting recovery"
+                        )
+                        self.pending_replan_after_recovery = False
+                        self.recovery_attempt_count = 0
+                        self.switch_mode(Mode.IDLE)
             elif self.mode == Mode.STOPPED_FOR_PERSON:
                 current_time = rospy.get_rostime().to_sec()
                 if current_time - self.stopped_for_person_time > 5:
