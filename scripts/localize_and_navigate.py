@@ -229,6 +229,9 @@ class Navigator:
         # expects diameter robot_d, so we double clearance for footprint collision checks.
         self.robot_d = 2.0 * float(rospy.get_param("~robot_clearance", 0.3))
 
+        print("*" * 50)
+        print(self.robot_d)
+
         self.person_occupancy = None
         self.robot_stopped_by_person = False
         self.robot_slowed_by_person = False
