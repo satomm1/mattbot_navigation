@@ -1,0 +1,20 @@
+name: Sync KAIST mattbot stack stamp
+
+# On push to noetic/main, update the aggregate "last commit" stamp on
+# satomm1.github.io/mattbot/kaist.html (most recent across the mattbot stack).
+on:
+  push:
+    branches: [noetic, main]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    if: github.actor != 'github-actions[bot]'
+    uses: satomm1/satomm1.github.io/.github/workflows/update-mattbot-stack-stamp.yml@main
+    with:
+      commit_iso: ${{ github.event.head_commit.timestamp }}
+      commit_sha: ${{ github.sha }}
+      source_repo: ${{ github.repository }}
+    secrets:
+      SITE_REPO_TOKEN: ${{ secrets.SITE_REPO_TOKEN }}
+
