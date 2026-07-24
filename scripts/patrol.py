@@ -17,6 +17,8 @@ class Patrol:
         self.next_wait_sec = 0.0
 
         self.pose_pub = rospy.Publisher('/external_goal', Pose2D, queue_size=10)
+        # Outbound-only: data_publisher forwards this to DDS as MSG_GOAL for the central GUI.
+        self.dds_goal_pub = rospy.Publisher('/patrol_goal_for_dds', Pose2D, queue_size=10)
         robot_state_subscriber = rospy.Subscriber('/robot_mode', Int32, self.robot_state_callback)
         localized_subscriber = rospy.Subscriber('/localized', Bool, self.localized_callback)
 
@@ -70,6 +72,7 @@ class Patrol:
     def publish_patrol_point(self):
         pose, wait_sec = self.patrol_points[self.current_index]
         self.pose_pub.publish(pose)
+        self.dds_goal_pub.publish(pose)
         self.next_wait_sec = wait_sec
         rospy.loginfo(
             "Published patrol point %d at (%.2f, %.2f, %.2f); wait after arrival: %.1fs",
