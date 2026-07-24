@@ -1,3 +1,4 @@
 /maps/*.json
 maps/occupancy_grid_map.json
 *.pyc
+scripts/patrol.txt
