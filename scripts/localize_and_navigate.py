@@ -480,7 +480,13 @@ class Navigator:
             and self.theta_g is not None
             and (msg.x == self.x_g and msg.y == self.y_g and msg.theta == self.theta_g)
         ):
-            _nav_loginfo("External goal is the same as current goal, ignoring")
+            # Patrol re-publishes the active goal periodically; if we were left IDLE
+            # (e.g. /stop), accept the duplicate and replan so motion can resume.
+            if self.mode == Mode.IDLE:
+                _nav_loginfo("External goal matches current goal while IDLE; replanning")
+                self.replan()
+            else:
+                _nav_loginfo("External goal is the same as current goal, ignoring")
             return
 
         if self.mode == Mode.WAITING_FOR_INIT or self.mode == Mode.LOCALIZING:

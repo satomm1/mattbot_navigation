@@ -404,7 +404,14 @@ class MultiAgentNavigator(nav_impl.Navigator):
             and self.theta_g is not None
             and (msg.x == self.x_g and msg.y == self.y_g and msg.theta == self.theta_g)
         ):
-            rospy.logdebug("External goal is the same as current goal, ignoring")
+            # Patrol re-publishes the active goal periodically; resume if left IDLE.
+            if self.mode == nav_impl.Mode.IDLE:
+                rospy.loginfo(
+                    "MultiAgentNavigator: external goal matches current while IDLE; replanning"
+                )
+                self.replan()
+            else:
+                rospy.logdebug("External goal is the same as current goal, ignoring")
             return
 
         if self.mode == nav_impl.Mode.WAITING_FOR_INIT or self.mode == nav_impl.Mode.LOCALIZING:
