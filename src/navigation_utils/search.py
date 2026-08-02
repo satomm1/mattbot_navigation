@@ -1,7 +1,7 @@
+import heapq
 import math
 import numpy as np
 import time
-from queue import PriorityQueue
 
 class AStar(object):
     """Represents a motion planning problem to be solved using A*"""
@@ -14,18 +14,31 @@ class AStar(object):
         self.x_init = self.snap_to_grid(x_init)  # initial state
         self.x_goal = self.snap_to_grid(x_goal)  # goal state
 
+        # Cached planner bounds + 8-connected offsets (world meters).
+        self._x_min = float(self.statespace_lo[0])
+        self._x_max = float(self.statespace_hi[0])
+        self._y_min = float(self.statespace_lo[1])
+        self._y_max = float(self.statespace_hi[1])
+        r = float(self.resolution)
+        self._neighbor_offsets = tuple(
+            (i * r, j * r)
+            for i in (-1, 0, 1)
+            for j in (-1, 0, 1)
+            if i or j
+        )
+
         self.closed_set = set()  # the set containing the states that have been visited
         self.open_set = set()  # the set containing the states that are condidate for future expension
         self.came_from = {}  # dictionary keeping track of each state's parent to reconstruct the path
         self.est_cost_through = {}
         self.cost_to_arrive = {}
 
-        self.priority_queue = PriorityQueue()
-        self.priority_queue.put((self.manhattan_distance(self.x_init, self.x_goal), self.x_init))
+        self.priority_queue = []
+        heapq.heappush(self.priority_queue, (self.h(self.x_init), self.x_init))
 
         self.open_set.add(self.x_init)
         self.cost_to_arrive[self.x_init] = 0
-        self.est_cost_through[self.x_init] = self.distance(self.x_init, self.x_goal)
+        self.est_cost_through[self.x_init] = self.h(self.x_init)
 
         self.path = None  # the final path as a list of states
 
@@ -51,23 +64,25 @@ class AStar(object):
               useful here
         """
         ########## Code starts here ##########
-        if self.occupancy.is_free(x) and self.statespace_lo[0] <= x[0] < self.statespace_hi[0] and self.statespace_lo[1] <= x[1] < self.statespace_hi[1]:
-            if self.robots_x is not None:
-                robots_d2 = self.robots_d * self.robots_d
-                for ii in range(len(self.robots_x)):
-                    dx = self.robots_x[ii] - x[0]
-                    dy = self.robots_y[ii] - x[1]
-                    if dx * dx + dy * dy < robots_d2:
-                        return False
-                for ii in range(len(self.obj_x)):
-                    r = self.obj_d[ii] / 2 + self.robots_d / 2
-                    dx = self.obj_x[ii] - x[0]
-                    dy = self.obj_y[ii] - x[1]
-                    if dx * dx + dy * dy < r * r:
-                        return False
-            return True
-        else:
+        # Bounds first (cheap) before occupancy / agent checks.
+        if not (self._x_min <= x[0] < self._x_max and self._y_min <= x[1] < self._y_max):
             return False
+        if not self.occupancy.is_free(x):
+            return False
+        if self.robots_x is not None:
+            robots_d2 = self.robots_d * self.robots_d
+            for ii in range(len(self.robots_x)):
+                dx = self.robots_x[ii] - x[0]
+                dy = self.robots_y[ii] - x[1]
+                if dx * dx + dy * dy < robots_d2:
+                    return False
+            for ii in range(len(self.obj_x)):
+                r = self.obj_d[ii] / 2 + self.robots_d / 2
+                dx = self.obj_x[ii] - x[0]
+                dy = self.obj_y[ii] - x[1]
+                if dx * dx + dy * dy < r * r:
+                    return False
+        return True
         ########## Code ends here ##########
 
     def distance(self, x1, x2):
@@ -118,28 +133,33 @@ class AStar(object):
             x: tuple state
         Ouput:
             List of neighbors that are free, as a list of TUPLES
-
-        HINTS: Use self.is_free to check whether a given state is indeed free.
-               Use self.snap_to_grid (see above) to ensure that the neighbors
-               you compute are actually on the discrete grid, i.e., if you were
-               to compute neighbors by adding/subtracting self.resolution from x,
-               numerical errors could creep in over the course of many additions
-               and cause grid point equality checks to fail. To remedy this, you
-               should make sure that every neighbor is snapped to the grid as it
-               is computed.
         """
         neighbors = []
         ########## Code starts here ##########
-        for ii in [1, 0, -1]:
-            for jj in [1, 0, -1]:
-                if ii != 0 or jj != 0:
-                    x0 = x[0]
-                    x1 = x[1]
-                    x0 += ii * self.resolution * step_resolution  # /(np.linalg.norm(np.array((ii, jj))))
-                    x1 += jj * self.resolution * step_resolution  # /(np.linalg.norm(np.array((ii, jj))))
-                    state = self.snap_to_grid((x0, x1))
-                    if self.is_free(state):
-                        neighbors.append(state)
+        x0, y0 = x[0], x[1]
+        if step_resolution == 1:
+            offsets = self._neighbor_offsets
+        else:
+            s = self.resolution * step_resolution
+            offsets = (
+                (i * s, j * s)
+                for i in (-1, 0, 1)
+                for j in (-1, 0, 1)
+                if i or j
+            )
+
+        xmin, xmax = self._x_min, self._x_max
+        ymin, ymax = self._y_min, self._y_max
+        res = self.resolution
+        for dx, dy in offsets:
+            nx = x0 + dx
+            ny = y0 + dy
+            if nx < xmin or nx >= xmax or ny < ymin or ny >= ymax:
+                continue
+            # Re-snap to keep a stable float lattice (0.05 etc. are not binary-exact).
+            state = (res * round(nx / res), res * round(ny / res))
+            if self.is_free(state):
+                neighbors.append(state)
         ########## Code ends here ##########
         return neighbors
 
@@ -243,8 +263,8 @@ class AStar(object):
         time_limit = self.max_plan_time_sec
 
         t_start = time.time()
-        while self.priority_queue.qsize() > 0:
-            current_cost, x_current = self.priority_queue.get()
+        while self.priority_queue:
+            current_cost, x_current = heapq.heappop(self.priority_queue)
 
             # Lazy PQ: skip stale entries for nodes already expanded.
             if x_current in self.closed_set:
@@ -273,7 +293,8 @@ class AStar(object):
                 if x_neigh not in self.cost_to_arrive or tentative_cost_to_arrive < self.cost_to_arrive[x_neigh]:
                     self.came_from[x_neigh] = x_current
                     self.cost_to_arrive[x_neigh] = tentative_cost_to_arrive
-                    self.priority_queue.put(
-                        (current_cost + edge + self.h(x_neigh) - h_current, x_neigh)
+                    heapq.heappush(
+                        self.priority_queue,
+                        (current_cost + edge + self.h(x_neigh) - h_current, x_neigh),
                     )
         return False
