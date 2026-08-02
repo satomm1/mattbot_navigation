@@ -237,7 +237,7 @@ class AStar(object):
     def solve(self, step_resolution=1):
         time_limit = self.max_plan_time_sec
 
-        t_start = time.time()  
+        t_start = time.time()
         while self.priority_queue.qsize() > 0:
             current_cost, x_current = self.priority_queue.get()
 
@@ -268,3 +268,4 @@ class AStar(object):
                          - self.h(x_current),
                          x_neigh)
                     )
+        return False
