@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import time
 from queue import PriorityQueue
@@ -52,11 +53,17 @@ class AStar(object):
         ########## Code starts here ##########
         if self.occupancy.is_free(x) and self.statespace_lo[0] <= x[0] < self.statespace_hi[0] and self.statespace_lo[1] <= x[1] < self.statespace_hi[1]:
             if self.robots_x is not None:
+                robots_d2 = self.robots_d * self.robots_d
                 for ii in range(len(self.robots_x)):
-                    if np.linalg.norm(np.array((self.robots_x[ii], self.robots_y[ii])) - np.array(x)) < self.robots_d:
+                    dx = self.robots_x[ii] - x[0]
+                    dy = self.robots_y[ii] - x[1]
+                    if dx * dx + dy * dy < robots_d2:
                         return False
                 for ii in range(len(self.obj_x)):
-                    if np.linalg.norm(np.array((self.obj_x[ii], self.obj_y[ii])) - np.array(x)) < self.obj_d[ii]/2 + self.robots_d/2:
+                    r = self.obj_d[ii] / 2 + self.robots_d / 2
+                    dx = self.obj_x[ii] - x[0]
+                    dy = self.obj_y[ii] - x[1]
+                    if dx * dx + dy * dy < r * r:
                         return False
             return True
         else:
@@ -71,11 +78,9 @@ class AStar(object):
             x2: Second state tuple
         Output:
             Float Euclidean distance
-
-        HINT: This should take one line. Tuples can be converted to numpy arrays using np.array().
         """
         ########## Code starts here ##########
-        return np.linalg.norm(np.array(x1) - np.array(x2))
+        return math.hypot(x1[0] - x2[0], x1[1] - x2[1])
         ########## Code ends here ##########
 
     def manhattan_distance(self, x1, x2):
@@ -87,8 +92,8 @@ class AStar(object):
         Output:
             Float Manhattan distance
         """
-        return np.sum(np.abs(np.array(x1) - np.array(x2)))
-    
+        return abs(x1[0] - x2[0]) + abs(x1[1] - x2[1])
+
     def h(self, x):
         return self.manhattan_distance(x, self.x_goal)
 
@@ -241,6 +246,10 @@ class AStar(object):
         while self.priority_queue.qsize() > 0:
             current_cost, x_current = self.priority_queue.get()
 
+            # Lazy PQ: skip stale entries for nodes already expanded.
+            if x_current in self.closed_set:
+                continue
+
             if x_current == self.x_goal:
                 t_end = time.time()
                 self.path = self.reconstruct_path()
@@ -252,20 +261,19 @@ class AStar(object):
                 return False
 
             self.closed_set.add(x_current)
+            h_current = self.h(x_current)
 
             for x_neigh in self.get_neighbors(x_current):
                 if x_neigh in self.closed_set:
                     continue
 
-                tentative_cost_to_arrive = self.cost_to_arrive[x_current] + self.distance(x_current, x_neigh)
+                edge = self.distance(x_current, x_neigh)
+                tentative_cost_to_arrive = self.cost_to_arrive[x_current] + edge
 
                 if x_neigh not in self.cost_to_arrive or tentative_cost_to_arrive < self.cost_to_arrive[x_neigh]:
-                    cost_x_x_neigh = self.cost(x_current, x_neigh)
                     self.came_from[x_neigh] = x_current
                     self.cost_to_arrive[x_neigh] = tentative_cost_to_arrive
                     self.priority_queue.put(
-                        (current_cost + cost_x_x_neigh + self.h(x_neigh)
-                         - self.h(x_current),
-                         x_neigh)
+                        (current_cost + edge + self.h(x_neigh) - h_current, x_neigh)
                     )
         return False
