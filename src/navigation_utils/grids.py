@@ -105,39 +105,21 @@ class StochOccupancyGrid2D(object):
         self.l[y[~mask], x[~mask]] = 1.2
 
     def is_free(self, state):
-        # combine the probabilities of each cell by assuming independence
-        # of each estimation
+        # Robot-footprint check on ROS OccupancyGrid scale (occupied if >85).
+        # Unknown (<0) remains free. No probabilistic window (speed).
         x, y = self.snap_to_grid(state)
         grid_x = int((x - self.origin_x) / self.resolution)
         grid_y = int((y - self.origin_y) / self.resolution)
-        
-        # Check if in configuration space
-        half_config_size = int(round(self.robot_d/2/self.resolution))
-        #print(half_config_size)
+
+        half_config_size = int(round(self.robot_d / 2 / self.resolution))
         config_x_lower = max(0, grid_x - half_config_size)
         config_y_lower = max(0, grid_y - half_config_size)
         config_x_upper = min(self.width, grid_x + half_config_size)
         config_y_upper = min(self.height, grid_y + half_config_size)
-        if np.sum(self.probs[config_y_lower:config_y_upper, config_x_lower:config_x_upper]>85):
-            # values, counts = np.unique(self.probs[config_y_lower:config_y_upper, config_x_lower:config_x_upper], return_counts=True)
-            # print(values)
-            # print(counts)
-            #print(self.resolution)
-            return False  # Not free according to configuration space
-        # elif np.sum(self.probs[config_y_lower:config_y_upper, config_x_lower:config_x_upper]<0):
-        #     return False  # This is unknown space, not free!
-
-        # Now check probabilities
-        half_size = int(round((self.window_size-1)/2))
-        grid_x_lower = max(0, grid_x - half_size)
-        grid_y_lower = max(0, grid_y - half_size)
-        grid_x_upper = min(self.width, grid_x + half_size + 1)
-        grid_y_upper = min(self.height, grid_y + half_size + 1)        
-        
-        prob_window = self.probs[grid_y_lower:grid_y_upper, grid_x_lower:grid_x_upper]
-        p_total = np.prod(1. - np.maximum(prob_window / 100., 0.))
-
-        return (1. - p_total) < self.thresh
+        window = self.probs[config_y_lower:config_y_upper, config_x_lower:config_x_upper]
+        if window.size == 0:
+            return False
+        return not np.any(window > 85)
     
     def find_nearest_free(self, state, max_radius=1.0, step=None):
         """
