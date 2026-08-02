@@ -28,17 +28,13 @@ class AStar(object):
         )
 
         self.closed_set = set()  # the set containing the states that have been visited
-        self.open_set = set()  # the set containing the states that are condidate for future expension
         self.came_from = {}  # dictionary keeping track of each state's parent to reconstruct the path
-        self.est_cost_through = {}
         self.cost_to_arrive = {}
 
         self.priority_queue = []
         heapq.heappush(self.priority_queue, (self.h(self.x_init), self.x_init))
 
-        self.open_set.add(self.x_init)
         self.cost_to_arrive[self.x_init] = 0
-        self.est_cost_through[self.x_init] = self.h(self.x_init)
 
         self.path = None  # the final path as a list of states
 
@@ -54,16 +50,13 @@ class AStar(object):
 
     def is_free(self, x):
         """
-        Checks if a give state x is free, meaning it is inside the bounds of the map and
+        Checks if a given state x is free, meaning it is inside the bounds of the map and
         is not inside any obstacle.
         Inputs:
             x: state tuple
         Output:
             Boolean True/False
-        Hint: self.occupancy is a DetOccupancyGrid2D object, take a look at its methods for what might be
-              useful here
         """
-        ########## Code starts here ##########
         # Bounds first (cheap) before occupancy / agent checks.
         if not (self._x_min <= x[0] < self._x_max and self._y_min <= x[1] < self._y_max):
             return False
@@ -83,7 +76,6 @@ class AStar(object):
                 if dx * dx + dy * dy < r * r:
                     return False
         return True
-        ########## Code ends here ##########
 
     def distance(self, x1, x2):
         """
@@ -94,9 +86,7 @@ class AStar(object):
         Output:
             Float Euclidean distance
         """
-        ########## Code starts here ##########
         return math.hypot(x1[0] - x2[0], x1[1] - x2[1])
-        ########## Code ends here ##########
 
     def manhattan_distance(self, x1, x2):
         """
@@ -131,11 +121,10 @@ class AStar(object):
         amount equal to self.resolution.
         Input:
             x: tuple state
-        Ouput:
+        Output:
             List of neighbors that are free, as a list of TUPLES
         """
         neighbors = []
-        ########## Code starts here ##########
         x0, y0 = x[0], x[1]
         if step_resolution == 1:
             offsets = self._neighbor_offsets
@@ -160,34 +149,9 @@ class AStar(object):
             state = (res * round(nx / res), res * round(ny / res))
             if self.is_free(state):
                 neighbors.append(state)
-        ########## Code ends here ##########
         return neighbors
 
-    def find_best_est_cost_through(self):
-        """
-        Gets the state in open_set that has the lowest est_cost_through
-        Output: A tuple, the state found in open_set that has the lowest est_cost_through
-        """
-        return min(self.open_set, key=lambda x: self.est_cost_through[x])
-
-    def interpolate_path_linear(self, path, step_resolution=2):
-        """Linearly interpolate between path points"""
-        path_array = np.array(path)
-        new_path = []
-        for i in range(len(path_array) - 1):
-            start = path_array[i]
-            end = path_array[i + 1]
-            num_to_add = step_resolution - 1
-            
-            new_path.append(self.snap_to_grid(start))
-            for j in range(num_to_add):
-                t = (j + 1) / (num_to_add + 1)
-                interpolated_point = start + t * (end - start)
-                new_path.append(self.snap_to_grid(interpolated_point))
-        new_path.append(self.snap_to_grid(path_array[-1]))
-        return new_path
-
-    def reconstruct_path(self, step_resolution=1):
+    def reconstruct_path(self):
         """
         Use the came_from map to reconstruct a path from the initial location to
         the goal location
@@ -199,65 +163,7 @@ class AStar(object):
         while current != self.x_init:
             path.append(self.came_from[current])
             current = path[-1]
-
-        # if step_resolution > 1:
-        #     return self.interpolate_path_linear(list(reversed(path)), step_resolution=step_resolution)
-
         return list(reversed(path))
-
-    def solve_old(self, step_resolution=1):
-        """
-        Solves the planning problem using the A* search algorithm. It places
-        the solution as a list of tuples (each representing a state) that go
-        from self.x_init to self.x_goal inside the variable self.path
-        Input:
-            None
-        Output:
-            Boolean, True if a solution from x_init to x_goal was found
-
-        HINTS:  We're representing the open and closed sets using python's built-in
-                set() class. This allows easily adding and removing items using
-                .add(item) and .remove(item) respectively, as well as checking for
-                set membership efficiently using the syntax "if item in set".
-        """
-        ########## Code starts here ##########
-        time_limit = self.max_plan_time_sec
-
-        print("step resolution: ", step_resolution)
-
-        start = time.time()        
-        print(self.x_init)
-        while len(self.open_set) > 0:
-            if time.time() - start > time_limit:
-                print("A* took too long")
-                return False
-        
-            x_current = self.find_best_est_cost_through()
-            if x_current == self.x_goal:
-                self.path = self.reconstruct_path(step_resolution=step_resolution)
-                return True
-            self.open_set.remove(x_current)
-            self.closed_set.add(x_current)
-            for x_neigh in self.get_neighbors(x_current, step_resolution=step_resolution):
-
-                # if x_neigh not in self.closed_set:
-                #     continue
-                # tentative_cost_to_arrive = self.cost_to_arrive[x_current] + self.distance(x_current, x_neigh)
-                # if x_neigh not in self.open_set:
-                #     self.open_set.add(x_neigh)
-                # elif tentative_cost_to_arrive > self.cost_to_arrive[x_neigh]:
-                #     continue
-                # self.came_from[x_neigh] = x_current
-                # self.cost_to_arrive[x_neigh] = tentative_cost_to_arrive
-                # self.est_cost_through[x_neigh] = tentative_cost_to_arrive + self.distance(x_neigh, self.x_goal)
-                tentative_cost_to_arrive = self.cost_to_arrive[x_current] + self.distance(x_current, x_neigh)
-                if x_neigh not in self.cost_to_arrive or tentative_cost_to_arrive < self.cost_to_arrive[x_neigh]:
-                    self.open_set.add(x_neigh)
-                    self.came_from[x_neigh] = x_current
-                    self.cost_to_arrive[x_neigh] = tentative_cost_to_arrive
-                    self.est_cost_through[x_neigh] = tentative_cost_to_arrive + self.distance(x_neigh, self.x_goal)
-        return False
-        ########## Code ends here ##########
 
     def solve(self, step_resolution=1):
         time_limit = self.max_plan_time_sec
