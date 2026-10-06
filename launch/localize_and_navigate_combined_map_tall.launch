@@ -5,6 +5,11 @@
   <param name="camera_inverted" type="bool" value="true" />
 
   <arg name="patrol" default="false" />
+  <!-- Experimental: stop on the path to check ledger objects whose belief has decayed
+       (needs the ledger + belief model: bringup ledger:=true). -->
+  <arg name="observe" default="false"/>
+  <arg name="observe_dwell_s" default="4.0"/>
+  <arg name="observe_check_below_belief" default="0.5"/>
   <arg name="tall"   default="true"  />
   <arg name="car"    default="false" />
 
@@ -46,6 +51,8 @@
   </node>
 
   <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate.py" output="screen">
+    <param name="observe_enabled" value="$(arg observe)"/>
+    <param name="observe_dwell_s" value="$(arg observe_dwell_s)"/>
     <param name="stall_detection_enabled" value="true"/>
     <param name="stall_cmd_vel_threshold" value="0.08"/>
     <param name="stall_odom_displacement_m" value="0.02"/>
@@ -56,6 +63,11 @@
     <param name="nearest_free_search_radius" value="1.0"/>
     <param name="robot_clearance" value="$(arg robot_clearance)"/>
     <param name="max_plan_time_sec" value="$(arg max_plan_time_sec)"/>
+  </node>
+
+  <node if="$(arg observe)" name="observation_planner" pkg="mattbot_navigation" type="observation_planner.py" output="screen">
+    <param name="dwell_s" value="$(arg observe_dwell_s)"/>
+    <param name="check_below_belief" value="$(arg observe_check_below_belief)"/>
   </node>
 
   <!-- Launch the patrol.py script only if patrol is true -->

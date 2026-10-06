@@ -7,7 +7,8 @@ from geometry_msgs.msg import Twist, Pose2D, PoseStamped, PoseWithCovarianceStam
 from std_msgs.msg import String, Int32, Float64, Bool
 from visualization_msgs.msg import Marker, MarkerArray
 from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray
-from mattbot_dds.msg import AgentPath, AgentLocation
+from mattbot_dds.msg import AgentPath, AgentLocation, ObservationEvent, ObservationStop
+from mattbot_dds.srv import SelectObservations
 import tf
 from dynamic_reconfigure.client import Client
 
@@ -171,6 +172,10 @@ class Mode(Enum):
     STOPPED_FOR_AGENT = 11
     POSE_REFINE = 13       # stopped after backup; wait for pose inject
     RECOVERY_VALIDATE = 14 # reserved for stage 2
+    OBSERVE_TURN = 15      # stopped on the path, turning to face an object to check
+    OBSERVE_DWELL = 16     # facing the object, holding still while the camera observes
+
+OBSERVE_MODES = (Mode.OBSERVE_TURN, Mode.OBSERVE_DWELL)
 
 class Navigator:
     """
@@ -322,6 +327,25 @@ class Navigator:
         self.v_des = rospy.get_param('/cruising_velocity', 0.35) # desired cruising velocity
         self.theta_start_thresh = 0.05  # threshold in theta to start moving forward when path-following
         self.post_align_pause_sec = rospy.get_param('~post_align_pause_sec', 1.0)
+
+        # Opportunistic observation: stop on the path to check ledger objects (observation_planner.py)
+        self.observe_enabled = bool(rospy.get_param('~observe_enabled', False))
+        self.observe_dwell_s = float(rospy.get_param('~observe_dwell_s', 4.0))
+        self.observe_trigger_m = float(rospy.get_param('~observe_trigger_m', 0.25))
+        self.observe_path_stride = max(1, int(rospy.get_param('~observe_path_stride', 5)))
+        self.observe_turn_timeout_s = float(rospy.get_param('~observe_turn_timeout_s', 10.0))
+        self._observation_stops = []  # [{"idx", "t", "stop": ObservationStop}], ordered along current_plan
+        self._observe_queue = []  # [(object_id, x, y)] still to look at in the active stop
+        self._observe_stop = None  # active stop entry
+        self._observe_target = None  # (object_id, x, y) being looked at
+        self._observe_heading = 0.0
+        self._observe_phase_start = None  # rospy.Time
+        self._observe_window_start = 0.0  # wall time
+        self._observe_resuming = False  # set while leaving OBSERVE_* normally
+        self._observed_this_goal = set()  # object ids checked for the current goal
+        self._observe_goal = None  # goal the set above belongs to
+        self._observation_srv = None
+        self.observation_event_pub = rospy.Publisher('/observation/events', ObservationEvent, queue_size=20)
         self._aligned_since = None  # wall time when post-align dwell started (before TRACK)
         self.start_pos_thresh = (
             0.2  # threshold to be far enough into the plan to recompute it
@@ -1151,6 +1175,8 @@ class Navigator:
 
     def switch_mode(self, new_mode):
         _nav_loginfo("Switching from %s -> %s", self.mode, new_mode)
+        if self.mode in OBSERVE_MODES and new_mode not in OBSERVE_MODES and not self._observe_resuming:
+            self._abort_observation()
         if self.mode == Mode.ALIGN and new_mode != Mode.ALIGN:
             self._aligned_since = None
         if new_mode == Mode.TRACK:
@@ -1616,11 +1642,26 @@ class Navigator:
         self.th_init = plan_start_heading(planned_path, traj_new, v_min=0.05)
         self.heading_controller.load_goal(self.th_init)
 
+        self._build_waypoints(t_new, traj_new)
+        self._request_observation_stops(traj_new, t_new)
+
+        if not self.aligned():
+            _nav_loginfo("Not aligned with start direction")
+            self.switch_mode(Mode.ALIGN)
+            return
+        else:
+            _nav_loginfo(
+                "Already aligned; pausing %.1fs before TRACK", self.post_align_pause_sec
+            )
+            self._aligned_since = rospy.get_rostime()
+            self.switch_mode(Mode.ALIGN)
+            return
+
+    def _build_waypoints(self, t_new, traj_new):
+        """Waypoint deadlines (every 20th trajectory sample, +2 s buffer) and their markers."""
         # Populate the waypoints, use every 20th point:
         self.waypoints = []
         marker_arr = MarkerArray()
-        th_err = wrapToPi(self.th_init - self.theta)
-        t_init_align = abs(th_err / self.om_max)
         for i in range(20, len(traj_new), 20):
             self.waypoints.append([traj_new[i, 0], traj_new[i, 1], t_new[i]+2])  # +2 to add a buffer +t_init_align+current_time
             marker = Marker()
@@ -1642,17 +1683,186 @@ class Navigator:
             marker_arr.markers.append(marker)
         self.waypoint_pub.publish(marker_arr)
 
-        if not self.aligned():
-            _nav_loginfo("Not aligned with start direction")
-            self.switch_mode(Mode.ALIGN)
+    # ---------- Opportunistic observation ----------
+
+    def _observation_allowed(self):
+        return self.observe_enabled
+
+    def _request_observation_stops(self, traj_new, t_new):
+        """Ask observation_planner where along the new trajectory to stop and check objects."""
+        self._observation_stops = []
+        if not self._observation_allowed():
             return
-        else:
-            _nav_loginfo(
-                "Already aligned; pausing %.1fs before TRACK", self.post_align_pause_sec
+        goal = (self.x_g, self.y_g, self.theta_g)
+        if goal != self._observe_goal:
+            # New goal: every object may be checked again (once)
+            self._observe_goal = goal
+            self._observed_this_goal = set()
+        try:
+            if self._observation_srv is None:
+                rospy.wait_for_service('/observation/select', timeout=0.2)
+                self._observation_srv = rospy.ServiceProxy('/observation/select', SelectObservations)
+            stride = self.observe_path_stride
+            path = Path()
+            path.header.frame_id = "map"
+            path.header.stamp = rospy.Time.now()
+            for k in range(0, len(traj_new), stride):
+                ps = PoseStamped()
+                ps.pose.position.x = traj_new[k, 0]
+                ps.pose.position.y = traj_new[k, 1]
+                ps.pose.orientation.w = 1.0
+                path.poses.append(ps)
+            resp = self._observation_srv(
+                path=path,
+                start=Pose2D(x=self.x, y=self.y, theta=self.theta),
+                goal=Pose2D(x=self.x_g or 0.0, y=self.y_g or 0.0, theta=self.theta_g or 0.0),
+                exclude_object_ids=sorted(self._observed_this_goal),
             )
-            self._aligned_since = rospy.get_rostime()
-            self.switch_mode(Mode.ALIGN)
+        except (rospy.ROSException, rospy.ServiceException) as exc:
+            self._observation_srv = None
+            rospy.logwarn_throttle(30, "observation: /observation/select unavailable (%s)", exc)
             return
+        for stop in resp.stops:
+            if stop.kind != ObservationStop.OPPORTUNISTIC or stop.path_index < 0:
+                continue  # detours not supported yet
+            idx = min(stop.path_index * stride, len(traj_new) - 1)
+            self._observation_stops.append({"idx": idx, "t": float(t_new[idx]), "stop": stop})
+        if self._observation_stops:
+            _nav_loginfo(
+                "Observation stops planned: %s",
+                ", ".join("+".join(e["stop"].object_ids) for e in self._observation_stops),
+            )
+
+    def _observation_due(self):
+        """In TRACK: True if the next observation stop is reached. Drops stops we have passed."""
+        if not self._observation_stops:
+            return False
+        entry = self._observation_stops[0]
+        stop = entry["stop"]
+        # Trigger once the robot reaches the stop along the path (not up to trigger_m early)
+        along = (self.x - stop.x) * np.cos(stop.heading) + (self.y - stop.y) * np.sin(stop.heading)
+        if np.hypot(self.x - stop.x, self.y - stop.y) < self.observe_trigger_m and along >= -0.05:
+            return True
+        if self.get_current_plan_time() > entry["t"] + 2.0:
+            _nav_loginfo("Passed observation stop for %s without reaching it; skipping", list(stop.object_ids))
+            self._observation_stops.pop(0)
+        return False
+
+    def _start_observation_stop(self):
+        """Stop on the path and start turning to the first object of the next stop."""
+        self._observe_stop = self._observation_stops.pop(0)
+        stop = self._observe_stop["stop"]
+        self._observe_queue = [(oid, t.x, t.y) for oid, t in zip(stop.object_ids, stop.targets)]
+        self.nav_vel_pub.publish(Twist())
+        self._observe_next_target()
+
+    def _observe_next_target(self):
+        self._observe_target = self._observe_queue.pop(0)
+        _, tx, ty = self._observe_target
+        self._observe_heading = float(np.arctan2(ty - self.y, tx - self.x))
+        self.heading_controller.load_goal(self._observe_heading)
+        self._observe_phase_start = rospy.get_rostime()
+        self.switch_mode(Mode.OBSERVE_TURN)
+
+    def _publish_observation_event(self, event, window_end=0.0):
+        object_id, tx, ty = self._observe_target
+        stop = self._observe_stop["stop"]
+        msg = ObservationEvent(
+            event=event,
+            kind=stop.kind,
+            cost_s=stop.cost_s,
+            object_id=object_id,
+            target_x=tx,
+            target_y=ty,
+            x=self.x,
+            y=self.y,
+            theta=self.theta,
+            distance=float(np.hypot(tx - self.x, ty - self.y)),
+            window_start=self._observe_window_start,
+            window_end=window_end,
+        )
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "map"
+        self.observation_event_pub.publish(msg)
+
+    def _abort_observation(self):
+        """Interrupted (stop, new goal, recovery, ...): report and drop the active stop.
+
+        Planned stops are left alone: every way back to TRACK goes through replan(), which
+        replaces them (and may already have, if a new goal triggered this abort).
+        """
+        if self._observe_target is not None:
+            _nav_loginfo("Observation of %s aborted", self._observe_target[0])
+            self._publish_observation_event(ObservationEvent.ABORTED, window_end=time.time())
+        self._observe_target = None
+        self._observe_stop = None
+        self._observe_queue = []
+
+    def _observe_step(self):
+        """State machine for OBSERVE_TURN / OBSERVE_DWELL (called from run())."""
+        elapsed = (rospy.get_rostime() - self._observe_phase_start).to_sec()
+        if self.mode == Mode.OBSERVE_TURN:
+            if abs(wrapToPi(self.theta - self._observe_heading)) < self.theta_goal_thresh:
+                self._observe_window_start = time.time()
+                self._observe_phase_start = rospy.get_rostime()
+                self._publish_observation_event(ObservationEvent.STARTED)
+                self.switch_mode(Mode.OBSERVE_DWELL)
+            elif elapsed > self.observe_turn_timeout_s:
+                _nav_loginfo("Observation turn to %s timed out; skipping", self._observe_target[0])
+                self._publish_observation_event(ObservationEvent.ABORTED, window_end=time.time())
+                self._finish_observation_target(done=False)
+        elif self.mode == Mode.OBSERVE_DWELL and elapsed >= self.observe_dwell_s:
+            self._publish_observation_event(ObservationEvent.ENDED, window_end=time.time())
+            self._finish_observation_target(done=True)
+
+    def _finish_observation_target(self, done):
+        if done:
+            self._observed_this_goal.add(self._observe_target[0])
+        if self._observe_queue:
+            self._observe_next_target()
+            return
+        entry = self._observe_stop
+        self._observe_target = None
+        self._observe_stop = None
+        self._observe_resuming = True
+        try:
+            if entry["stop"].resume == ObservationStop.REPLAN:
+                self.switch_mode(Mode.IDLE)
+                self.replan()
+            else:
+                self._load_remaining_plan(self._nearest_plan_index(entry["idx"]))
+        finally:
+            self._observe_resuming = False
+
+    def _nearest_plan_index(self, idx, window=40):
+        """Trajectory sample nearest the robot, searched around idx (robot may stop short or overshoot)."""
+        plan = np.asarray(self.current_plan)
+        lo, hi = max(idx - window, 0), min(idx + window + 1, len(plan))
+        d = np.hypot(plan[lo:hi, 0] - self.x, plan[lo:hi, 1] - self.y)
+        return lo + int(np.argmin(d))
+
+    def _load_remaining_plan(self, idx):
+        """Continue the current trajectory from sample idx: turn back to the path, then TRACK."""
+        times = np.asarray(self.traj_controller.traj_times)
+        traj = np.asarray(self.current_plan)[idx:]
+        t_new = times[idx:] - times[idx]
+        if len(traj) < 4:
+            self._enter_park_pose()
+            return
+        self.traj_controller.load_traj(t_new, traj)  # resets tracker state; soft start re-applies
+        self.current_plan = traj
+        self.current_plan_start_time = rospy.get_rostime()
+        self._reset_plan_clock_slip()
+        self.current_plan_duration = t_new[-1]
+        self._build_waypoints(t_new, traj)
+        for entry in self._observation_stops:  # later stops on the same trajectory
+            entry["idx"] -= idx
+            entry["t"] -= times[idx]
+        self.th_init = plan_start_heading(None, traj, v_min=0.05)
+        self.heading_controller.load_goal(self.th_init)
+        if self.aligned():
+            self._aligned_since = rospy.get_rostime()
+        self.switch_mode(Mode.ALIGN)
 
     def publish_control(self):
         """
@@ -1712,6 +1922,14 @@ class Navigator:
             om = 0.0
         elif self.mode == Mode.STOPPED_FOR_AGENT:
             # If we are stopped for an agent, we don't want to move
+            V = 0.0
+            om = 0.0
+        elif self.mode == Mode.OBSERVE_TURN:
+            V, om = self.heading_controller.compute_control(
+                self.theta, t, prev_om=self.prev_om
+            )
+        elif self.mode == Mode.OBSERVE_DWELL:
+            # Hold still: the detector drops frames while rotating
             V = 0.0
             om = 0.0
         else:
@@ -1823,6 +2041,8 @@ class Navigator:
                 current_time = rospy.get_rostime().to_sec()
                 if self.near_goal():
                     self._enter_park_pose()
+                elif self._observation_due():
+                    self._start_observation_stop()
                 elif(not self.path_still_valid(self.current_plan)):
                     # Path no longer valid ---> replan
                     _nav_loginfo("replanning because path is no longer valid")
@@ -1877,7 +2097,7 @@ class Navigator:
                 #     # Now replan
                 #     self.replan(obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
 
-                if self.get_current_plan_time() > self.current_plan_duration * 1.2:
+                if self.mode == Mode.TRACK and self.get_current_plan_time() > self.current_plan_duration * 1.2:
                     if (self.x_g is not None and self.y_g is not None and np.linalg.norm(np.array([self.x - self.x_g, self.y - self.y_g])) > 0.5):
                         _nav_loginfo("replanning because out of time")
 
@@ -1887,6 +2107,9 @@ class Navigator:
                     else:
                         _nav_loginfo("Going to park because out of time and near goal")
                         self._enter_park_pose()
+
+            elif self.mode in OBSERVE_MODES:
+                self._observe_step()
 
             elif self.mode == Mode.PARK_POSE:
                 if self.at_park_pose():

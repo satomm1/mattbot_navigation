@@ -1995,6 +1995,11 @@ class MultiAgentNavigator(nav_impl.Navigator):
             )
         self.replan()
 
+    def _observation_allowed(self):
+        """No opportunistic observation stops during multi-agent missions: pausing would break
+        the timed schedule peers plan around (and goals here always run as missions)."""
+        return super()._observation_allowed() and not (self._multi_plan_id or "").strip()
+
     def replan(self, obj_x=None, obj_y=None, obj_d=None):
         """Extend base ``replan()`` with optional **multi timing tail** (pre-MULTI ALIGN → MULTI → arm).
 

@@ -168,6 +168,7 @@ catkin_install_python(PROGRAMS
   scripts/occupancy_grid_mapper.py
   scripts/localize_and_map.py
   scripts/patrol.py
+  scripts/observation_planner.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
