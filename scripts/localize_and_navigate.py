@@ -12,6 +12,7 @@ from mattbot_dds.srv import SelectObservations
 import tf
 from dynamic_reconfigure.client import Client
 
+import copy
 import time
 import numpy as np
 import networkx as nx
@@ -233,6 +234,8 @@ class Navigator:
         # robot_clearance: planning radius from robot center (m). StochOccupancyGrid2D.is_free()
         # expects diameter robot_d, so we double clearance for footprint collision checks.
         self.robot_d = 2.0 * float(rospy.get_param("~robot_clearance", 0.3))
+        # TRACK replans only if the path enters an object blockout by more than this (m)
+        self.path_check_tolerance_m = float(rospy.get_param("~path_check_tolerance_m", 0.1))
 
         print("*" * 50)
         print(self.robot_d)
@@ -1419,15 +1422,33 @@ class Navigator:
         else:
             return False
     
+    def _planning_occupancy(self):
+        """Navigation map plus the confirmed-object blockouts from /object_map.
+
+        self.occupancy is built once from the first /navigation_map, so it never contains objects
+        confirmed later. A shallow copy keeps the social A* wall-distance cache.
+        """
+        self._init_dynamic_occupancy_grids()
+        objects = self.object_occupancy
+        if objects is None or objects.probs.shape != self.occupancy.probs.shape:
+            return self.occupancy
+        combined = copy.copy(self.occupancy)
+        combined.probs = np.maximum(self.occupancy.probs, objects.probs)
+        return combined
+
     def path_still_valid(self, path):
         if path is None or len(path) == 0:
             return True
         self._init_dynamic_occupancy_grids()
         if self.object_occupancy is None:
             return True
+        # A* plans right along the blockout edge and smoothing shifts the trajectory by a cell or so;
+        # only reject intrusions deeper than the tolerance, or every new plan is rejected again.
+        check = copy.copy(self.object_occupancy)
+        check.robot_d = max(self.robot_d - 2.0 * self.path_check_tolerance_m, 0.0)
         for point in path:
             xy = np.asarray(point, dtype=float).reshape(-1)[:2]
-            if not self.object_occupancy.is_free(xy):
+            if not check.is_free(xy):
                 _nav_loginfo("Path no longer valid...")
                 return False
         return True
@@ -1505,8 +1526,11 @@ class Navigator:
             return  # don't replan if we are already tracking a plan
 
         current_time = rospy.get_rostime()
- 
-        x_init = self._resolve_plan_start(self.x, self.y, self.occupancy)
+
+        # Plan on the same object blockouts that path_still_valid checks, or TRACK rejects the plan right away
+        combined_occupancy = self._planning_occupancy()
+
+        x_init = self._resolve_plan_start(self.x, self.y, combined_occupancy)
         if x_init is None:
             self.switch_mode(Mode.IDLE)
             return
@@ -1526,8 +1550,6 @@ class Navigator:
             agent_x, agent_y = self.other_agent_locs[agent_id]
             robots_x.append(agent_x)
             robots_y.append(agent_y)
-
-        combined_occupancy = self.occupancy
 
         # Tight world bounds from the loaded map (same idea as build_occ_grid / plan_with_heatmap). Using
         # a huge ±plan_horizon box forced A* to search an enormous state space at map resolution.
