@@ -4,8 +4,11 @@ Pure Python (no ROS). An observation option is "stop at (x, y), look at these ob
 Every option carries a kind, an estimated cost (extra seconds) and a value per object,
 so policies can trade value against cost:
 
-  OPPORTUNISTIC (implemented): the stop is on the planned path; cost = turn out + dwell + turn back.
-  DETOUR (future): the stop is off the path; cost also includes the extra driving time.
+  OPPORTUNISTIC: the stop is on the planned path; cost = turn out + dwell + turn back.
+  DETOUR: the stop is a viewpoint off the path (navigation_utils/detour.py: leave the path, look,
+          replan to the goal); cost = extra driving / cruise_speed + turn to the object + dwell.
+          Offered only for objects that no opportunistic stop covers. The navigator does not
+          execute detours yet.
 
 ThresholdPolicy (current) checks objects whose belief is at or below a threshold. Its value is
 importance * (1 - belief); importance comes from importance_fn when given (the observation
@@ -49,6 +52,7 @@ class ObservationOption:
     candidates: List[Candidate]  # in stop.targets order
     values: List[float]
     cost_s: float
+    detour_m: float = 0.0  # extra driving distance (DETOUR only)
 
     @property
     def path_index(self):
@@ -112,8 +116,10 @@ class ThresholdPolicy(ObservationPolicy):
         turn_rate=1.0,  # rad/s, for the cost estimate
         dwell_s=3.0,
         importance_fn=None,  # Candidate -> importance; None = importance() stub
+        cruise_speed=0.4,  # m/s, converts detour distance to time
     ):
         self.importance_fn = importance_fn
+        self.cruise_speed = cruise_speed
         self.check_below_belief = check_below_belief
         self.cooldown_s = cooldown_s
         self.max_cost_s = max_cost_s
@@ -140,7 +146,15 @@ class ThresholdPolicy(ObservationPolicy):
     def value(self, candidate):
         return self.importance(candidate) * (1.0 - candidate.belief)
 
-    def options(self, path_xy, candidates, viewsheds, now, exclude=()):
+    def detour_cost_s(self, detour, candidate):
+        """Extra time for a DETOUR: drive the extra distance, turn to the object, dwell."""
+        bearing = math.atan2(candidate.y - detour.viewpoint_xy[1], candidate.x - detour.viewpoint_xy[0])
+        turn = abs(wrap_angle(bearing - detour.arrival_heading))
+        return detour.detour_m / self.cruise_speed + turn / self.turn_rate + self.dwell_s
+
+    def options(self, path_xy, candidates, viewsheds, now, exclude=(), detours=None):
+        """Opportunistic options along path_xy, then DETOUR options for eligible objects that no
+        opportunistic stop covers (detours: {object_id: detour.DetourResult}, None = none)."""
         eligible = {c.object_id: c for c in self.eligible_candidates(candidates, now, exclude)}
         stops = select_stops(
             path_xy,
@@ -167,4 +181,20 @@ class ThresholdPolicy(ObservationPolicy):
                     cost_s=cost,
                 )
             )
-        return options
+        covered = {c.object_id for opt in options for c in opt.candidates}
+        detour_options = []
+        for object_id, c in eligible.items():
+            d = (detours or {}).get(object_id)
+            if object_id in covered or d is None or d.on_path:
+                continue
+            cost = self.detour_cost_s(d, c)
+            if self.max_cost_s > 0 and cost > self.max_cost_s:
+                continue
+            stop = Stop(d.leave_index, d.viewpoint_xy[0], d.viewpoint_xy[1], d.arrival_heading,
+                        [(object_id, c.x, c.y)])
+            detour_options.append(
+                ObservationOption(kind=DETOUR, resume=REPLAN, stop=stop, candidates=[c],
+                                  values=[self.value(c)], cost_s=cost, detour_m=d.detour_m)
+            )
+        detour_options.sort(key=lambda o: o.cost_s)
+        return options + detour_options

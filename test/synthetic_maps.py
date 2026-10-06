@@ -56,3 +56,12 @@ def maze():
     free(g, 10.8, 5.2, 12.6, 6.8)  # spur east from (10, 6)
     free(g, 3.0, 9.2, 4.0, 10.8, value=100)  # wall in the top corridor between x = 2 and 6
     return g
+
+
+def corridor_with_room():
+    """Corridor y in [1, 2.6], x in [1, 15]; room x in [7, 11], y in [4, 8] above it, joined by a
+    1.2 m door (x in [8.4, 9.6]) - the room interior is out of sight from the corridor beyond ~3 m."""
+    g = walls(16.0, 9.0)
+    free(g, 1.0, 1.0, 15.0, 2.6)
+    free(g, 7.0, 4.0, 11.0, 8.0)
+    return free(g, 8.4, 2.6, 9.6, 4.0)

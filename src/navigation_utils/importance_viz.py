@@ -1,4 +1,4 @@
-"""PNG of obstacle importance on the roadmap (matplotlib, headless; no ROS).
+"""PNGs of obstacle importance and observation detours (matplotlib, headless; no ROS).
 
 Draws the static map, the roadmap, and each obstacle filled by its I_o (one-hue sequential
 ramp, shared colorbar) with its blocked edges in the same colour. Obstacles that block nothing
@@ -181,6 +181,96 @@ def render_importance_png(path, roadmap, results, objects, trips=None, title=Non
     fig.suptitle(title or "Obstacle importance", x=0.01, ha="left", fontsize=11, color=TEXT_PRIMARY)
     fig.tight_layout()
 
+    _save(fig, path, dpi)
+    return path
+
+
+DETOUR_ROUTE = "#2a78d6"
+VIEWPOINT_CELLS = "#cde2fb"
+PATH_COLOR = TEXT_PRIMARY
+
+
+def render_detour_png(path, roadmap, path_xy, detours, targets, options=None, occupancy=None, planner=None,
+                      title=None, dpi=150, margin_m=3.0):
+    """Write a PNG of the detours for one planned path.
+
+    path_xy: (N, 2) planned path; detours: {object_id: detour.DetourResult};
+    targets: {object_id: (x, y, viewpoint_nodes)} (viewpoint cells are drawn when planner is given);
+    options: ObservationOptions (DETOUR costs in seconds are added to the labels).
+    """
+    path_xy = np.asarray(path_xy, dtype=float).reshape(-1, 2)
+    pts = [path_xy] + [np.array([[x, y]]) for x, y, _vn in targets.values()]
+    allp = np.concatenate(pts, axis=0)
+    lo, hi = allp.min(axis=0) - margin_m, allp.max(axis=0) + margin_m
+    span = np.maximum(hi - lo, 1.0)
+    fig_w = 12.0
+    fig_h = float(np.clip(fig_w * span[1] / span[0], 4.0, 14.0)) + 0.8
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor=SURFACE)
+    ax.set_facecolor(SURFACE)
+    _background(ax, roadmap, occupancy)
+    ax.set_xlim(lo[0], hi[0])
+    ax.set_ylim(lo[1], hi[1])
+    ax.set_aspect("equal")
+    placer = _LabelPlacer(ax, fontsize=7)
+    halo = [patheffects.withStroke(linewidth=2.5, foreground=SURFACE)]
+
+    if planner is not None:
+        cells = [vn for _x, _y, vn in targets.values() if len(vn)]
+        if cells:
+            rc = planner.cells[np.unique(np.concatenate(cells))]
+            mask = np.zeros(roadmap.shape, dtype=bool)
+            mask[rc[:, 0], rc[:, 1]] = True
+            h, w = roadmap.shape
+            ax.imshow(np.ma.masked_where(~mask, np.ones(roadmap.shape)), cmap=ListedColormap([VIEWPOINT_CELLS]),
+                      origin="lower", interpolation="nearest", zorder=2,
+                      extent=(roadmap.origin[0], roadmap.origin[0] + w * roadmap.res,
+                              roadmap.origin[1], roadmap.origin[1] + h * roadmap.res))
+
+    ax.plot(path_xy[:, 0], path_xy[:, 1], color=PATH_COLOR, linewidth=2.0, solid_capstyle="round", zorder=4)
+    ax.scatter([path_xy[0, 0]], [path_xy[0, 1]], s=30, color=PATH_COLOR, zorder=5)
+    ax.scatter([path_xy[-1, 0]], [path_xy[-1, 1]], marker="*", s=90, color=PATH_COLOR, zorder=5)
+
+    cost = {}
+    for o in options or []:
+        if o.kind == 1:  # observation_policy.DETOUR
+            cost[o.candidates[0].object_id] = o.cost_s
+    for oid in sorted(targets, key=lambda k: detours[k].detour_m if k in detours else np.inf):
+        x, y, _vn = targets[oid]
+        d = detours.get(oid)
+        if d is not None and not d.on_path:
+            route = np.vstack([d.leave_xy, d.route_xy]) if len(d.route_xy) else np.array([d.leave_xy, d.viewpoint_xy])
+            ax.plot(route[:, 0], route[:, 1], color=DETOUR_ROUTE, linewidth=2.0, linestyle=(0, (4, 2)), zorder=5)
+            ax.scatter([d.viewpoint_xy[0]], [d.viewpoint_xy[1]], s=40, facecolor=DETOUR_ROUTE, edgecolor=SURFACE,
+                       linewidths=1.0, zorder=6)
+            ax.plot([d.viewpoint_xy[0], x], [d.viewpoint_xy[1], y], color=DETOUR_ROUTE, linewidth=0.8, zorder=5)
+            label = "%s: +%.1f m" % (oid, d.detour_m) + (" (%.0f s)" % cost[oid] if oid in cost else "")
+            ink, face = TEXT_PRIMARY, DETOUR_ROUTE
+        elif d is not None:
+            label, ink, face = "%s: seen from path" % oid, TEXT_SECONDARY, SURFACE
+        else:
+            label, ink, face = "%s: no viewpoint within limit" % oid, TEXT_SECONDARY, SURFACE
+        ax.add_patch(Rectangle((x - 0.25, y - 0.25), 0.5, 0.5, facecolor=face, edgecolor=TEXT_SECONDARY,
+                               linewidth=1.0, zorder=7))
+        off, ha = placer.offset(x, y, label)
+        ax.annotate(label, (x, y), xytext=off, textcoords="offset points", fontsize=7, ha=ha, color=ink,
+                    path_effects=halo, zorder=8)
+
+    ax.set_xlabel("x (m)", color=TEXT_SECONDARY, fontsize=8)
+    ax.set_ylabel("y (m)", color=TEXT_SECONDARY, fontsize=8)
+    ax.tick_params(colors=TEXT_SECONDARY, labelsize=7)
+    for spine in ax.spines.values():
+        spine.set_color(ROADMAP)
+    n_det = sum(1 for d in detours.values() if not d.on_path)
+    ax.set_title("%d object(s) considered, %d need a detour; light cells = reachable viewpoints, dashed = "
+                 "leave the path -> viewpoint, then replan to the goal (star)" % (len(targets), n_det),
+                 fontsize=8, color=TEXT_SECONDARY, loc="left")
+    fig.suptitle(title or "Observation detours", x=0.01, ha="left", fontsize=11, color=TEXT_PRIMARY)
+    fig.tight_layout()
+    _save(fig, path, dpi)
+    return path
+
+
+def _save(fig, path, dpi):
     out_dir = os.path.dirname(os.path.abspath(path))
     os.makedirs(out_dir, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=out_dir, suffix=".png")
@@ -193,4 +283,3 @@ def render_importance_png(path, roadmap, results, objects, trips=None, title=Non
         plt.close(fig)
         if os.path.exists(tmp):
             os.unlink(tmp)
-    return path

@@ -170,6 +170,7 @@ catkin_install_python(PROGRAMS
   scripts/patrol.py
   scripts/observation_planner.py
   scripts/plot_obstacle_importance.py
+  scripts/plot_observation_detours.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

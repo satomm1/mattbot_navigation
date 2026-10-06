@@ -14,6 +14,10 @@
        once per object on a topological roadmap of the static /map. -->
   <arg name="observe_importance" default="false"/>
   <arg name="observe_landmarks_file" default=""/>
+  <!-- Offer DETOUR options (viewpoints off the path) for objects no on-path stop can see; the
+       navigator does not execute them yet. Objects needing more than max_detour_m are ignored. -->
+  <arg name="observe_detour" default="false"/>
+  <arg name="observe_max_detour_m" default="15.0"/>
   <arg name="tall"   default="true"  />
   <arg name="car"    default="false" />
 
@@ -75,6 +79,8 @@
     <param name="importance_enabled" value="$(arg observe_importance)"/>
     <param name="robot_radius" value="$(arg robot_clearance)"/>
     <param name="landmarks_file" value="$(arg observe_landmarks_file)"/>
+    <param name="detour_enabled" value="$(arg observe_detour)"/>
+    <param name="max_detour_m" value="$(arg observe_max_detour_m)"/>
   </node>
 
   <!-- Launch the patrol.py script only if patrol is true -->

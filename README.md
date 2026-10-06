@@ -11,6 +11,7 @@ Implements navigation for the mobile robot. Uses A* to plan paths, smooths them 
 - **patrol.py**: Patrol behavior (optional in combined-map launches).
 - **observation_planner.py**: Picks stops along the planned path to re-check ledger objects (`observe:=true`). With `observe_importance:=true` it values each object by its obstacle importance I_o (below).
 - **plot_obstacle_importance.py**: Offline I_o for a map and a CSV of objects; prints a table and writes a PNG.
+- **plot_observation_detours.py**: Offline detour cost for a path (or start/goal) and a CSV of objects; prints a table and writes a PNG.
 
 ### Obstacle importance I_o
 
@@ -22,7 +23,13 @@ Implements navigation for the mobile robot. Uses A* to plan paths, smooths them 
 - **Computed once**: each obstacle is evaluated alone against the obstacle-free roadmap; other obstacles and belief never change it. It is recomputed only if its own footprint changes the set of blocked edges.
 - **Outputs** (`observe_importance:=true`): `/observation/roadmap` and `/observation/importance` (RViz MarkerArrays), `~/.ros/mattbot_roadmap/importance_latest.png` and `.json`.
 
+### Observation detours
+
+`navigation_utils/detour.py`: extra driving needed to see an object that no stop on the planned path can see. Each object's viewshed (the same ray casting as opportunistic stops) is mapped to reachable C-space cells; the robot leaves the path anywhere, drives to a viewpoint, looks, and replans to the goal. detour(v) = F(v) + G(v) - L, with F one Dijkstra from the whole path (offset by distance driven along it) and G one from the goal, so a path query costs two grid Dijkstras for all objects (~15 ms on the y2e2 map). Objects that cannot be within `max_detour_m` (15 m) are skipped with a straight-line lower bound before any search. With `observe_detour:=true` the observation planner adds DETOUR options (cost = detour / cruising speed + turn + dwell) to `/observation/select`, publishes `/observation/detours`, and writes `~/.ros/mattbot_roadmap/detour_latest.png`; the navigator does not execute detours yet.
+
 ```bash
+rosrun mattbot_navigation plot_observation_detours.py --map $(rospack find mattbot_mcl)/map_json/current_map.json \
+    --objects objects.csv --start 10,18.9 --goal 80,18.9 --out detours.png
 rosrun mattbot_navigation plot_obstacle_importance.py --map $(rospack find mattbot_mcl)/map_json/current_map.json \
     --objects objects.csv --out importance.png          # objects.csv rows: x,y,width[,id] (local map frame)
 python3 -m pytest mattbot_navigation/test               # from src/
