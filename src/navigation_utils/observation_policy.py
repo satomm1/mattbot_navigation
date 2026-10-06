@@ -7,9 +7,11 @@ so policies can trade value against cost:
   OPPORTUNISTIC (implemented): the stop is on the planned path; cost = turn out + dwell + turn back.
   DETOUR (future): the stop is off the path; cost also includes the extra driving time.
 
-ThresholdPolicy (current) checks objects whose belief is at or below a threshold. A future
-DetourPolicy can add DETOUR options and gate on value - lambda * cost, with value using
-importance() (e.g. how badly the object blocks a critical passage).
+ThresholdPolicy (current) checks objects whose belief is at or below a threshold. Its value is
+importance * (1 - belief); importance comes from importance_fn when given (the observation
+planner passes the obstacle importance I_o from obstacle_importance.py, metres of extra travel
+per trip), else the importance() stub. A future DetourPolicy can add DETOUR options and gate on
+value - lambda * cost, using I_o (or the discovery cost I_o_disc) as the importance.
 """
 
 import math
@@ -54,10 +56,10 @@ class ObservationOption:
 
 
 def importance(candidate):
-    """How much it matters to know whether this object still blocks. Stub: all objects equal.
+    """Default importance when no importance_fn is given: all objects equal.
 
-    Future: derive from map connectivity, e.g. the increase in shortest-path lengths if the
-    object's cells are blocked (an object in a critical doorway matters more).
+    The map-connectivity importance I_o (extra travel per trip if the object blocks) is in
+    navigation_utils/obstacle_importance.py and is passed to policies as importance_fn.
     """
     return 1.0
 
@@ -109,7 +111,9 @@ class ThresholdPolicy(ObservationPolicy):
         merge_m=0.5,
         turn_rate=1.0,  # rad/s, for the cost estimate
         dwell_s=3.0,
+        importance_fn=None,  # Candidate -> importance; None = importance() stub
     ):
+        self.importance_fn = importance_fn
         self.check_below_belief = check_below_belief
         self.cooldown_s = cooldown_s
         self.max_cost_s = max_cost_s
@@ -130,8 +134,11 @@ class ThresholdPolicy(ObservationPolicy):
         last = self.last_checked.get(candidate.object_id)
         return last is None or now - last >= self.cooldown_s
 
+    def importance(self, candidate):
+        return self.importance_fn(candidate) if self.importance_fn is not None else importance(candidate)
+
     def value(self, candidate):
-        return importance(candidate) * (1.0 - candidate.belief)
+        return self.importance(candidate) * (1.0 - candidate.belief)
 
     def options(self, path_xy, candidates, viewsheds, now, exclude=()):
         eligible = {c.object_id: c for c in self.eligible_candidates(candidates, now, exclude)}

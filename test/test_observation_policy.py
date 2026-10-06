@@ -36,6 +36,15 @@ def test_value_uses_belief():
     assert p.value(cand("a", 0.25)) == pytest.approx(0.75)
 
 
+def test_value_uses_importance_fn():
+    importance = {"a": 4.0, "b": 0.0}
+    p = ThresholdPolicy(importance_fn=lambda c: importance[c.object_id])
+    assert p.value(cand("a", 0.25)) == pytest.approx(3.0)
+    assert p.value(cand("b", 0.25)) == 0.0
+    # Importance does not change which objects are eligible
+    assert p.eligible(cand("b", 0.25), now=0.0)
+
+
 def test_cost_turn_out_dwell_and_back():
     # Path heading 0; one target straight left (+90 deg): turn 90 out, 90 back
     stop = Stop(0, 0.0, 0.0, 0.0, [("a", 0.0, 2.0)])

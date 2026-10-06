@@ -1,0 +1,15 @@
+# Named landmarks for obstacle importance I_o (observation_planner ~landmarks_file,
+# bringup arg observe_landmarks_file). Trips are all ordered pairs of landmarks
+# (uniform_landmarks), or the pairs listed in ~trip_counts_file (weighted_landmarks):
+#   start_landmark,goal_landmark,count
+#   kitchen,dock,12
+# Coordinates are x, y in metres in this robot's local map frame (like patrol.txt);
+# each landmark snaps to the nearest roadmap node it can see. With no file,
+# 50 random roadmap nodes (fixed seed) are used instead.
+#
+# Copy to landmarks.yaml and replace these placeholder points with real ones.
+dock:     [10.0, 18.8]
+kitchen:  [25.6, 26.0]
+office_a: [45.0, 15.0]
+office_b: [76.0, 4.0]
+lobby:    [52.0, 23.0]

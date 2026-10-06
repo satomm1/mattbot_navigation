@@ -169,6 +169,7 @@ catkin_install_python(PROGRAMS
   scripts/localize_and_map.py
   scripts/patrol.py
   scripts/observation_planner.py
+  scripts/plot_obstacle_importance.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

@@ -8,11 +8,22 @@ Service:  /observation/select   (mattbot_dds/SelectObservations) path -> observa
 Outputs:  /observation/viewsheds  OccupancyGrid: union of viewsheds of objects due a check (RViz)
           /observation/stops      MarkerArray: last selected stops and their targets (RViz)
 
+With ~importance_enabled, a background worker also builds (or loads from cache) the topological
+roadmap of the static /map and computes each object's importance I_o once (expected extra travel
+per trip if it blocks; navigation_utils/obstacle_importance.py). The policy value becomes
+I_o * (1 - belief). Extra outputs:
+          /observation/roadmap     MarkerArray: roadmap edges and nodes (latched)
+          /observation/importance  MarkerArray: I_o per object and its blocked edges (latched)
+          ~importance_png_path     PNG of the importance map (+ .json of the results)
+
 Geometry is in navigation_utils/viewpoints.py, the check policy in observation_policy.py.
 """
 
+import logging
+import os
 import threading
 import time
+import traceback
 
 import numpy as np
 import rospy
@@ -26,6 +37,19 @@ from navigation_utils.observation_policy import Candidate, ThresholdPolicy
 from navigation_utils.viewpoints import blocking_mask, compute_viewshed, nearby_blockers
 
 RECOMPUTE_MOVE_M = 0.2  # recompute an object's viewshed if it moves further than this
+
+
+class _RospyLogHandler(logging.Handler):
+    """Forward library logging (navigation_utils.*) to rosout."""
+
+    def emit(self, record):
+        msg = self.format(record)
+        if record.levelno >= logging.ERROR:
+            rospy.logerr(msg)
+        elif record.levelno >= logging.WARNING:
+            rospy.logwarn(msg)
+        else:
+            rospy.loginfo(msg)
 
 
 class ObservationPlannerNode:
@@ -46,6 +70,10 @@ class ObservationPlannerNode:
             turn_rate=float(rospy.get_param("~turn_rate", 1.0)),
             dwell_s=float(rospy.get_param("~dwell_s", 4.0)),
         )
+        self.importance = None
+        if bool(rospy.get_param("~importance_enabled", False)):
+            self.importance = ImportanceWorker()
+            self.policy.importance_fn = self.importance.importance_of
 
         self.lock = threading.Lock()
         self.map_info = None
@@ -73,6 +101,8 @@ class ObservationPlannerNode:
             self.blocking = blocking
             self.viewsheds = {}  # map changed: line of sight may have changed
         rospy.loginfo("observation_planner: map %dx%d @ %.3f m", msg.info.width, msg.info.height, msg.info.resolution)
+        if self.importance is not None:
+            self.importance.set_map(msg)
 
     def beliefs_callback(self, msg):
         cands = [
@@ -82,6 +112,8 @@ class ObservationPlannerNode:
         with self.lock:
             self.candidates = cands
             self.last_beliefs_time = time.time()
+        if self.importance is not None:
+            self.importance.set_objects({c.object_id: (c.x, c.y, c.width) for c in cands})
 
     def event_callback(self, msg):
         if msg.event == ObservationEvent.ENDED:
@@ -198,6 +230,216 @@ class ObservationPlannerNode:
         msg.header.frame_id = header.frame_id or "map"
         msg.header.stamp = rospy.Time.now()
         self.viewshed_pub.publish(msg)
+
+
+class ImportanceWorker:
+    """Roadmap + per-object importance on a background thread (never on the service path).
+
+    Compute-once rule: the roadmap and distance table depend only on the static /map (rebuilt
+    only if its fingerprint changes); each object is evaluated alone against the obstacle-free
+    roadmap, once, and again only if its footprint cells change (ObjectImportanceTracker).
+    """
+
+    def __init__(self):
+        from navigation_utils.edge_blocking import BlockingParams
+        from navigation_utils.obstacle_importance import ImportanceParams
+        from navigation_utils.roadmap import DEFAULT_CACHE_DIR, RoadmapParams
+
+        handler = _RospyLogHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        lib_log = logging.getLogger("navigation_utils")
+        lib_log.addHandler(handler)
+        lib_log.setLevel(logging.INFO)
+        lib_log.propagate = False
+
+        robot_radius = float(rospy.get_param("~robot_radius", 0.4))
+        self.roadmap_params = RoadmapParams(
+            roadmap_resolution=float(rospy.get_param("~roadmap_resolution", 0.2)),
+            robot_radius=float(rospy.get_param("~roadmap_robot_radius", robot_radius)),
+        )
+        self.importance_params = ImportanceParams(
+            d_max=float(rospy.get_param("~importance_d_max", 50.0)),
+            trip_mode=str(rospy.get_param("~importance_trip_mode", "uniform_landmarks")),
+            landmarks_file=os.path.expanduser(rospy.get_param("~landmarks_file", "")) or None,
+            trip_counts_file=os.path.expanduser(rospy.get_param("~trip_counts_file", "")) or None,
+            num_random_landmarks=int(rospy.get_param("~num_random_landmarks", 50)),
+        )
+        self.blocking_params = BlockingParams()
+        self.cache_dir = os.path.expanduser(rospy.get_param("~roadmap_cache_dir", DEFAULT_CACHE_DIR))
+        self.png_path = os.path.expanduser(
+            rospy.get_param("~importance_png_path", os.path.join(self.cache_dir, "importance_latest.png"))
+        )
+        self.png_min_interval_s = float(rospy.get_param("~importance_png_min_interval_s", 10.0))
+
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.pending_map = None
+        self.objects = None  # latest {object_id: (x, y, width)} (local map frame)
+        self.objects_dirty = False
+        self.map_msg = None
+        self.fingerprint = None
+        self.roadmap = None
+        self.trips = None
+        self.tracker = None
+        self.png_dirty = False
+        self.last_png = 0.0
+
+        self.roadmap_pub = rospy.Publisher("/observation/roadmap", MarkerArray, queue_size=1, latch=True)
+        self.importance_pub = rospy.Publisher("/observation/importance", MarkerArray, queue_size=1, latch=True)
+        threading.Thread(target=self.run, name="importance_worker", daemon=True).start()
+
+    # ---------- Inputs (any thread) ----------
+
+    def set_map(self, msg):
+        with self.lock:
+            self.pending_map = msg
+        self.wake.set()
+
+    def set_objects(self, objects):
+        with self.lock:
+            self.objects = objects
+            self.objects_dirty = True
+        self.wake.set()
+
+    def importance_of(self, candidate):
+        """I_o of an object (1.0 = neutral until it has been evaluated). A lookup, never a computation."""
+        tracker = self.tracker
+        result = tracker.get(candidate.object_id) if tracker is not None else None
+        return 1.0 if result is None else result.I_o
+
+    # ---------- Worker ----------
+
+    def run(self):
+        while not rospy.is_shutdown():
+            self.wake.wait(timeout=1.0)
+            self.wake.clear()
+            with self.lock:
+                map_msg, self.pending_map = self.pending_map, None
+                objects = self.objects if (self.objects_dirty or map_msg is not None) else None
+                self.objects_dirty = False
+            try:
+                if map_msg is not None:
+                    self.load_roadmap(map_msg)
+                if objects is not None and self.tracker is not None:
+                    self.update_objects(objects)
+                if self.png_dirty and time.time() - self.last_png >= self.png_min_interval_s:
+                    self.write_png()
+            except Exception:  # keep the worker alive; the policy falls back to importance 1
+                rospy.logerr("observation_planner: importance worker failed:\n%s", traceback.format_exc())
+
+    def load_roadmap(self, msg):
+        from navigation_utils.obstacle_importance import (
+            ImportanceEvaluator, ObjectImportanceTracker, build_trip_set,
+        )
+        from navigation_utils.roadmap import load_or_build_roadmap, map_fingerprint
+
+        data = np.asarray(msg.data, dtype=np.int8)
+        info = msg.info
+        origin = (info.origin.position.x, info.origin.position.y)
+        fp = map_fingerprint(data, info.width, info.height, info.resolution, origin, self.roadmap_params)
+        if fp == self.fingerprint:
+            return  # same static map: keep the roadmap and every computed importance
+        t0 = time.time()
+        roadmap, cached = load_or_build_roadmap(
+            data, info.width, info.height, info.resolution, origin, self.roadmap_params, self.cache_dir
+        )
+        trips = build_trip_set(roadmap, self.importance_params)
+        evaluator = ImportanceEvaluator(
+            roadmap, trips, self.importance_params, self.blocking_params, cache_dir=self.cache_dir
+        )
+        self.map_msg, self.fingerprint, self.roadmap, self.trips = msg, fp, roadmap, trips
+        self.tracker = ObjectImportanceTracker(evaluator)  # new map: all importances start over
+        self.png_dirty = True
+        rospy.loginfo(
+            "observation_planner: roadmap %d nodes, %d edges (%s, %.1f s); %d trips (%s)",
+            roadmap.graph.number_of_nodes(), roadmap.graph.number_of_edges(),
+            "cached" if cached else "built", time.time() - t0, len(trips), trips.mode,
+        )
+        self.publish_roadmap(msg.header.frame_id or "map")
+
+    def update_objects(self, objects):
+        changed = self.tracker.update(objects)
+        if not changed:
+            return
+        for oid in sorted(changed):
+            r = self.tracker.get(oid)
+            if r is None:
+                rospy.loginfo("observation_planner: importance: %s removed", oid)
+                continue
+            rospy.loginfo(
+                "observation_planner: importance: %s I_o=%.2f m I_o_disc=%.2f m affected=%.0f%% "
+                "(%d/%d trips) blocked_edges=%d (%.0f ms)",
+                oid, r.I_o, r.I_o_disc, 100.0 * r.frac_affected, r.num_affected, r.num_trips,
+                len(r.blocked_edges), 1000.0 * r.compute_time_s,
+            )
+        self.publish_importance(self.map_msg.header.frame_id or "map")
+        self.png_dirty = True
+
+    def write_png(self):
+        from navigation_utils.importance_viz import render_importance_png
+        from navigation_utils.obstacle_importance import write_results_json
+
+        info = self.map_msg.info
+        occupancy = (self.map_msg.data, info.width, info.height, info.resolution,
+                     (info.origin.position.x, info.origin.position.y))
+        results, objects = self.tracker.results, self.tracker.objects
+        render_importance_png(self.png_path, self.roadmap, results, objects, trips=self.trips, occupancy=occupancy,
+                              title="Obstacle importance (%s)" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        write_results_json(os.path.splitext(self.png_path)[0] + ".json", results, objects)
+        self.png_dirty = False
+        self.last_png = time.time()
+        rospy.loginfo_throttle(60, "observation_planner: wrote %s" % self.png_path)
+
+    # ---------- RViz ----------
+
+    def _edge_points(self, edges):
+        rm = self.roadmap
+        pts = []
+        for e in edges:
+            poly = rm.graph.edges[e]["polyline"]
+            xs = rm.origin[0] + (poly[:, 1] + 0.5) * rm.res
+            ys = rm.origin[1] + (poly[:, 0] + 0.5) * rm.res
+            for k in range(len(poly) - 1):
+                pts += [Point(x=xs[k], y=ys[k]), Point(x=xs[k + 1], y=ys[k + 1])]
+        return pts
+
+    def publish_roadmap(self, frame_id):
+        rm = self.roadmap
+        edges = Marker(ns="roadmap_edges", id=0, type=Marker.LINE_LIST, action=Marker.ADD)
+        edges.header.frame_id = frame_id
+        edges.pose.orientation.w = 1.0
+        edges.scale.x = 0.03
+        edges.color.r, edges.color.g, edges.color.b, edges.color.a = 0.55, 0.55, 0.55, 0.8
+        edges.points = self._edge_points(rm.edge_list)
+        nodes = Marker(ns="roadmap_nodes", id=1, type=Marker.SPHERE_LIST, action=Marker.ADD)
+        nodes.header.frame_id = frame_id
+        nodes.pose.orientation.w = 1.0
+        nodes.scale.x = nodes.scale.y = nodes.scale.z = 0.12
+        nodes.color.r, nodes.color.g, nodes.color.b, nodes.color.a = 0.4, 0.4, 0.4, 0.9
+        nodes.points = [Point(x=x, y=y) for x, y in rm.node_xy]
+        self.roadmap_pub.publish(MarkerArray(markers=[Marker(action=Marker.DELETEALL), edges, nodes]))
+
+    def publish_importance(self, frame_id):
+        markers = [Marker(action=Marker.DELETEALL)]
+        for k, (oid, r) in enumerate(sorted(self.tracker.results.items())):
+            x, y, _w = self.tracker.objects.get(oid, (0.0, 0.0, 0.0))
+            text = Marker(ns="importance_text", id=k, type=Marker.TEXT_VIEW_FACING, action=Marker.ADD)
+            text.header.frame_id = frame_id
+            text.pose.position.x, text.pose.position.y, text.pose.position.z = x, y, 0.6
+            text.pose.orientation.w = 1.0
+            text.scale.z = 0.25
+            text.color.r = text.color.g = text.color.b = text.color.a = 1.0
+            text.text = "I_o %.1f / %.1f m (%.0f%%)" % (r.I_o, r.I_o_disc, 100.0 * r.frac_affected)
+            markers.append(text)
+            if r.blocked_edges:
+                lines = Marker(ns="importance_blocked_edges", id=k, type=Marker.LINE_LIST, action=Marker.ADD)
+                lines.header.frame_id = frame_id
+                lines.pose.orientation.w = 1.0
+                lines.scale.x = 0.08
+                lines.color.r, lines.color.g, lines.color.b, lines.color.a = 0.9, 0.1, 0.1, 0.9
+                lines.points = self._edge_points(sorted(r.blocked_edges))
+                markers.append(lines)
+        self.importance_pub.publish(MarkerArray(markers=markers))
 
 
 if __name__ == "__main__":

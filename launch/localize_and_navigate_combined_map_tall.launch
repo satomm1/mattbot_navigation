@@ -10,6 +10,10 @@
   <arg name="observe" default="false"/>
   <arg name="observe_dwell_s" default="4.0"/>
   <arg name="observe_check_below_belief" default="0.5"/>
+  <!-- Value objects by obstacle importance I_o (extra travel per trip if the object blocks), computed
+       once per object on a topological roadmap of the static /map. -->
+  <arg name="observe_importance" default="false"/>
+  <arg name="observe_landmarks_file" default=""/>
   <arg name="tall"   default="true"  />
   <arg name="car"    default="false" />
 
@@ -68,6 +72,9 @@
   <node if="$(arg observe)" name="observation_planner" pkg="mattbot_navigation" type="observation_planner.py" output="screen">
     <param name="dwell_s" value="$(arg observe_dwell_s)"/>
     <param name="check_below_belief" value="$(arg observe_check_below_belief)"/>
+    <param name="importance_enabled" value="$(arg observe_importance)"/>
+    <param name="robot_radius" value="$(arg robot_clearance)"/>
+    <param name="landmarks_file" value="$(arg observe_landmarks_file)"/>
   </node>
 
   <!-- Launch the patrol.py script only if patrol is true -->

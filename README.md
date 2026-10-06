@@ -9,6 +9,24 @@ Implements navigation for the mobile robot. Uses A* to plan paths, smooths them 
 - **localize_and_map.py**: Navigator variant with mapping/localization workflow.
 - **occupancy_grid_mapper.py**: Builds `/navigation_map` from SLAM + dynamic layers; optional depth occupancy grid via `enable_depth_occupancy_grid` ROS param (default false; set from bringup launch files).
 - **patrol.py**: Patrol behavior (optional in combined-map launches).
+- **observation_planner.py**: Picks stops along the planned path to re-check ledger objects (`observe:=true`). With `observe_importance:=true` it values each object by its obstacle importance I_o (below).
+- **plot_obstacle_importance.py**: Offline I_o for a map and a CSV of objects; prints a table and writes a PNG.
+
+### Obstacle importance I_o
+
+`navigation_utils/roadmap.py`, `edge_blocking.py`, `obstacle_importance.py`, `importance_viz.py` (pure Python, no ROS):
+
+- **Roadmap**: sparse topological graph of the free space of the static `/map` (0.2 m grid, C-space inflated by `robot_clearance`, skeleton junctions/endpoints/corridor nodes, lattice nodes in open areas). Built once per map and cached in `~/.ros/mattbot_roadmap/` keyed by a hash of the map and parameters.
+- **Edge blocking**: an obstacle blocks a roadmap edge only if the robot cannot get past it inside the edge's corridor (a cart against one wall of a wide hallway blocks nothing).
+- **I_o** (m per trip) = expected extra travel distance over a trip set if the obstacle is there: all landmark pairs (`config/landmarks.example.yaml`, or 50 random roadmap nodes) or pairs weighted by a CSV of counts. Also reported: `I_o_disc` (cost when the obstacle is only discovered on arrival), the fraction of trips affected, and the mean detour of those.
+- **Computed once**: each obstacle is evaluated alone against the obstacle-free roadmap; other obstacles and belief never change it. It is recomputed only if its own footprint changes the set of blocked edges.
+- **Outputs** (`observe_importance:=true`): `/observation/roadmap` and `/observation/importance` (RViz MarkerArrays), `~/.ros/mattbot_roadmap/importance_latest.png` and `.json`.
+
+```bash
+rosrun mattbot_navigation plot_obstacle_importance.py --map $(rospack find mattbot_mcl)/map_json/current_map.json \
+    --objects objects.csv --out importance.png          # objects.csv rows: x,y,width[,id] (local map frame)
+python3 -m pytest mattbot_navigation/test               # from src/
+```
 
 ### Launch
 

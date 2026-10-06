@@ -57,6 +57,12 @@
   <exec_depend>mattbot_dds</exec_depend>
   <exec_depend>path_planning</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <!-- Obstacle importance (navigation_utils/roadmap.py, edge_blocking.py, obstacle_importance.py) -->
+  <exec_depend>python3-networkx</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-skimage</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
 
 
   <!-- The export tag contains other, unspecified, tags -->
