@@ -21,6 +21,10 @@ future driving it saves exceeds what it costs now, both in metres:
     C      = D + v_cruise * (t_turn + t_dwell) extra driving + time spent turning and looking
     detour if V - C > margin;   D* = V - v_cruise * t_dwell is the longest detour worth searching
 
+A detour is never taken if its route branches off the path within skip_start_m of the start or
+skip_goal_m of the goal (DetourResult.branch_arc_m): such a check belongs to the trip that starts or
+ends there, not to a detour from this one.
+
 Only "the fleet keeps avoiding an object that has actually gone" is modelled (the fleet routes
 around every ledger object until it is removed), so the discovery cost I_o_disc is not used.
 """
@@ -84,6 +88,8 @@ class DetourValueParams:
     margin_m: float = 0.0  # detour only if V - C exceeds this
     max_detours_per_path: int = 1
     hard_cap_m: float = 15.0  # never search for detours longer than this
+    skip_start_m: float = 1.0  # no detour whose route branches off the path this close to its start
+    skip_goal_m: float = 1.0  # ... or this close to its goal (arc length along the path)
 
 
 @dataclass
@@ -97,6 +103,7 @@ class DetourEvaluation:
     chosen: bool = False
     option: object = None  # ObservationOption
     values_m: List[float] = field(default_factory=list)
+    blocked: str = ""  # why it may not be taken whatever its value (e.g. "branches at the goal")
 
     @property
     def net_m(self):
@@ -292,12 +299,22 @@ class ThresholdPolicy(ObservationPolicy):
             heading = bearing
         return detour.detour_m + self.cruise_speed * (turn / self.turn_rate + self.dwell_s * len(targets))
 
+    def detour_blocked(self, detour):
+        """Reason a detour may not be taken (branches off at the start or goal), or ""."""
+        p = self.detour_params
+        if detour.branch_arc_m < p.skip_start_m:
+            return "branches at the start"
+        if detour.path_length_m - detour.branch_arc_m < p.skip_goal_m:
+            return "branches at the goal"
+        return ""
+
     def detour_options(self, path_xy, candidates, viewsheds, now, exclude=(), detours=None):
         """Detours worth driving. Returns (chosen ObservationOptions, all DetourEvaluations).
 
         One evaluation per object with a detour result: its best viewpoint, bundled with every
         other detour candidate visible from there (values add). Options with V - C > margin are
         taken best-first by net benefit, without sharing objects, up to max_detours_per_path.
+        Blocked ones (detour_blocked: branching off at the start or goal) are evaluated but never taken.
         """
         detours = detours or {}
         cands = {c.object_id: c for c in self.detour_candidates(path_xy, candidates, viewsheds, now, exclude)}
@@ -322,14 +339,14 @@ class ThresholdPolicy(ObservationPolicy):
                 leave_xy=tuple(d.leave_xy),
             )
             evaluations.append(DetourEvaluation([u.object_id for u in targets], d.detour_m, sum(values), cost_m,
-                                                option=option, values_m=values))
+                                                option=option, values_m=values, blocked=self.detour_blocked(d)))
 
         p = self.detour_params
         chosen, used = [], set()
         for ev in sorted(evaluations, key=lambda e: -e.net_m):
             if len(chosen) >= p.max_detours_per_path or ev.net_m <= p.margin_m:
                 break
-            if used & set(ev.object_ids):
+            if used & set(ev.object_ids) or ev.blocked:
                 continue
             if self.max_cost_s > 0 and ev.option.cost_s > self.max_cost_s:
                 continue

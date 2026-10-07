@@ -153,3 +153,22 @@ def test_per_object_limits_match_brute_force():
             assert got[oid].detour_m == pytest.approx(e, abs=1e-6)
         else:
             assert oid not in got
+
+
+def test_branch_point_is_where_the_route_leaves_the_path(room):
+    _rm, planner, blocking = room
+    path = corridor_path(planner)
+    _vs, t = target(planner, blocking, "box", 10.0, 7.0)
+    d = planner.compute(path, {"box": t})["box"]
+    arc = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(path, axis=0).T))])
+    _dist, door_arc = DetourPlanner.project_to_path([(9.0, 2.6)], path, arc)
+    assert abs(d.branch_arc_m - door_arc[0]) < 1.0  # it turns off at the door
+    assert d.path_length_m == pytest.approx(arc[-1])
+    assert arc[d.leave_index] <= d.branch_arc_m + 0.2  # the leave point is never after the branch point
+
+def test_project_to_path():
+    path = np.array([[0.0, 0.0], [4.0, 0.0], [4.0, 3.0]])
+    arc = np.array([0.0, 4.0, 7.0])
+    dist, along = DetourPlanner.project_to_path([(2.0, 1.0), (5.0, 2.0), (-1.0, 0.0)], path, arc)
+    assert dist.tolist() == pytest.approx([1.0, 1.0, 1.0])
+    assert along.tolist() == pytest.approx([2.0, 6.0, 0.0])

@@ -102,6 +102,9 @@ class ObservationPlannerNode:
                 margin_m=float(rospy.get_param("~detour_margin_m", 0.0)),
                 max_detours_per_path=int(rospy.get_param("~max_detours_per_path", 1)),
                 hard_cap_m=max_detour_m,
+                # No detour branching off the path this close to the robot (start) or the goal
+                skip_start_m=float(rospy.get_param("~detour_skip_start_m", 1.0)),
+                skip_goal_m=float(rospy.get_param("~detour_skip_goal_m", 1.0)),
             )
             self.detours_pub = rospy.Publisher("/observation/detours", MarkerArray, queue_size=1, latch=True)
 
@@ -272,7 +275,8 @@ class ObservationPlannerNode:
         for ev in sorted(evaluations, key=lambda e: -e.net_m):
             rospy.loginfo(
                 "observation_planner: detour %s: +%.1f m, V=%.1f m, C=%.1f m -> %s",
-                "+".join(ev.object_ids), ev.detour_m, ev.value_m, ev.cost_m, "GO" if ev.chosen else "skip",
+                "+".join(ev.object_ids), ev.detour_m, ev.value_m, ev.cost_m,
+                "GO" if ev.chosen else "skip (%s)" % ev.blocked if ev.blocked else "skip",
             )
         unreachable = sorted(set(targets) - {oid for ev in evaluations for oid in ev.object_ids})
         if unreachable:
@@ -297,7 +301,8 @@ class ObservationPlannerNode:
             text.scale.z = 0.22
             text.color.r = text.color.g = text.color.b = text.color.a = 1.0
             text.text = "%s +%.1f m V=%.1f C=%.1f %s" % (
-                "+".join(ev.object_ids), ev.detour_m, ev.value_m, ev.cost_m, "GO" if ev.chosen else "skip")
+                "+".join(ev.object_ids), ev.detour_m, ev.value_m, ev.cost_m,
+                "GO" if ev.chosen else "skip (%s)" % ev.blocked if ev.blocked else "skip")
             rays = Marker(ns="detour_rays", id=k, type=Marker.LINE_LIST, action=Marker.ADD)
             rays.header.frame_id = frame_id
             rays.pose.orientation.w = 1.0

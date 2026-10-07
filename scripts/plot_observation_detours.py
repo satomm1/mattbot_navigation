@@ -61,6 +61,8 @@ def main():
     ap.add_argument("--n-trips", type=float, default=5.0)
     ap.add_argument("--conclusive-prob", type=float, default=1.0)
     ap.add_argument("--margin", type=float, default=0.0)
+    ap.add_argument("--skip-start", type=float, default=1.0, help="no detour branching off this close to the start")
+    ap.add_argument("--skip-goal", type=float, default=1.0, help="no detour branching off this close to the goal")
     ap.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR)
     args = ap.parse_args()
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
@@ -100,7 +102,8 @@ def main():
         cruise_speed=args.cruise_speed, dwell_s=args.dwell, importance_fn=lambda c: importance[c.object_id],
         importance_m_fn=lambda c: importance[c.object_id],
         detour_params=DetourValueParams(n_trips=args.n_trips, conclusive_prob=args.conclusive_prob,
-                                        margin_m=args.margin, hard_cap_m=args.max_detour),
+                                        margin_m=args.margin, hard_cap_m=args.max_detour,
+                                        skip_start_m=args.skip_start, skip_goal_m=args.skip_goal),
     )
     cands = [Candidate(oid, "object", x, y, beliefs[oid], w) for oid, (x, y, w) in objects.items()]
     t2 = time.time()
@@ -134,7 +137,7 @@ def main():
         elif ev is None:
             decision = "no viewpoint within D*"
         else:
-            decision = ("GO" if ev.chosen else "skip") + (
+            decision = ("GO" if ev.chosen else "skip (%s)" % ev.blocked if ev.blocked else "skip") + (
                 " (with %s)" % "+".join(o for o in ev.object_ids if o != oid) if len(ev.object_ids) > 1 else "")
         print("%-12s %5.2f %6.2f %6s %8s %7s %7s  %s" % (
             oid, beliefs[oid], importance[oid], "-" if d_star is None else "%.1f" % d_star,

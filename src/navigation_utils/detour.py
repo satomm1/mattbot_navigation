@@ -38,6 +38,7 @@ class DetourParams:
     r_max: float = 3.5  # m; viewshed radius (for the far-object lower bound)
     snap_radius_m: float = 0.5  # path points off C-space snap to a free cell this close
     on_path_m: float = 0.3  # detours shorter than this count as "visible from the path"
+    branch_tol_m: float = 0.4  # route cells this close to the path are still on it (for branch_arc_m)
 
 
 @dataclass
@@ -50,6 +51,11 @@ class DetourResult:
     to_view_m: float  # distance from the leave point to the viewpoint
     arrival_heading: float  # heading when reaching the viewpoint (rad)
     route_xy: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))  # leave point -> viewpoint
+    # Where the route really separates from the path: arc length along the request path of the last
+    # route cell within branch_tol_m of it. The leave point can be far before that, because driving
+    # the grid cells beside the path ties with following it.
+    branch_arc_m: float = 0.0
+    path_length_m: float = 0.0
 
     @property
     def on_path(self):
@@ -62,6 +68,8 @@ class DetourResult:
             "leave_index": self.leave_index,
             "leave": list(self.leave_xy),
             "to_view_m": self.to_view_m,
+            "branch_arc_m": self.branch_arc_m,
+            "path_length_m": self.path_length_m,
         }
 
 
@@ -131,6 +139,22 @@ class DetourPlanner:
             hit = np.isfinite(d)
             nodes[missing[hit]] = k[hit]
         return nodes, arc
+
+    @staticmethod
+    def project_to_path(points, path_xy, arc):
+        """(distance to the path polyline, arc length of the closest point on it) per point."""
+        points = np.asarray(points, dtype=float).reshape(-1, 2)
+        a, b = path_xy[:-1], path_xy[1:]
+        ab = b - a
+        seg2 = np.maximum((ab ** 2).sum(axis=1), 1e-12)
+        ap = points[:, None, :] - a[None, :, :]
+        t = np.clip((ap * ab[None, :, :]).sum(axis=2) / seg2[None, :], 0.0, 1.0)
+        closest = a[None, :, :] + t[:, :, None] * ab[None, :, :]
+        dist = np.hypot(*(points[:, None, :] - closest).transpose(2, 0, 1))
+        k = np.argmin(dist, axis=1)
+        rows = np.arange(len(points))
+        seg_len = np.sqrt(seg2)
+        return dist[rows, k], arc[k] + t[rows, k] * seg_len[k]
 
     @staticmethod
     def lower_bound(path_xy, arc, obj_xy, r_max):
@@ -214,6 +238,9 @@ class DetourPlanner:
                 i = first_idx[leave]
                 d = path_xy[min(i + 1, len(path_xy) - 1)] - path_xy[max(i - 1, 0)]
                 heading = math.atan2(d[1], d[0])
+            dist, along = self.project_to_path(self.xy[route], path_xy, arc)
+            near = np.nonzero(dist <= params.branch_tol_m)[0]
+            branch_arc = float(along[near[-1]]) if len(near) else float(arc[first_idx[leave]])
             detour = float(total[k])
             out[oid] = DetourResult(
                 object_id=oid,
@@ -224,6 +251,8 @@ class DetourPlanner:
                 to_view_m=float(F[v] - F[leave]),
                 arrival_heading=heading,
                 route_xy=route_xy,
+                branch_arc_m=branch_arc,
+                path_length_m=float(arc[-1]),
             )
         return out
 

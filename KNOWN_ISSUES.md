@@ -41,6 +41,7 @@ Code references are relative to `mattbot_navigation/` unless another package is 
 | 3.7 | Low | D* (search limit) uses one object's value and zero turn. A bundle can justify a longer detour than any of its members' D*, so those detours are never found. | Raise the limit using nearby candidates' combined value, or run a second pass. |
 | 3.8 | Low | Cost is distance only. It ignores mission urgency, battery, the robot's own deadlines, and passengers or deliveries. `margin_m` is the only knob. | Add a per-mission budget or urgency factor. |
 | 3.9 | Low | Only the error "the fleet avoids an object that's gone" is modelled. Believing something absent that's actually present is out of scope for re-checking, by design. I_o_disc is computed but unused. | Fine for now. Revisit if objects are ever routed through at low belief. |
+| 3.10 | Med | **No detour branches off at the start or goal.** A detour whose route leaves the path within `detour_skip_start_m` / `detour_skip_goal_m` (1 m) of the start or goal is never taken (`ThresholdPolicy.detour_blocked`, using `DetourResult.branch_arc_m`). An object whose only detours branch off at a patrol endpoint is therefore never checked on that patrol. In the sim, `detour_present` had to move its west waypoint past the passage. | Accept it for patrols. Otherwise let a robot that is idle at a goal check such objects as a separate short task. |
 
 ## 4. Detour distance (`src/navigation_utils/detour.py`)
 

@@ -170,3 +170,30 @@ def test_opportunistic_unchanged_without_detours(room):
     opts = pol.options(path, cands, vs, now=0.0)
     assert [o.kind for o in opts] == [OPPORTUNISTIC]
     assert opts[0].path_index == opts[0].stop.path_index
+
+
+def run_on_path(room, path, objects, importance, beliefs, **params):
+    planner, blocking, _path = room
+    return run((planner, blocking, path), objects, importance, beliefs, **params)
+
+
+def test_no_detour_branching_off_at_the_start_or_goal(room):
+    planner = room[0]
+    box = {"box": (10.0, 7.0)}  # in the room; its door is at x ~ 9
+    # Path along the whole corridor: the detour branches off mid-path and is taken
+    _pol, _opp, chosen, evals, detours, _dc = run(room, box, {"box": 6.0}, {"box": 0.0})
+    assert chosen and not evals[0].blocked
+    assert 1.0 < detours["box"].branch_arc_m < detours["box"].path_length_m - 1.0
+    # Path that ends at the door: the detour would branch off at the goal
+    to_door = planner.shortest_path_xy((2.0, 1.8), (9.0, 1.8))
+    _pol, _opp, chosen, evals, detours, _dc = run_on_path(room, to_door, box, {"box": 6.0}, {"box": 0.0})
+    (ev,) = evals
+    assert not chosen and not ev.chosen and ev.blocked == "branches at the goal"
+    assert ev.net_m > 0  # worth it by value alone
+    # Path that starts at the door: the detour would branch off at the start
+    from_door = planner.shortest_path_xy((9.0, 1.8), (14.0, 1.8))
+    _pol, _opp, chosen, evals, _d, _dc = run_on_path(room, from_door, box, {"box": 6.0}, {"box": 0.0})
+    assert not chosen and evals[0].blocked == "branches at the start"
+    # The zones can be turned off
+    _pol, _opp, chosen, _e, _d, _dc = run_on_path(room, to_door, box, {"box": 6.0}, {"box": 0.0}, skip_goal_m=0.0)
+    assert chosen
