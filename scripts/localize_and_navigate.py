@@ -332,6 +332,14 @@ class Navigator:
         self.om_heading = 2.5  # angular velocity for heading controller
 
         self.v_des = rospy.get_param('/cruising_velocity', 0.35) # desired cruising velocity
+        if self.v_des > self.v_max:
+            # The tracker clips V at v_max, so the robot falls behind a trajectory timed at v_des and
+            # misses its waypoint deadlines ("Backing up because haven't reached waypoint" + recovery)
+            rospy.logwarn(
+                "[Navigator] cruising_velocity %.2f m/s is above v_max %.2f m/s: the robot cannot keep up "
+                "with its trajectory and will miss waypoint deadlines. Use cruising_velocity <= %.2f.",
+                self.v_des, self.v_max, self.v_max,
+            )
         self.theta_start_thresh = 0.05  # threshold in theta to start moving forward when path-following
         self.post_align_pause_sec = rospy.get_param('~post_align_pause_sec', 1.0)
 
