@@ -75,6 +75,8 @@ class ObservationPlannerNode:
             skip_start_m=float(rospy.get_param("~skip_start_m", 0.5)),
             skip_goal_m=float(rospy.get_param("~skip_goal_m", 0.8)),
             merge_m=float(rospy.get_param("~merge_m", 0.5)),
+            # Prefer stops from which the object is at most this far off the path heading (no overshoot)
+            max_turn=np.radians(float(rospy.get_param("~max_turn_deg", 90.0))),
             turn_rate=float(rospy.get_param("~turn_rate", 1.0)),
             dwell_s=float(rospy.get_param("~dwell_s", 4.0)),
         )

@@ -139,13 +139,17 @@ def path_headings(path_xy):
     return np.arctan2(d[:, 1], d[:, 0])
 
 
-def select_stops(path_xy, targets, viewsheds, r_pref=2.0, skip_start_m=0.5, skip_goal_m=0.8, merge_m=0.5):
+def select_stops(
+    path_xy, targets, viewsheds, r_pref=2.0, skip_start_m=0.5, skip_goal_m=0.8, merge_m=0.5, max_turn=math.pi / 2
+):
     """Choose where along path_xy (N, 2) to stop and observe each target.
 
     targets:   [(object_id, x, y), ...]
     viewsheds: {object_id: Viewshed}
     Each target gets at most one stop: the path point inside its viewshed whose distance to the
-    object is closest to r_pref. Points within skip_start_m (arc length) of the start or
+    object is closest to r_pref. Points from which the object is within max_turn (rad) of the
+    path heading are preferred; points that need a larger turn (the object is behind, i.e. the
+    stop overshoots it) are used only if there are no others. None = no preference. Points within skip_start_m (arc length) of the start or
     skip_goal_m of the goal are not used. Stops within merge_m of arc length are merged into
     the earlier one. Returns [Stop, ...] ordered along the path.
     """
@@ -157,6 +161,7 @@ def select_stops(path_xy, targets, viewsheds, r_pref=2.0, skip_start_m=0.5, skip
     to_goal = np.hypot(*(path_xy - path_xy[-1]).T)
     usable = (arc >= skip_start_m) & (to_goal >= skip_goal_m)
 
+    headings = path_headings(path_xy)
     picks = []  # (path_index, object_id, x, y)
     for object_id, tx, ty in targets:
         vs = viewsheds.get(object_id)
@@ -165,12 +170,17 @@ def select_stops(path_xy, targets, viewsheds, r_pref=2.0, skip_start_m=0.5, skip
         ok = usable & vs.contains_xy(path_xy)
         if not ok.any():
             continue
+        if max_turn is not None:
+            bearing = np.arctan2(ty - path_xy[:, 1], tx - path_xy[:, 0])
+            turn = np.abs((bearing - headings + np.pi) % (2.0 * np.pi) - np.pi)
+            small_turn = ok & (turn <= max_turn)
+            if small_turn.any():
+                ok = small_turn
         dist = np.hypot(path_xy[:, 0] - tx, path_xy[:, 1] - ty)
         score = np.where(ok, np.abs(dist - r_pref), np.inf)
         picks.append((int(np.argmin(score)), object_id, float(tx), float(ty)))
     picks.sort(key=lambda p: (p[0], p[1]))
 
-    headings = path_headings(path_xy)
     stops = []
     for idx, object_id, tx, ty in picks:
         if stops and arc[idx] - arc[stops[-1].path_index] <= merge_m:

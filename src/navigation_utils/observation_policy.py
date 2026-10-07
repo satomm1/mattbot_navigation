@@ -167,6 +167,7 @@ class ThresholdPolicy(ObservationPolicy):
         skip_start_m=0.5,
         skip_goal_m=0.8,
         merge_m=0.5,
+        max_turn=math.pi / 2,  # rad: prefer stops that see the object within this turn (None = no preference)
         turn_rate=1.0,  # rad/s, for the cost estimate
         dwell_s=3.0,
         importance_fn=None,  # Candidate -> importance; None = importance() stub
@@ -185,6 +186,7 @@ class ThresholdPolicy(ObservationPolicy):
         self.skip_start_m = skip_start_m
         self.skip_goal_m = skip_goal_m
         self.merge_m = merge_m
+        self.max_turn = max_turn
         self.turn_rate = turn_rate
         self.dwell_s = dwell_s
         self.last_checked: Dict[str, float] = {}  # object_id -> time of last completed check
@@ -224,6 +226,7 @@ class ThresholdPolicy(ObservationPolicy):
             skip_start_m=self.skip_start_m,
             skip_goal_m=self.skip_goal_m,
             merge_m=self.merge_m,
+            max_turn=self.max_turn,
         )
         options = []
         for stop in stops:

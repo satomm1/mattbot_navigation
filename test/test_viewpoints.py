@@ -141,3 +141,29 @@ def test_nearby_blockers_signature():
     assert sig != sig_moved
     _, sig_same = nearby_blockers("a", (5.0, 3.0), [("a", 5.0, 3.0, 0.5), ("b", 5.02, 2.0, 0.4)], 4.5)
     assert sig == sig_same  # sub-0.1 m jitter does not invalidate the cache
+
+
+def test_prefers_stop_before_object_over_overshoot():
+    # 0.8 m off the path: r_pref is reached both before (small turn) and after the object (~157 deg).
+    # The point after is slightly closer to r_pref, but the stop must not overshoot.
+    obj = ("a", 5.0, 1.8)
+    for path in (straight_path(), straight_path(10.0, 0.0)):
+        vs = views(obj)
+        far_side = 5.0 + math.sqrt(2.0 ** 2 - 0.8 ** 2) * np.sign(path[-1, 0] - path[0, 0])
+        assert vs["a"].contains_xy([(far_side, 1.0)])[0]
+        (stop,) = select_stops(path, [obj], vs, r_pref=2.0)
+        bearing = math.atan2(obj[2] - stop.y, obj[1] - stop.x)
+        assert abs(math.degrees(math.atan2(math.sin(bearing - stop.heading), math.cos(bearing - stop.heading)))) < 90
+        # Without the preference both sides tie on distance
+        (free,) = select_stops(path, [obj], vs, r_pref=2.0, max_turn=None)
+        assert abs(math.hypot(obj[1] - free.x, obj[2] - free.y) - 2.0) <= abs(
+            math.hypot(obj[1] - stop.x, obj[2] - stop.y) - 2.0)
+
+
+def test_overshoot_stop_used_when_object_only_visible_behind():
+    blocking = empty_map()
+    blocking[11:25, 0:60] = True  # wall between the path and the object, up to x = 6.0
+    obj = ("a", 6.3, 2.0)  # just past the wall end: seen only from x > 6.3 at >= r_min
+    vs = views(obj, r_min=1.2, blocking=blocking)
+    (stop,) = select_stops(straight_path(0.0, 8.0, n=81), [obj], vs, r_pref=2.0)
+    assert stop.x > obj[1]  # past the object: it can only be seen looking back
