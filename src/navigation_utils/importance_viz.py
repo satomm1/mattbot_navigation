@@ -190,16 +190,22 @@ VIEWPOINT_CELLS = "#cde2fb"
 PATH_COLOR = TEXT_PRIMARY
 
 
+DETOUR_SKIPPED = "#9a9893"
+
+
 def render_detour_png(path, roadmap, path_xy, detours, targets, options=None, occupancy=None, planner=None,
-                      title=None, dpi=150, margin_m=3.0):
+                      title=None, dpi=150, margin_m=3.0, evaluations=None, visible=()):
     """Write a PNG of the detours for one planned path.
 
     path_xy: (N, 2) planned path; detours: {object_id: detour.DetourResult};
-    targets: {object_id: (x, y, viewpoint_nodes)} (viewpoint cells are drawn when planner is given);
-    options: ObservationOptions (DETOUR costs in seconds are added to the labels).
+    targets: {object_id: (x, y, viewpoint_nodes[, max_m])} (viewpoint cells drawn when planner is given);
+    options: ObservationOptions (DETOUR costs in seconds are added to the labels when no evaluations);
+    evaluations: observation_policy.DetourEvaluations (V, C, GO / skip labels);
+    visible: [(object_id, x, y)] objects seen from the path (left to opportunistic stops).
     """
     path_xy = np.asarray(path_xy, dtype=float).reshape(-1, 2)
-    pts = [path_xy] + [np.array([[x, y]]) for x, y, _vn in targets.values()]
+    pts = [path_xy] + [np.array([[t[0], t[1]]]) for t in targets.values()] + \
+        [np.array([[x, y]]) for _oid, x, y in visible]
     allp = np.concatenate(pts, axis=0)
     lo, hi = allp.min(axis=0) - margin_m, allp.max(axis=0) + margin_m
     span = np.maximum(hi - lo, 1.0)
@@ -215,7 +221,7 @@ def render_detour_png(path, roadmap, path_xy, detours, targets, options=None, oc
     halo = [patheffects.withStroke(linewidth=2.5, foreground=SURFACE)]
 
     if planner is not None:
-        cells = [vn for _x, _y, vn in targets.values() if len(vn)]
+        cells = [t[2] for t in targets.values() if len(t[2])]
         if cells:
             rc = planner.cells[np.unique(np.concatenate(cells))]
             mask = np.zeros(roadmap.shape, dtype=bool)
@@ -234,10 +240,32 @@ def render_detour_png(path, roadmap, path_xy, detours, targets, options=None, oc
     for o in options or []:
         if o.kind == 1:  # observation_policy.DETOUR
             cost[o.candidates[0].object_id] = o.cost_s
+    ev_of = {}  # object_id -> the evaluation it belongs to (its own one first)
+    for ev in evaluations or []:
+        for oid in ev.object_ids:
+            if oid not in ev_of or ev.object_ids[0] == oid:
+                ev_of[oid] = ev
+    drawn_routes = set()
     for oid in sorted(targets, key=lambda k: detours[k].detour_m if k in detours else np.inf):
-        x, y, _vn = targets[oid]
+        x, y = targets[oid][0], targets[oid][1]
         d = detours.get(oid)
-        if d is not None and not d.on_path:
+        ev = ev_of.get(oid)
+        if ev is not None:
+            color = DETOUR_ROUTE if ev.chosen else DETOUR_SKIPPED
+            lead = detours.get(ev.object_ids[0])
+            if lead is not None and id(ev) not in drawn_routes:
+                drawn_routes.add(id(ev))
+                route = np.vstack([lead.leave_xy, lead.route_xy]) if len(lead.route_xy) else \
+                    np.array([lead.leave_xy, lead.viewpoint_xy])
+                ax.plot(route[:, 0], route[:, 1], color=color, linewidth=2.0, linestyle=(0, (4, 2)), zorder=5)
+                ax.scatter([lead.viewpoint_xy[0]], [lead.viewpoint_xy[1]], s=40, facecolor=color,
+                           edgecolor=SURFACE, linewidths=1.0, zorder=6)
+            vx, vy = ev.option.stop.x, ev.option.stop.y
+            ax.plot([vx, x], [vy, y], color=color, linewidth=0.8, zorder=5)
+            label = "%s: +%.1f m, V=%.1f, C=%.1f m %s" % (oid, ev.detour_m, ev.value_m, ev.cost_m,
+                                                        "GO" if ev.chosen else "skip")
+            ink, face = (TEXT_PRIMARY, DETOUR_ROUTE) if ev.chosen else (TEXT_SECONDARY, DETOUR_SKIPPED)
+        elif d is not None and evaluations is None:
             route = np.vstack([d.leave_xy, d.route_xy]) if len(d.route_xy) else np.array([d.leave_xy, d.viewpoint_xy])
             ax.plot(route[:, 0], route[:, 1], color=DETOUR_ROUTE, linewidth=2.0, linestyle=(0, (4, 2)), zorder=5)
             ax.scatter([d.viewpoint_xy[0]], [d.viewpoint_xy[1]], s=40, facecolor=DETOUR_ROUTE, edgecolor=SURFACE,
@@ -245,25 +273,35 @@ def render_detour_png(path, roadmap, path_xy, detours, targets, options=None, oc
             ax.plot([d.viewpoint_xy[0], x], [d.viewpoint_xy[1], y], color=DETOUR_ROUTE, linewidth=0.8, zorder=5)
             label = "%s: +%.1f m" % (oid, d.detour_m) + (" (%.0f s)" % cost[oid] if oid in cost else "")
             ink, face = TEXT_PRIMARY, DETOUR_ROUTE
-        elif d is not None:
-            label, ink, face = "%s: seen from path" % oid, TEXT_SECONDARY, SURFACE
         else:
-            label, ink, face = "%s: no viewpoint within limit" % oid, TEXT_SECONDARY, SURFACE
+            label, ink, face = "%s: no worthwhile viewpoint" % oid, TEXT_SECONDARY, SURFACE
         ax.add_patch(Rectangle((x - 0.25, y - 0.25), 0.5, 0.5, facecolor=face, edgecolor=TEXT_SECONDARY,
                                linewidth=1.0, zorder=7))
         off, ha = placer.offset(x, y, label)
         ax.annotate(label, (x, y), xytext=off, textcoords="offset points", fontsize=7, ha=ha, color=ink,
                     path_effects=halo, zorder=8)
+    for oid, x, y in visible:
+        ax.add_patch(Rectangle((x - 0.25, y - 0.25), 0.5, 0.5, facecolor="none", edgecolor=TEXT_SECONDARY,
+                               linewidth=1.0, zorder=7))
+        label = "%s: opportunistic (seen from path)" % oid
+        off, ha = placer.offset(x, y, label)
+        ax.annotate(label, (x, y), xytext=off, textcoords="offset points", fontsize=7, ha=ha,
+                    color=TEXT_SECONDARY, path_effects=halo, zorder=8)
 
     ax.set_xlabel("x (m)", color=TEXT_SECONDARY, fontsize=8)
     ax.set_ylabel("y (m)", color=TEXT_SECONDARY, fontsize=8)
     ax.tick_params(colors=TEXT_SECONDARY, labelsize=7)
     for spine in ax.spines.values():
         spine.set_color(ROADMAP)
-    n_det = sum(1 for d in detours.values() if not d.on_path)
-    ax.set_title("%d object(s) considered, %d need a detour; light cells = reachable viewpoints, dashed = "
-                 "leave the path -> viewpoint, then replan to the goal (star)" % (len(targets), n_det),
-                 fontsize=8, color=TEXT_SECONDARY, loc="left")
+    if evaluations is not None:
+        n_go = sum(1 for ev in evaluations if ev.chosen)
+        summary = "%d detour candidate(s), %d evaluated, %d chosen (V - C > margin); %d seen from the path" % (
+            len(targets), len(evaluations), n_go, len(visible))
+    else:
+        summary = "%d object(s) considered, %d need a detour" % (
+            len(targets), sum(1 for d in detours.values() if not d.on_path))
+    ax.set_title(summary + "; light cells = reachable viewpoints, dashed = leave the path -> viewpoint, "
+                 "then replan to the goal (star)", fontsize=8, color=TEXT_SECONDARY, loc="left")
     fig.suptitle(title or "Observation detours", x=0.01, ha="left", fontsize=11, color=TEXT_PRIMARY)
     fig.tight_layout()
     _save(fig, path, dpi)

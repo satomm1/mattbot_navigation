@@ -92,6 +92,7 @@ class DetourPlanner:
         self._wts = np.concatenate(wts)
         self.graph = csr_matrix((self._wts, (self._rows, self._cols)), shape=(self.n, self.n))
         self._tree = cKDTree(self.xy) if self.n else None
+        self.num_searches = 0  # path queries that ran the Dijkstra searches (diagnostics / tests)
 
     # ---------- Viewpoints ----------
 
@@ -139,9 +140,11 @@ class DetourPlanner:
         return float(np.min(arc + d)) + to_goal - float(arc[-1]) - 2.0 * r_max
 
     def compute(self, path_xy, targets, params=None):
-        """Detours for targets {object_id: (x, y, viewpoint_nodes)} -> {object_id: DetourResult}.
+        """Detours for targets {object_id: (x, y, viewpoint_nodes[, max_m])} -> {object_id: DetourResult}.
 
-        Objects with no viewpoint reachable within params.max_detour_m are left out.
+        max_m is the object's own limit (e.g. the longest detour worth its value; default
+        params.max_detour_m). Objects with max_m <= 0 or whose lower bound exceeds max_m are
+        dropped before any search; results longer than max_m are left out.
         """
         params = params or DetourParams()
         path_xy = np.asarray(path_xy, dtype=float).reshape(-1, 2)
@@ -151,12 +154,15 @@ class DetourPlanner:
         keep = nodes >= 0
         if not keep[-1] or not keep.any():
             return {}  # goal is not in C-space on this grid
-        cand = {
-            oid: (x, y, vn) for oid, (x, y, vn) in targets.items()
-            if len(vn) and self.lower_bound(path_xy, arc, (x, y), params.r_max) <= params.max_detour_m
-        }
+        cand = {}
+        for oid, t in targets.items():
+            x, y, vn = t[0], t[1], t[2]
+            max_m = float(t[3]) if len(t) > 3 else params.max_detour_m
+            if max_m > 0 and len(vn) and self.lower_bound(path_xy, arc, (x, y), params.r_max) <= max_m:
+                cand[oid] = (x, y, vn, max_m)
         if not cand:
             return {}
+        self.num_searches += 1
 
         # Virtual source n -> each path node, weight = arc length driven before leaving the path
         first_arc = {}
@@ -173,7 +179,7 @@ class DetourPlanner:
              (np.concatenate([self._rows, np.full(len(src_nodes), n)]), np.concatenate([self._cols, src_nodes]))),
             shape=(n + 1, n + 1),
         )
-        limit = float(arc[-1]) + params.max_detour_m + 1.0
+        limit = float(arc[-1]) + max(m for *_rest, m in cand.values()) + 1.0
         F, pred = dijkstra(A, directed=True, indices=n, limit=limit, return_predecessors=True)
         goal = int(nodes[-1])
         G = dijkstra(self.graph, directed=True, indices=goal, limit=limit)
@@ -182,10 +188,10 @@ class DetourPlanner:
             return {}
 
         out = {}
-        for oid, (ox, oy, vn) in cand.items():
+        for oid, (ox, oy, vn, max_m) in cand.items():
             total = F[vn] + G[vn] - L
             k = int(np.argmin(total))
-            if not np.isfinite(total[k]) or total[k] > params.max_detour_m:
+            if not np.isfinite(total[k]) or total[k] > max_m:
                 continue
             v = int(vn[k])
             route = [v]

@@ -14,10 +14,13 @@
        once per object on a topological roadmap of the static /map. -->
   <arg name="observe_importance" default="false"/>
   <arg name="observe_landmarks_file" default=""/>
-  <!-- Offer DETOUR options (viewpoints off the path) for objects no on-path stop can see; the
-       navigator does not execute them yet. Objects needing more than max_detour_m are ignored. -->
+  <!-- Detours: leave the path to re-check an object no on-path stop can see, when its value of
+       information beats its cost (observation_planner decides, the navigator drives it). Objects
+       needing more than observe_max_detour_m of extra driving are ignored. -->
   <arg name="observe_detour" default="false"/>
   <arg name="observe_max_detour_m" default="15.0"/>
+  <arg name="observe_detour_n_trips" default="5"/>
+  <arg name="observe_detour_margin_m" default="0.0"/>
 
   <param name="alpha1" value="0.075"/>
   <param name="alpha2" value="0.2"/>
@@ -51,6 +54,7 @@
 
   <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate.py" output="screen">
     <param name="observe_enabled" value="$(arg observe)"/>
+    <param name="observe_detour_enabled" value="$(arg observe_detour)"/>
     <param name="observe_dwell_s" value="$(arg observe_dwell_s)"/>
     <param name="stall_detection_enabled" value="true"/>
     <param name="stall_cmd_vel_threshold" value="0.08"/>
@@ -72,6 +76,8 @@
     <param name="landmarks_file" value="$(arg observe_landmarks_file)"/>
     <param name="detour_enabled" value="$(arg observe_detour)"/>
     <param name="max_detour_m" value="$(arg observe_max_detour_m)"/>
+    <param name="detour_n_trips" value="$(arg observe_detour_n_trips)"/>
+    <param name="detour_margin_m" value="$(arg observe_detour_margin_m)"/>
   </node>
 
   <!-- Launch the patrol.py script only if patrol is true -->

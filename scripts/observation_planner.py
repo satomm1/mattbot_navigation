@@ -16,10 +16,11 @@ I_o * (1 - belief). Extra outputs:
           /observation/importance  MarkerArray: I_o per object and its blocked edges (latched)
           ~importance_png_path     PNG of the importance map (+ .json of the results)
 
-With ~detour_enabled, objects due a check that no stop on the path can see also get a DETOUR
-option: the cheapest viewpoint off the path (leave the path, look, replan to the goal;
-navigation_utils/detour.py), skipped beyond ~max_detour_m of extra driving. The navigator does not
-execute detours yet. Extra outputs:
+With ~detour_enabled (implies importance), objects that no point of the path can see (visible ones
+are left to opportunistic stops) may get one DETOUR: leave the path, look from the best viewpoint,
+replan to the goal (navigation_utils/detour.py). It is returned only if its value of information
+beats its cost, V - C > ~detour_margin_m (observation_policy.py), and the navigator drives it
+(~observe_detour_enabled). Extra outputs:
           /observation/detours     MarkerArray: detour viewpoints, routes and extra distances
           ~detour_png_path         PNG of the last request's detours (+ .json)
 
@@ -81,17 +82,24 @@ class ObservationPlannerNode:
         importance_enabled = bool(rospy.get_param("~importance_enabled", False))
         self.detour_enabled = bool(rospy.get_param("~detour_enabled", False))
         self.importance = None  # RoadmapWorker (roadmap of /map, importance, detour planner)
-        if importance_enabled or self.detour_enabled:
-            self.importance = RoadmapWorker(importance_enabled, self.detour_enabled)
-            if importance_enabled:
-                self.policy.importance_fn = self.importance.importance_of
+        if importance_enabled or self.detour_enabled:  # detours need I_o
+            self.importance = RoadmapWorker(True, self.detour_enabled)
+            self.policy.importance_fn = self.importance.importance_of
+            self.policy.importance_m_fn = self.importance.importance_m_of
         self.detour_params = None
         self.viewpoints = {}  # object_id -> (Viewshed, DetourPlanner, viewpoint nodes)
         if self.detour_enabled:
             from navigation_utils.detour import DetourParams
+            from navigation_utils.observation_policy import DetourValueParams
 
-            self.detour_params = DetourParams(
-                max_detour_m=float(rospy.get_param("~max_detour_m", 15.0)), r_max=self.r_max
+            max_detour_m = float(rospy.get_param("~max_detour_m", 15.0))
+            self.detour_params = DetourParams(max_detour_m=max_detour_m, r_max=self.r_max)
+            self.policy.detour_params = DetourValueParams(
+                n_trips=float(rospy.get_param("~detour_n_trips", 5.0)),
+                conclusive_prob=float(rospy.get_param("~detour_conclusive_prob", 1.0)),
+                margin_m=float(rospy.get_param("~detour_margin_m", 0.0)),
+                max_detours_per_path=int(rospy.get_param("~max_detours_per_path", 1)),
+                hard_cap_m=max_detour_m,
             )
             self.detours_pub = rospy.Publisher("/observation/detours", MarkerArray, queue_size=1, latch=True)
 
@@ -181,13 +189,29 @@ class ObservationPlannerNode:
                 return SelectObservationsResponse(stops=[])
             now = time.time()
             eligible = self.policy.eligible_candidates(self.candidates, now, exclude)
-            self.ensure_viewsheds(eligible)
+            detour_eligible = []
+            if self.detour_enabled:  # no belief threshold for detours: they need viewsheds too
+                detour_eligible = [c for c in self.candidates if self.policy.detour_eligible(c, now, exclude)]
+            self.ensure_viewsheds({c.object_id: c for c in eligible + detour_eligible}.values())
             views = {oid: vs for oid, (vs, _sig) in self.viewsheds.items()}
-            detours, targets = self.compute_detours(path_xy, eligible, views)
-            options = self.policy.options(path_xy, self.candidates, views, now, exclude, detours=detours)
+            options = self.policy.opportunistic_options(path_xy, self.candidates, views, now, exclude)
+            evaluations, detours, targets = [], None, {}
+            if self.detour_enabled:
+                # Objects visible from any point of the path are left to opportunistic stops
+                dcands = self.policy.detour_candidates(path_xy, self.candidates, views, now, exclude)
+                detours, targets = self.compute_detours(path_xy, dcands, views)
+                if detours is not None:
+                    chosen, evaluations = self.policy.detour_options(
+                        path_xy, self.candidates, views, now, exclude, detours
+                    )
+                    options += chosen
         if self.detour_enabled:
-            self.publish_detour_markers(options, req.path.header.frame_id or "map")
-            self.importance.set_detours(path_xy, detours, targets, options)
+            self.log_detours(evaluations, targets)
+            self.publish_detour_markers(evaluations, req.path.header.frame_id or "map")
+            visible = [(c.object_id, c.x, c.y) for c in self.candidates
+                       if c.object_id in views and c.object_id not in targets
+                       and self.policy.checkable_from_path(path_xy, views[c.object_id])]
+            self.importance.set_detours(path_xy, detours, targets, options, evaluations, visible)
 
         stops = []
         for opt in options:
@@ -217,21 +241,23 @@ class ObservationPlannerNode:
 
     # ---------- Detours ----------
 
-    def compute_detours(self, path_xy, eligible, views):
-        """Detours for eligible objects (call with self.lock held). Returns (detours, targets)."""
-        planner = self.importance.detour_planner if self.detour_enabled else None
+    def compute_detours(self, path_xy, dcands, views):
+        """Detours for detour candidates, each searched up to its own D* (call with self.lock
+        held). Returns (detours, targets), detours None while the roadmap is not ready."""
+        planner = self.importance.detour_planner
         if planner is None:
             return None, {}
         targets = {}
-        for c in eligible:
-            vs = views.get(c.object_id)
-            if vs is None:
-                continue
+        for c in dcands:
+            d_star = self.policy.max_detour_m(c)
+            if d_star <= 0:
+                continue  # not worth any detour (just seen, or blocks nothing): no search
+            vs = views[c.object_id]
             cached = self.viewpoints.get(c.object_id)
             if cached is None or cached[0] is not vs or cached[1] is not planner:
                 cached = (vs, planner, planner.viewpoint_nodes(vs))
                 self.viewpoints[c.object_id] = cached
-            targets[c.object_id] = (c.x, c.y, cached[2])
+            targets[c.object_id] = (c.x, c.y, cached[2], d_star)
         for oid in [oid for oid in self.viewpoints if oid not in self.viewsheds]:
             del self.viewpoints[oid]
         t0 = time.time()
@@ -240,29 +266,43 @@ class ObservationPlannerNode:
                        len(detours), len(targets), 1000.0 * (time.time() - t0))
         return detours, targets
 
-    def publish_detour_markers(self, options, frame_id):
+    def log_detours(self, evaluations, targets):
+        for ev in sorted(evaluations, key=lambda e: -e.net_m):
+            rospy.loginfo(
+                "observation_planner: detour %s: +%.1f m, V=%.1f m, C=%.1f m -> %s",
+                "+".join(ev.object_ids), ev.detour_m, ev.value_m, ev.cost_m, "GO" if ev.chosen else "skip",
+            )
+        unreachable = sorted(set(targets) - {oid for ev in evaluations for oid in ev.object_ids})
+        if unreachable:
+            rospy.loginfo("observation_planner: no worthwhile viewpoint within D* for %s", ", ".join(unreachable))
+
+    def publish_detour_markers(self, evaluations, frame_id):
         markers = MarkerArray(markers=[Marker(action=Marker.DELETEALL)])
-        for k, opt in enumerate(o for o in options if o.kind == ObservationStop.DETOUR):
-            s = opt.stop
+        for k, ev in enumerate(evaluations):
+            s = ev.option.stop
+            rgb = (0.2, 0.5, 1.0) if ev.chosen else (0.6, 0.6, 0.6)
             m = Marker(ns="detour_viewpoints", id=k, type=Marker.SPHERE, action=Marker.ADD)
             m.header.frame_id = frame_id
             m.pose.position.x, m.pose.position.y = s.x, s.y
             m.pose.orientation.w = 1.0
             m.scale.x = m.scale.y = m.scale.z = 0.25
-            m.color.r, m.color.g, m.color.b, m.color.a = 0.2, 0.5, 1.0, 1.0
+            m.color.r, m.color.g, m.color.b = rgb
+            m.color.a = 1.0
             text = Marker(ns="detour_text", id=k, type=Marker.TEXT_VIEW_FACING, action=Marker.ADD)
             text.header.frame_id = frame_id
             text.pose.position.x, text.pose.position.y, text.pose.position.z = s.x, s.y, 0.5
             text.pose.orientation.w = 1.0
             text.scale.z = 0.22
             text.color.r = text.color.g = text.color.b = text.color.a = 1.0
-            text.text = "%s +%.1f m (%.0f s)" % (opt.candidates[0].object_id, opt.detour_m, opt.cost_s)
+            text.text = "%s +%.1f m V=%.1f C=%.1f %s" % (
+                "+".join(ev.object_ids), ev.detour_m, ev.value_m, ev.cost_m, "GO" if ev.chosen else "skip")
             rays = Marker(ns="detour_rays", id=k, type=Marker.LINE_LIST, action=Marker.ADD)
             rays.header.frame_id = frame_id
             rays.pose.orientation.w = 1.0
             rays.scale.x = 0.03
-            rays.color.r, rays.color.g, rays.color.b, rays.color.a = 0.2, 0.5, 1.0, 0.8
-            for c in opt.candidates:
+            rays.color.r, rays.color.g, rays.color.b = rgb
+            rays.color.a = 0.8
+            for c in ev.option.candidates:
                 rays.points += [Point(x=s.x, y=s.y), Point(x=c.x, y=c.y)]
             markers.markers += [m, text, rays]
         self.detours_pub.publish(markers)
@@ -384,12 +424,12 @@ class RoadmapWorker:
             self.pending_map = msg
         self.wake.set()
 
-    def set_detours(self, path_xy, detours, targets, options):
+    def set_detours(self, path_xy, detours, targets, options, evaluations=(), visible=()):
         """Last /observation/select result, for the detour PNG (drawn on the worker thread)."""
         if detours is None:
             return
         with self.lock:
-            self.detour_snapshot = (path_xy, detours, targets, options)
+            self.detour_snapshot = (path_xy, detours, targets, options, list(evaluations), list(visible))
             self.detour_png_dirty = True
         self.wake.set()
 
@@ -400,6 +440,12 @@ class RoadmapWorker:
             self.objects = objects
             self.objects_dirty = True
         self.wake.set()
+
+    def importance_m_of(self, candidate):
+        """I_o (m per trip), or None until the object has been evaluated (no detour before that)."""
+        tracker = self.tracker
+        result = tracker.get(candidate.object_id) if tracker is not None else None
+        return None if result is None else result.I_o
 
     def importance_of(self, candidate):
         """I_o of an object (1.0 = neutral until it has been evaluated). A lookup, never a computation."""
@@ -507,14 +553,15 @@ class RoadmapWorker:
             snapshot, self.detour_png_dirty = self.detour_snapshot, False
         if snapshot is None or self.roadmap is None:
             return
-        path_xy, detours, targets, options = snapshot
+        path_xy, detours, targets, options, evaluations, visible = snapshot
         info = self.map_msg.info
         occupancy = (self.map_msg.data, info.width, info.height, info.resolution,
                      (info.origin.position.x, info.origin.position.y))
         render_detour_png(self.detour_png_path, self.roadmap, path_xy, detours, targets, options=options,
-                          occupancy=occupancy, planner=self.detour_planner,
+                          occupancy=occupancy, planner=self.detour_planner, evaluations=evaluations,
+                          visible=visible,
                           title="Observation detours (%s)" % time.strftime("%Y-%m-%d %H:%M:%S"))
-        write_detours_json(os.path.splitext(self.detour_png_path)[0] + ".json", detours, options)
+        write_detours_json(os.path.splitext(self.detour_png_path)[0] + ".json", detours, evaluations, visible)
         self.last_detour_png = time.time()
 
     # ---------- RViz ----------
@@ -569,15 +616,16 @@ class RoadmapWorker:
         self.importance_pub.publish(MarkerArray(markers=markers))
 
 
-def write_detours_json(path, detours, options):
+def write_detours_json(path, detours, evaluations, visible=()):
     import json
     import tempfile
 
-    cost = {o.candidates[0].object_id: o.cost_s for o in options if o.kind == ObservationStop.DETOUR}
-    out = {}
-    for oid, d in detours.items():
-        out[oid] = d.to_dict()
-        out[oid]["option_cost_s"] = cost.get(oid)  # None: no DETOUR option (seen from the path)
+    out = {"detours": {oid: d.to_dict() for oid, d in detours.items()},
+           "evaluations": [{"object_ids": ev.object_ids, "detour_m": ev.detour_m, "V_m": ev.value_m,
+                            "C_m": ev.cost_m, "net_m": ev.net_m, "chosen": ev.chosen,
+                            "viewpoint": [ev.option.stop.x, ev.option.stop.y], "values_m": ev.values_m}
+                           for ev in evaluations],
+           "opportunistic": [oid for oid, _x, _y in visible]}
     out_dir = os.path.dirname(os.path.abspath(path))
     os.makedirs(out_dir, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=out_dir, suffix=".json")

@@ -5,7 +5,7 @@ from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import Twist, Pose
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from visualization_msgs.msg import Marker, MarkerArray
-from mattbot_dds.msg import MapUpdate
+from mattbot_dds.msg import MapUpdate, ObjectBeliefArray
 import tf
 import sensor_msgs.point_cloud2 as pc2
 from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray, Person, PersonArray
@@ -15,6 +15,7 @@ import time
 
 import numpy as np
 from matplotlib import pyplot as plt
+from navigation_utils.object_layers import ledger_blockout_grid
 import os
 import json
 
@@ -52,6 +53,11 @@ class Map:
                 "Object blockout TTL: %.1fs (remove only in IDLE)",
                 self.object_blockout_ttl_sec,
             )
+
+        # Ledger objects (mattbot_dds object_belief_map /object_beliefs): block every object until it
+        # is removed (seen gone), so routing matches the observation planner's detour model.
+        self.enable_ledger_blockout = bool(rospy.get_param('enable_ledger_blockout', False))
+        rospy.loginfo("Ledger object blockout: %s", "enabled" if self.enable_ledger_blockout else "disabled")
 
         self.trans_listener = tf.TransformListener()
 
@@ -92,7 +98,8 @@ class Map:
         self.combined_map_publisher = rospy.Publisher(
             '/navigation_map', OccupancyGrid, queue_size=1, latch=True
         )
-        self.object_map_publisher = rospy.Publisher('/object_map', OccupancyGrid, queue_size=10)
+        # Latched: a navigator started later still gets the current blockouts
+        self.object_map_publisher = rospy.Publisher('/object_map', OccupancyGrid, queue_size=10, latch=True)
 
         if self.enable_depth_occupancy_grid:
             self._init_depth_occupancy_grid()
@@ -105,6 +112,12 @@ class Map:
         self.object_marker_array = MarkerArray()
 
         self.detected_object_map = np.ones((self.height, self.width))*-1
+        self.ledger_object_map = np.ones((self.height, self.width))*-1
+        self._ledger_cells_key = None
+        if self.enable_ledger_blockout:
+            self.ledger_subscriber = rospy.Subscriber(
+                '/object_beliefs', ObjectBeliefArray, self.object_beliefs_callback, queue_size=1
+            )
         self.confirmed_object_publisher = rospy.Publisher('/confirmed_objects', DetectedObject, queue_size=10)
         self.object_marker_publisher = rospy.Publisher('/object_array', MarkerArray, queue_size=10)
 
@@ -117,6 +130,29 @@ class Map:
         # on the first depth frame (which may be delayed or skipped).
         self._publish_navigation_map()
 
+    def _publish_object_map(self):
+        """/object_map = confirmed-object blockouts + ledger objects (cell-wise max)."""
+        layer = np.maximum(self.detected_object_map, self.ledger_object_map)
+        map_data = layer.flatten().astype(int).tolist()
+        self.object_map_publisher.publish(
+            OccupancyGrid(header=self.map_msg.header, info=self.map_msg.info, data=map_data)
+        )
+
+    def object_beliefs_callback(self, msg):
+        """Rebuild the ledger layer; republish /object_map only when its blocked cells change."""
+        info = self.map_msg.info
+        grid = ledger_blockout_grid(
+            [(o.local_x, o.local_y, o.width, o.belief) for o in msg.objects],
+            self.width, self.height, self.resolution, (info.origin.position.x, info.origin.position.y),
+        )
+        key = np.flatnonzero(grid > 0).tobytes()
+        if key == self._ledger_cells_key:
+            return
+        self._ledger_cells_key = key
+        self.ledger_object_map = grid.astype(float)
+        rospy.loginfo("Ledger blockout: %d object(s), %d cell(s)", len(msg.objects), int((grid > 0).sum()))
+        self._publish_object_map()
+
     def _planning_blockout_width(self, width):
         """Cap reported object width used for /object_map and detected_object_map."""
         return min(float(width), self.max_object_blockout_width)
@@ -124,10 +160,12 @@ class Map:
     def _detected_object_blockout_indices(self, x, y, width):
         """Grid index bounds for a square blockout centered at (x, y), clipped to the map."""
         blockout_w = self._planning_blockout_width(width)
-        x_min = max(int((x - blockout_w / 2) / self.resolution), 0)
-        x_max = min(int((x + blockout_w / 2) / self.resolution), self.width)
-        y_min = max(int((y - blockout_w / 2) / self.resolution), 0)
-        y_max = min(int((y + blockout_w / 2) / self.resolution), self.height)
+        ox = self.map_msg.info.origin.position.x
+        oy = self.map_msg.info.origin.position.y
+        x_min = max(int((x - ox - blockout_w / 2) / self.resolution), 0)
+        x_max = min(int((x - ox + blockout_w / 2) / self.resolution), self.width)
+        y_min = max(int((y - oy - blockout_w / 2) / self.resolution), 0)
+        y_max = min(int((y - oy + blockout_w / 2) / self.resolution), self.height)
         return x_min, x_max, y_min, y_max, blockout_w
 
     def _set_detected_object_blockout(self, x, y, width):
@@ -156,10 +194,7 @@ class Map:
             if np.sqrt((marker.pose.position.x - x)**2 + (marker.pose.position.y - y)**2) < blockout_w:
                 self.object_marker_array.markers[j].action = Marker.DELETE
                 break
-        map_data = self.detected_object_map.flatten().astype(int).tolist()
-        self.object_map_publisher.publish(
-            OccupancyGrid(header=self.map_msg.header, info=self.map_msg.info, data=map_data)
-        )
+        self._publish_object_map()
         self.object_marker_publisher.publish(self.object_marker_array)
         self.num_removed_objects += 1
 
@@ -743,8 +778,7 @@ class Map:
                             self.confirmed_object_publisher.publish(confirmed_object)
 
                             # Publish updated map
-                            map_data = self.detected_object_map.flatten().astype(int).tolist()
-                            self.object_map_publisher.publish(OccupancyGrid(header=self.map_msg.header, info=self.map_msg.info, data=map_data))
+                            self._publish_object_map()
 
                             break
                 
@@ -786,8 +820,7 @@ class Map:
         self.object_marker_publisher.publish(self.object_marker_array)
 
         # Publish updated map
-        map_data = self.detected_object_map.flatten().astype(int).tolist()
-        self.object_map_publisher.publish(OccupancyGrid(header=self.map_msg.header, info=self.map_msg.info, data=map_data))
+        self._publish_object_map()
 
     def object_from_sensor_callback(self, msg):
         object_array = msg.objects
@@ -829,8 +862,7 @@ class Map:
                 print("Number of detected objects: ", self.num_detected_objects - self.num_removed_objects)
 
                 # Publish updated map
-                map_data = self.detected_object_map.flatten().astype(int).tolist()
-                self.object_map_publisher.publish(OccupancyGrid(header=self.map_msg.header, info=self.map_msg.info, data=map_data))
+                self._publish_object_map()
 
                 marker = self.get_marker(x, y, self.num_detected_objects)
                 self.object_marker_array.markers.append(marker)     

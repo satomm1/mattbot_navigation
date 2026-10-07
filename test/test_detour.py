@@ -7,7 +7,6 @@ import pytest
 from scipy.sparse.csgraph import dijkstra
 
 from navigation_utils.detour import DetourParams, DetourPlanner
-from navigation_utils.observation_policy import DETOUR, OPPORTUNISTIC, REPLAN, Candidate, ThresholdPolicy
 from navigation_utils.viewpoints import compute_viewshed
 from synthetic_maps import RES, corridor_with_room, maze, roadmap_of
 
@@ -123,34 +122,34 @@ def test_far_objects_skipped(room):
     assert "box" in planner.compute(path, {"box": t}, DetourParams(max_detour_m=30.0))
 
 
-# ---------- Policy ----------
+# ---------- Per-object limits ----------
 
 
-def test_policy_adds_detour_option_for_uncovered_object(room):
+def test_object_limit_zero_or_negative_is_never_searched(room):
     _rm, planner, blocking = room
     path = corridor_path(planner)
-    vs_box, t_box = target(planner, blocking, "box", 10.0, 7.0)
-    vs_cart, t_cart = target(planner, blocking, "cart", 5.0, 2.2)
-    detours = planner.compute(path, {"box": t_box, "cart": t_cart})
-    policy = ThresholdPolicy(check_below_belief=0.5, cruise_speed=0.5, dwell_s=4.0, turn_rate=1.0)
-    cands = [Candidate("box", "box", 10.0, 7.0, 0.2), Candidate("cart", "cart", 5.0, 2.2, 0.2)]
-    options = policy.options(path, cands, {"box": vs_box, "cart": vs_cart}, now=0.0, detours=detours)
-    kinds = {o.candidates[0].object_id: o for o in options}
-    assert kinds["cart"].kind == OPPORTUNISTIC  # seen from the path: no detour
-    det = kinds["box"]
-    assert det.kind == DETOUR and det.resume == REPLAN and det.path_index == -1
-    assert det.detour_m == pytest.approx(detours["box"].detour_m)
-    assert (det.stop.x, det.stop.y) == detours["box"].viewpoint_xy
-    expected = detours["box"].detour_m / 0.5 + 4.0
-    assert expected <= det.cost_s <= expected + math.pi  # + turn towards the object (<= pi rad at 1 rad/s)
-    assert det.values == [pytest.approx(0.8)]
+    _vs, (x, y, nodes) = target(planner, blocking, "box", 10.0, 7.0)
+    runs = planner.num_searches
+    assert planner.compute(path, {"box": (x, y, nodes, 0.0)}) == {}
+    assert planner.compute(path, {"box": (x, y, nodes, -3.0)}) == {}
+    assert planner.num_searches == runs  # dropped before any Dijkstra
 
 
-def test_policy_detour_respects_max_cost_and_absence(room):
-    _rm, planner, blocking = room
-    path = corridor_path(planner)
-    vs, t = target(planner, blocking, "box", 10.0, 7.0)
-    detours = planner.compute(path, {"box": t})
-    cands = [Candidate("box", "box", 10.0, 7.0, 0.2)]
-    assert ThresholdPolicy(max_cost_s=5.0).options(path, cands, {"box": vs}, 0.0, detours=detours) == []
-    assert ThresholdPolicy().options(path, cands, {"box": vs}, 0.0) == []  # no detours given
+def test_per_object_limits_match_brute_force():
+    rm, planner, blocking = setup(maze())
+    path = planner.shortest_path_xy((2.0, 2.0), (10.0, 10.0))
+    rng = np.random.default_rng(1)
+    targets, exact = {}, {}
+    for k, (x, y) in enumerate(planner.xy[rng.choice(planner.n, 60, replace=False)]):
+        _vs, (x, y, nodes) = target(planner, blocking, "o%d" % k, x, y, r_min=0.3, r_max=1.5)
+        if len(nodes):
+            limit = float(rng.uniform(0.5, 10.0))
+            targets["o%d" % k] = (x, y, nodes, limit)
+            exact["o%d" % k] = brute_force(planner, path, nodes)
+    got = planner.compute(path, targets, DetourParams(r_max=1.5))
+    for oid, (_x, _y, _n, limit) in targets.items():
+        e = exact[oid] if exact[oid] > 0.3 else 0.0
+        if e <= limit:
+            assert got[oid].detour_m == pytest.approx(e, abs=1e-6)
+        else:
+            assert oid not in got

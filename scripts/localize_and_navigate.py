@@ -47,6 +47,10 @@ FREQUENT_GRAPH_CACHE_VERSION = 1
 _NAV_LOG_PREFIX = "[Navigator] "
 
 
+def _is_detour_entry(entry):
+    return bool(entry) and bool(entry.get("detour"))
+
+
 def _nav_loginfo(msg, *args, **kwargs):
     rospy.loginfo(_NAV_LOG_PREFIX + msg, *args, **kwargs)
 
@@ -349,6 +353,12 @@ class Navigator:
         self._observe_goal = None  # goal the set above belongs to
         self._observation_srv = None
         self.observation_event_pub = rospy.Publisher('/observation/events', ObservationEvent, queue_size=20)
+        # Detours (observation_planner ~detour_enabled): leave the path, look from a viewpoint, replan.
+        # The viewpoint is a sub-goal (_active_goal); x_g / y_g / theta_g always keep the real goal.
+        self.observe_detour_enabled = bool(rospy.get_param('~observe_detour_enabled', False))
+        self.observe_detour_timeout_factor = float(rospy.get_param('~observe_detour_timeout_factor', 2.0))
+        self._detour = None  # {"entry", "stop", "goal", "heading", "deadline"} while a detour is active
+        self._detour_skipped = set()  # detour objects given up on for the current goal
         self._aligned_since = None  # wall time when post-align dwell started (before TRACK)
         self.start_pos_thresh = (
             0.2  # threshold to be far enough into the plan to recompute it
@@ -488,6 +498,7 @@ class Navigator:
         """Human / fleet stop (e.g. from DDS via /stop): halt motion and go to IDLE."""
         if not msg.data:
             return
+        self._cancel_detour("stop")
         if self.mode == Mode.IDLE:
             return
         cmd_vel = Twist()
@@ -1047,8 +1058,9 @@ class Navigator:
         returns whether the robot is close enough in position to the goal to
         start using the pose controller
         """
+        gx, gy, _gth = self._active_goal()
         return (
-            linalg.norm(np.array([self.x - self.x_g, self.y - self.y_g]))
+            linalg.norm(np.array([self.x - gx, self.y - gy]))
             < self.near_thresh
         )
 
@@ -1448,6 +1460,8 @@ class Navigator:
         check.robot_d = max(self.robot_d - 2.0 * self.path_check_tolerance_m, 0.0)
         for point in path:
             xy = np.asarray(point, dtype=float).reshape(-1)[:2]
+            if self.x is not None and np.hypot(xy[0] - self.x, xy[1] - self.y) < self.robot_d:
+                continue  # an object blocked out right next to the robot must not stop it in place
             if not check.is_free(xy):
                 _nav_loginfo("Path no longer valid...")
                 return False
@@ -1533,9 +1547,19 @@ class Navigator:
         x_init = self._resolve_plan_start(self.x, self.y, combined_occupancy)
         if x_init is None:
             self.switch_mode(Mode.IDLE)
+            if self._detour is not None:
+                self._abandon_detour("no free start cell")
             return
         self.plan_start = x_init
-        x_goal = self.snap_to_grid((self.x_g, self.y_g))
+        gx, gy, gth = self._active_goal()  # the detour viewpoint while a detour is active
+        x_goal = self.snap_to_grid((gx, gy))
+        if self._detour is not None and not combined_occupancy.is_free(x_goal):
+            # Viewpoints come from a round-robot C-space; the navigator checks a square footprint
+            nearest, _dist = combined_occupancy.find_nearest_free(x_goal, max_radius=0.4, step=self.plan_resolution)
+            if nearest is None:
+                self._abandon_detour("viewpoint not free")
+                return
+            x_goal = nearest
 
         # Get locations of agents who are static
         robots_x = []  # list of x coordinates of other agents who are static
@@ -1604,6 +1628,10 @@ class Navigator:
             success = problem.solve()
             if not success and (self.mode == Mode.IDLE or self.mode == Mode.STOPPED_FOR_AGENT):
                 _nav_loginfo("Planning failed")
+                if self._detour is not None:
+                    # Never count a failed detour leg against the real goal (would clear it)
+                    self._abandon_detour("no path to the viewpoint")
+                    return
                 self.times_planned_failed += 1
 
                 if self.times_planned_failed > 1:
@@ -1634,6 +1662,9 @@ class Navigator:
                 )
 
         # Check whether path is too short
+        if self._detour is not None and (planned_path is None or len(planned_path) < 4):
+            self._arrive_at_detour_viewpoint()  # already (almost) at the viewpoint: look from here
+            return
         if planned_path == None:
             return
         elif len(planned_path) < 4:
@@ -1650,7 +1681,7 @@ class Navigator:
         self.publish_smoothed_path(traj_new, self.nav_smoothed_path_pub, times=t_new)
 
         # Load the new trajectory into the controllers
-        self.pose_controller.load_goal(self.x_g, self.y_g, self.theta_g)
+        self.pose_controller.load_goal(gx, gy, gth)
         self.traj_controller.load_traj(t_new, traj_new)
         self.current_plan = traj_new
         self.unsmoothed_plan = planned_path
@@ -1715,11 +1746,14 @@ class Navigator:
         self._observation_stops = []
         if not self._observation_allowed():
             return
+        if self._detour is not None:
+            return  # no stops on the way to a detour viewpoint; the replan after it asks again
         goal = (self.x_g, self.y_g, self.theta_g)
         if goal != self._observe_goal:
             # New goal: every object may be checked again (once)
             self._observe_goal = goal
             self._observed_this_goal = set()
+            self._detour_skipped = set()
         try:
             if self._observation_srv is None:
                 rospy.wait_for_service('/observation/select', timeout=0.2)
@@ -1738,21 +1772,34 @@ class Navigator:
                 path=path,
                 start=Pose2D(x=self.x, y=self.y, theta=self.theta),
                 goal=Pose2D(x=self.x_g or 0.0, y=self.y_g or 0.0, theta=self.theta_g or 0.0),
-                exclude_object_ids=sorted(self._observed_this_goal),
+                exclude_object_ids=sorted(self._observed_this_goal | self._detour_skipped),
             )
         except (rospy.ROSException, rospy.ServiceException) as exc:
             self._observation_srv = None
             rospy.logwarn_throttle(30, "observation: /observation/select unavailable (%s)", exc)
             return
+        have_detour = False
         for stop in resp.stops:
-            if stop.kind != ObservationStop.OPPORTUNISTIC or stop.path_index < 0:
-                continue  # detours not supported yet
+            if stop.path_index < 0:
+                continue
             idx = min(stop.path_index * stride, len(traj_new) - 1)
-            self._observation_stops.append({"idx": idx, "t": float(t_new[idx]), "stop": stop})
+            entry = {"idx": idx, "t": float(t_new[idx]), "stop": stop, "detour": False}
+            if stop.kind == ObservationStop.DETOUR:
+                if not self.observe_detour_enabled or have_detour:
+                    continue  # at most one detour per trajectory
+                have_detour = True
+                # Triggered at the leave point on the path; stop.x / stop.y is the viewpoint
+                entry["detour"] = True
+                entry["leave"] = (float(traj_new[idx, 0]), float(traj_new[idx, 1]), float(traj_new[idx, 2]))
+            elif stop.kind != ObservationStop.OPPORTUNISTIC:
+                continue
+            self._observation_stops.append(entry)
+        self._observation_stops.sort(key=lambda e: e["idx"])
         if self._observation_stops:
             _nav_loginfo(
                 "Observation stops planned: %s",
-                ", ".join("+".join(e["stop"].object_ids) for e in self._observation_stops),
+                ", ".join(("detour:" if e["detour"] else "") + "+".join(e["stop"].object_ids)
+                          for e in self._observation_stops),
             )
 
     def _observation_due(self):
@@ -1761,18 +1808,19 @@ class Navigator:
             return False
         entry = self._observation_stops[0]
         stop = entry["stop"]
-        # Trigger once the robot reaches the stop along the path (not up to trigger_m early)
-        along = (self.x - stop.x) * np.cos(stop.heading) + (self.y - stop.y) * np.sin(stop.heading)
-        if np.hypot(self.x - stop.x, self.y - stop.y) < self.observe_trigger_m and along >= -0.05:
+        # Trigger once the robot reaches the stop (detour: the leave point) along the path
+        sx, sy, sh = entry["leave"] if entry.get("detour") else (stop.x, stop.y, stop.heading)
+        along = (self.x - sx) * np.cos(sh) + (self.y - sy) * np.sin(sh)
+        if np.hypot(self.x - sx, self.y - sy) < self.observe_trigger_m and along >= -0.05:
             return True
         if self.get_current_plan_time() > entry["t"] + 2.0:
             _nav_loginfo("Passed observation stop for %s without reaching it; skipping", list(stop.object_ids))
             self._observation_stops.pop(0)
         return False
 
-    def _start_observation_stop(self):
-        """Stop on the path and start turning to the first object of the next stop."""
-        self._observe_stop = self._observation_stops.pop(0)
+    def _start_observation_stop(self, entry=None):
+        """Stop (on the path, or at a detour viewpoint) and start turning to the first object."""
+        self._observe_stop = entry if entry is not None else self._observation_stops.pop(0)
         stop = self._observe_stop["stop"]
         self._observe_queue = [(oid, t.x, t.y) for oid, t in zip(stop.object_ids, stop.targets)]
         self.nav_vel_pub.publish(Twist())
@@ -1840,6 +1888,8 @@ class Navigator:
     def _finish_observation_target(self, done):
         if done:
             self._observed_this_goal.add(self._observe_target[0])
+        elif _is_detour_entry(self._observe_stop):
+            self._detour_skipped.add(self._observe_target[0])  # e.g. turn timed out: do not retry
         if self._observe_queue:
             self._observe_next_target()
             return
@@ -1849,12 +1899,70 @@ class Navigator:
         self._observe_resuming = True
         try:
             if entry["stop"].resume == ObservationStop.REPLAN:
+                if self._detour is not None:
+                    _nav_loginfo("Detour done; replanning to the goal")
+                    self._detour = None  # replan to the real goal, not the viewpoint
                 self.switch_mode(Mode.IDLE)
                 self.replan()
             else:
                 self._load_remaining_plan(self._nearest_plan_index(entry["idx"]))
         finally:
             self._observe_resuming = False
+
+    # ---------- Detours ----------
+
+    def _active_goal(self):
+        """(x, y, theta) the planner should go to: the detour viewpoint while a detour is active,
+        otherwise the goal. A detour whose goal was replaced (any goal source) is dropped."""
+        if self._detour is not None and self._detour["goal"] != (self.x_g, self.y_g, self.theta_g):
+            self._cancel_detour("goal changed")
+        if self._detour is not None:
+            s = self._detour["stop"]
+            return s.x, s.y, self._detour["heading"]
+        return self.x_g, self.y_g, self.theta_g
+
+    def _start_detour(self):
+        """At the leave point: drive to the viewpoint (a sub-goal), look, then replan to the goal."""
+        entry = self._observation_stops.pop(0)
+        self._observation_stops = []  # later stops belong to this trajectory; asked again after
+        stop = entry["stop"]
+        heading = float(np.arctan2(stop.targets[0].y - stop.y, stop.targets[0].x - stop.x))
+        self._detour = {
+            "entry": entry,
+            "stop": stop,
+            "goal": (self.x_g, self.y_g, self.theta_g),
+            "heading": heading,
+            "deadline": time.time() + self.observe_detour_timeout_factor * float(stop.cost_s) + 20.0,
+        }
+        _nav_loginfo(
+            "Detour to (%.2f, %.2f) to check %s (est. %.0f s)", stop.x, stop.y, "+".join(stop.object_ids), stop.cost_s
+        )
+        self.nav_vel_pub.publish(Twist())
+        self.switch_mode(Mode.IDLE)
+        self.replan()  # plans to _active_goal(): the viewpoint
+
+    def _arrive_at_detour_viewpoint(self):
+        _nav_loginfo("Reached detour viewpoint")
+        self.nav_vel_pub.publish(Twist())
+        self._start_observation_stop(self._detour["entry"])
+
+    def _abandon_detour(self, reason):
+        """Give up on the active detour for this goal and replan to the goal."""
+        if self._detour is None:
+            return
+        ids = list(self._detour["stop"].object_ids)
+        _nav_loginfo("Detour to check %s abandoned (%s); replanning to the goal", "+".join(ids), reason)
+        self._detour = None
+        self._detour_skipped.update(ids)
+        self.nav_vel_pub.publish(Twist())
+        self.switch_mode(Mode.IDLE)
+        self.replan()
+
+    def _cancel_detour(self, reason):
+        """Drop the active detour without replanning (new goal, /stop, ...)."""
+        if self._detour is not None:
+            _nav_loginfo("Detour cancelled (%s)", reason)
+            self._detour = None
 
     def _nearest_plan_index(self, idx, window=40):
         """Trajectory sample nearest the robot, searched around idx (robot may stop short or overshoot)."""
@@ -2062,9 +2170,17 @@ class Navigator:
                 self._maybe_recover_from_stall()
                 current_time = rospy.get_rostime().to_sec()
                 if self.near_goal():
-                    self._enter_park_pose()
+                    if self._detour is not None:
+                        self._arrive_at_detour_viewpoint()
+                    else:
+                        self._enter_park_pose()
                 elif self._observation_due():
-                    self._start_observation_stop()
+                    if self._observation_stops[0].get("detour"):
+                        self._start_detour()
+                    else:
+                        self._start_observation_stop()
+                elif self._detour is not None and time.time() > self._detour["deadline"]:
+                    self._abandon_detour("took too long")
                 elif(not self.path_still_valid(self.current_plan)):
                     # Path no longer valid ---> replan
                     _nav_loginfo("replanning because path is no longer valid")
@@ -2120,12 +2236,15 @@ class Navigator:
                 #     self.replan(obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
 
                 if self.mode == Mode.TRACK and self.get_current_plan_time() > self.current_plan_duration * 1.2:
-                    if (self.x_g is not None and self.y_g is not None and np.linalg.norm(np.array([self.x - self.x_g, self.y - self.y_g])) > 0.5):
+                    gx, gy, _gth = self._active_goal()
+                    if (gx is not None and gy is not None and np.linalg.norm(np.array([self.x - gx, self.y - gy])) > 0.5):
                         _nav_loginfo("replanning because out of time")
 
                         # Stop attempting current plan
                         self.switch_mode(Mode.IDLE)
                         self.replan()  # we aren't near the goal but we thought we should have been, so replan
+                    elif self._detour is not None:
+                        self._arrive_at_detour_viewpoint()
                     else:
                         _nav_loginfo("Going to park because out of time and near goal")
                         self._enter_park_pose()

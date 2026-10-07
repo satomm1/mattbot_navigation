@@ -11,7 +11,7 @@ Implements navigation for the mobile robot. Uses A* to plan paths, smooths them 
 - **patrol.py**: Patrol behavior (optional in combined-map launches).
 - **observation_planner.py**: Picks stops along the planned path to re-check ledger objects (`observe:=true`). With `observe_importance:=true` it values each object by its obstacle importance I_o (below).
 - **plot_obstacle_importance.py**: Offline I_o for a map and a CSV of objects; prints a table and writes a PNG.
-- **plot_observation_detours.py**: Offline detour cost for a path (or start/goal) and a CSV of objects; prints a table and writes a PNG.
+- **plot_observation_detours.py**: Offline detour decisions (detour, V, C, GO/skip) for a path (or start/goal) and a CSV of objects; prints a table and writes a PNG.
 
 ### Obstacle importance I_o
 
@@ -25,15 +25,22 @@ Implements navigation for the mobile robot. Uses A* to plan paths, smooths them 
 
 ### Observation detours
 
-`navigation_utils/detour.py`: extra driving needed to see an object that no stop on the planned path can see. Each object's viewshed (the same ray casting as opportunistic stops) is mapped to reachable C-space cells; the robot leaves the path anywhere, drives to a viewpoint, looks, and replans to the goal. detour(v) = F(v) + G(v) - L, with F one Dijkstra from the whole path (offset by distance driven along it) and G one from the goal, so a path query costs two grid Dijkstras for all objects (~15 ms on the y2e2 map). Objects that cannot be within `max_detour_m` (15 m) are skipped with a straight-line lower bound before any search. With `observe_detour:=true` the observation planner adds DETOUR options (cost = detour / cruising speed + turn + dwell) to `/observation/select`, publishes `/observation/detours`, and writes `~/.ros/mattbot_roadmap/detour_latest.png`; the navigator does not execute detours yet.
+`navigation_utils/detour.py`: extra driving needed to see an object that **no point of the planned path can see** (objects visible from the path are always left to opportunistic stops). Each object's viewshed (the same ray casting as opportunistic stops) is mapped to reachable C-space cells; the robot leaves the path anywhere, drives to a viewpoint, looks, and replans to the goal. detour(v) = F(v) + G(v) - L, with F one Dijkstra from the whole path (offset by distance driven along it) and G one from the goal, so a path query costs two grid Dijkstras for all objects (~15 ms on the y2e2 map).
+
+**Decision** (`observation_policy.py`, value of information, all in metres): for a ledger object with belief b in [0, 1],
+`p_gone = (1 - b)/2`, `V = q * N * p_gone * I_o` (driving the fleet saves over the next N trips if the check finds it gone), `C = detour + v_cruise * (turn + dwell)`. A detour is taken if `V - C > margin`, at most one per path (objects seen from the same viewpoint are bundled; their V adds). `D* = V - v_cruise * dwell` bounds each object's search; objects with D* <= 0 (just seen, or blocking nothing) are never searched.
+
+**Execution** (`observe_detour:=true`): the observation planner returns the chosen DETOUR stop (`path_index` = where to leave the path, `x, y` = viewpoint); the navigator drives to the viewpoint as a sub-goal (the real goal is never overwritten), observes, then replans to the goal. A detour is abandoned (and not offered again for this goal) if the viewpoint cannot be planned to or it takes longer than `~observe_detour_timeout_factor` x its estimated time + 20 s; a new goal or `/stop` cancels it. `observe_detour` also turns on importance and, by default, `ledger_blockout`: the occupancy grid mapper adds every ledger object to `/object_map` until it is removed, which is what the value model assumes. Tune with `observe_detour_n_trips` (N, default 5), `observe_detour_margin_m` and `observe_max_detour_m` (hard cap, 15 m). Outputs: `/observation/detours` (V, C, GO/skip per candidate) and `~/.ros/mattbot_roadmap/detour_latest.png` / `.json`.
 
 ```bash
 rosrun mattbot_navigation plot_observation_detours.py --map $(rospack find mattbot_mcl)/map_json/current_map.json \
-    --objects objects.csv --start 10,18.9 --goal 80,18.9 --out detours.png
+    --objects objects.csv --start 10,18.9 --goal 80,18.9 --belief 0.0 --n-trips 5 --out detours.png
 rosrun mattbot_navigation plot_obstacle_importance.py --map $(rospack find mattbot_mcl)/map_json/current_map.json \
     --objects objects.csv --out importance.png          # objects.csv rows: x,y,width[,id] (local map frame)
 python3 -m pytest mattbot_navigation/test               # from src/
 ```
+
+Known limitations and open issues of importance, detours and the re-check policy are tracked in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
 ### Launch
 
