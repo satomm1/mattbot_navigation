@@ -144,14 +144,14 @@ class ObservationPlannerNode:
         ]
         with self.lock:
             self.candidates = cands
-            self.last_beliefs_time = time.time()
+            self.last_beliefs_time = rospy.get_time()
         if self.importance is not None:
             self.importance.set_objects({c.object_id: (c.x, c.y, c.width) for c in cands})
 
     def event_callback(self, msg):
         if msg.event == ObservationEvent.ENDED:
             with self.lock:
-                self.policy.record_check(msg.object_id, msg.window_end or time.time())
+                self.policy.record_check(msg.object_id, msg.window_end or rospy.get_time())
 
     def health_timer(self, _event):
         if self.last_beliefs_time is None:
@@ -192,7 +192,7 @@ class ObservationPlannerNode:
         with self.lock:
             if self.blocking is None or len(path_xy) < 2:
                 return SelectObservationsResponse(stops=[])
-            now = time.time()
+            now = rospy.get_time()  # cooldowns use the navigator's window times (ROS time)
             eligible = self.policy.eligible_candidates(self.candidates, now, exclude)
             detour_eligible = []
             if self.detour_enabled:  # no belief threshold for detours: they need viewsheds too
@@ -265,10 +265,10 @@ class ObservationPlannerNode:
             targets[c.object_id] = (c.x, c.y, cached[2], d_star)
         for oid in [oid for oid in self.viewpoints if oid not in self.viewsheds]:
             del self.viewpoints[oid]
-        t0 = time.time()
+        t0 = time.time()  # wall clock: compute time
         detours = planner.compute(path_xy, targets, self.detour_params)
         rospy.logdebug("observation_planner: %d detour(s) for %d object(s) in %.0f ms",
-                       len(detours), len(targets), 1000.0 * (time.time() - t0))
+                       len(detours), len(targets), 1000.0 * (time.time() - t0))  # wall clock: compute time
         return detours, targets
 
     def log_detours(self, evaluations, targets):
@@ -341,7 +341,7 @@ class ObservationPlannerNode:
         with self.lock:
             if self.blocking is None:
                 return
-            eligible = self.policy.eligible_candidates(self.candidates, time.time())
+            eligible = self.policy.eligible_candidates(self.candidates, rospy.get_time())
             self.ensure_viewsheds(eligible)
             info, header = self.map_info, self.map_header
             grid = np.zeros((info.height, info.width), dtype=np.int8)
@@ -475,9 +475,9 @@ class RoadmapWorker:
                     self.load_roadmap(map_msg)
                 if objects is not None and self.tracker is not None:
                     self.update_objects(objects)
-                if self.png_dirty and time.time() - self.last_png >= self.png_min_interval_s:
+                if self.png_dirty and time.time() - self.last_png >= self.png_min_interval_s:  # wall clock: CPU throttle
                     self.write_png()
-                if self.detour_png_dirty and time.time() - self.last_detour_png >= self.detour_png_min_interval_s:
+                if self.detour_png_dirty and time.time() - self.last_detour_png >= self.detour_png_min_interval_s:  # wall clock: CPU throttle
                     self.write_detour_png()
             except Exception:  # keep the worker alive; the policy falls back to importance 1
                 rospy.logerr("observation_planner: importance worker failed:\n%s", traceback.format_exc())
@@ -494,7 +494,7 @@ class RoadmapWorker:
         fp = map_fingerprint(data, info.width, info.height, info.resolution, origin, self.roadmap_params)
         if fp == self.fingerprint:
             return  # same static map: keep the roadmap and every computed importance
-        t0 = time.time()
+        t0 = time.time()  # wall clock: compute time
         roadmap, cached = load_or_build_roadmap(
             data, info.width, info.height, info.resolution, origin, self.roadmap_params, self.cache_dir
         )
@@ -516,7 +516,7 @@ class RoadmapWorker:
         rospy.loginfo(
             "observation_planner: roadmap %d nodes, %d edges (%s, %.1f s)%s",
             roadmap.graph.number_of_nodes(), roadmap.graph.number_of_edges(),
-            "cached" if cached else "built", time.time() - t0, trips_info,
+            "cached" if cached else "built", time.time() - t0, trips_info,  # wall clock: compute time
         )
         self.publish_roadmap(msg.header.frame_id or "map")
 
@@ -550,7 +550,7 @@ class RoadmapWorker:
                               title="Obstacle importance (%s)" % time.strftime("%Y-%m-%d %H:%M:%S"))
         write_results_json(os.path.splitext(self.png_path)[0] + ".json", results, objects)
         self.png_dirty = False
-        self.last_png = time.time()
+        self.last_png = time.time()  # wall clock: CPU throttle
         rospy.loginfo_throttle(60, "observation_planner: wrote %s" % self.png_path)
 
     def write_detour_png(self):
@@ -569,7 +569,7 @@ class RoadmapWorker:
                           visible=visible,
                           title="Observation detours (%s)" % time.strftime("%Y-%m-%d %H:%M:%S"))
         write_detours_json(os.path.splitext(self.detour_png_path)[0] + ".json", detours, evaluations, visible)
-        self.last_detour_png = time.time()
+        self.last_detour_png = time.time()  # wall clock: CPU throttle
 
     # ---------- RViz ----------
 

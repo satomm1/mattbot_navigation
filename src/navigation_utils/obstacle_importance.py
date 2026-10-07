@@ -322,7 +322,7 @@ class ImportanceEvaluator:
 
     def evaluate(self, obstacle_id, coarse_cells=None, fine_cells=None, polygon=None, square=None):
         """ImportanceResult for one obstacle footprint (see edge_blocking.footprint_cells)."""
-        t0 = time.time()
+        t0 = time.time()  # wall clock: compute time
         B = self.blocked_edges_for(coarse_cells=coarse_cells, fine_cells=fine_cells, polygon=polygon, square=square)
         return self.evaluate_blocked(obstacle_id, B, t0)
 
@@ -334,11 +334,11 @@ class ImportanceEvaluator:
             del self.cache[k]
 
     def evaluate_blocked(self, obstacle_id, B, t0=None):
-        t0 = time.time() if t0 is None else t0
+        t0 = time.time() if t0 is None else t0  # wall clock: compute time
         B = frozenset(B)
         n = len(self.trips)
         if not B:
-            return ImportanceResult(0.0, 0.0, 0.0, 0.0, n, 0, B, time.time() - t0)
+            return ImportanceResult(0.0, 0.0, 0.0, 0.0, n, 0, B, time.time() - t0)  # wall clock: compute time
         key = (obstacle_id, B, self.trips_key)
         cached = self.cache.get(key)
         if cached is not None:
@@ -402,7 +402,7 @@ class ImportanceEvaluator:
             num_trips=n,
             num_affected=int(hit.sum()),
             blocked_edges=B,
-            compute_time_s=time.time() - t0,
+            compute_time_s=time.time() - t0,  # wall clock: compute time
         )
 
     def _discovery_delta(self, weight, memo, B, s, t, d0, delta_k):

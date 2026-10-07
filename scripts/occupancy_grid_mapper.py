@@ -543,7 +543,7 @@ class Map:
         (camera_x, camera_y) = self.new_map_as_np.snap_to_grid((camera_location[0], camera_location[1]))
         (camera_x_indx, camera_y_indx) = self.new_map_as_np.get_index((camera_x, camera_y))
 
-        t21 = time.time()
+        t21 = time.time()  # wall clock: compute time
         # print("Preprocessing TIme: ", t21 - t2)
 
         # Get perceptual field of the camera
@@ -559,7 +559,7 @@ class Map:
             #     perceptual_field_indx.extend(field)
             perceptual_field_indx.extend(field)
 
-        t22 = time.time()
+        t22 = time.time()  # wall clock: compute time
         # print("Perceptual Field Time: ", t22 - t21)
 
         # Get footprint of the robot
@@ -581,7 +581,7 @@ class Map:
         robot_outline_x_indx = robot_outline_x_indx.astype(int)
         robot_outline_y_indx = robot_outline_y_indx.astype(int)        
 
-        t23 = time.time()
+        t23 = time.time()  # wall clock: compute time
         # print("Robot Outline Time: ", t23 - t22)
 
         # Remove points that are behind another point
@@ -649,7 +649,7 @@ class Map:
         indx = np.where(np.logical_and(r < self.no_see_radius, r_objects[k] >= self.no_see_radius))[0]
         l[indx] = 0
         
-        t3 = time.time()
+        t3 = time.time()  # wall clock: compute time
         # print("final processing time: ", t3 - t23)
 
         self.new_map_as_np.l[perceptual_field_indx[:, 1].astype(int), perceptual_field_indx[:, 0].astype(int)] += l 

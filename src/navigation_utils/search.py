@@ -168,7 +168,7 @@ class AStar(object):
     def solve(self, step_resolution=1):
         time_limit = self.max_plan_time_sec
 
-        t_start = time.time()
+        t_start = time.time()  # wall clock: time_limit is a compute budget
         while self.priority_queue:
             current_cost, x_current = heapq.heappop(self.priority_queue)
 
@@ -177,12 +177,12 @@ class AStar(object):
                 continue
 
             if x_current == self.x_goal:
-                t_end = time.time()
+                t_end = time.time()  # wall clock: compute time
                 self.path = self.reconstruct_path()
                 print(f"A* found a path in {t_end - t_start:.2f} seconds.")
                 return True
 
-            if time.time() - t_start > time_limit:
+            if time.time() - t_start > time_limit:  # wall clock: compute budget
                 print("A* took too long.")
                 return False
 

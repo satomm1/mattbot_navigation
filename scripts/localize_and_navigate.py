@@ -355,7 +355,7 @@ class Navigator:
         self._observe_target = None  # (object_id, x, y) being looked at
         self._observe_heading = 0.0
         self._observe_phase_start = None  # rospy.Time
-        self._observe_window_start = 0.0  # wall time
+        self._observe_window_start = 0.0  # ROS time
         self._observe_resuming = False  # set while leaving OBSERVE_* normally
         self._observed_this_goal = set()  # object ids checked for the current goal
         self._observe_goal = None  # goal the set above belongs to
@@ -367,7 +367,7 @@ class Navigator:
         self.observe_detour_timeout_factor = float(rospy.get_param('~observe_detour_timeout_factor', 2.0))
         self._detour = None  # {"entry", "stop", "goal", "heading", "deadline"} while a detour is active
         self._detour_skipped = set()  # detour objects given up on for the current goal
-        self._aligned_since = None  # wall time when post-align dwell started (before TRACK)
+        self._aligned_since = None  # ROS time when post-align dwell started (before TRACK)
         self.start_pos_thresh = (
             0.2  # threshold to be far enough into the plan to recompute it
         )
@@ -888,7 +888,9 @@ class Navigator:
             )
 
     def odom_callback(self, msg):
-        t = rospy.get_rostime().to_sec()
+        # Time of the measurement, not of this callback: under CPU load (or faster-than-real-time
+        # simulation) callbacks run late and in bursts
+        t = msg.header.stamp.to_sec() or rospy.get_rostime().to_sec()
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
         self._odom_history.append((t, x, y))
@@ -909,6 +911,10 @@ class Navigator:
         if abs(self._last_cmd_linear) < self.stall_cmd_vel_threshold:
             return False
         if len(self._odom_history) < 2:
+            return False
+        # Decide only on samples covering most of the window: after a late burst of callbacks the history
+        # can hold just a few samples milliseconds apart, which barely move even at full speed
+        if self._odom_history[-1][0] - self._odom_history[0][0] < 0.8 * self.stall_window_sec:
             return False
         xs = [e[1] for e in self._odom_history]
         ys = [e[2] for e in self._odom_history]
@@ -1871,7 +1877,7 @@ class Navigator:
         """
         if self._observe_target is not None:
             _nav_loginfo("Observation of %s aborted", self._observe_target[0])
-            self._publish_observation_event(ObservationEvent.ABORTED, window_end=time.time())
+            self._publish_observation_event(ObservationEvent.ABORTED, window_end=rospy.get_time())
         self._observe_target = None
         self._observe_stop = None
         self._observe_queue = []
@@ -1881,16 +1887,16 @@ class Navigator:
         elapsed = (rospy.get_rostime() - self._observe_phase_start).to_sec()
         if self.mode == Mode.OBSERVE_TURN:
             if abs(wrapToPi(self.theta - self._observe_heading)) < self.theta_goal_thresh:
-                self._observe_window_start = time.time()
+                self._observe_window_start = rospy.get_time()
                 self._observe_phase_start = rospy.get_rostime()
                 self._publish_observation_event(ObservationEvent.STARTED)
                 self.switch_mode(Mode.OBSERVE_DWELL)
             elif elapsed > self.observe_turn_timeout_s:
                 _nav_loginfo("Observation turn to %s timed out; skipping", self._observe_target[0])
-                self._publish_observation_event(ObservationEvent.ABORTED, window_end=time.time())
+                self._publish_observation_event(ObservationEvent.ABORTED, window_end=rospy.get_time())
                 self._finish_observation_target(done=False)
         elif self.mode == Mode.OBSERVE_DWELL and elapsed >= self.observe_dwell_s:
-            self._publish_observation_event(ObservationEvent.ENDED, window_end=time.time())
+            self._publish_observation_event(ObservationEvent.ENDED, window_end=rospy.get_time())
             self._finish_observation_target(done=True)
 
     def _finish_observation_target(self, done):
@@ -1940,7 +1946,7 @@ class Navigator:
             "stop": stop,
             "goal": (self.x_g, self.y_g, self.theta_g),
             "heading": heading,
-            "deadline": time.time() + self.observe_detour_timeout_factor * float(stop.cost_s) + 20.0,
+            "deadline": rospy.get_time() + self.observe_detour_timeout_factor * float(stop.cost_s) + 20.0,
         }
         _nav_loginfo(
             "Detour to (%.2f, %.2f) to check %s (est. %.0f s)", stop.x, stop.y, "+".join(stop.object_ids), stop.cost_s
@@ -2187,7 +2193,7 @@ class Navigator:
                         self._start_detour()
                     else:
                         self._start_observation_stop()
-                elif self._detour is not None and time.time() > self._detour["deadline"]:
+                elif self._detour is not None and rospy.get_time() > self._detour["deadline"]:
                     self._abandon_detour("took too long")
                 elif(not self.path_still_valid(self.current_plan)):
                     # Path no longer valid ---> replan
@@ -2457,5 +2463,8 @@ class Navigator:
 if __name__ == "__main__":
     nav = Navigator()
     rospy.on_shutdown(nav.shutdown_callback)
-    time.sleep(3)  # Give time for everything to set up
-    nav.run()  # run the main loop
+    time.sleep(3)  # wall clock: give time for everything to set up
+    try:
+        nav.run()  # run the main loop
+    except rospy.ROSInterruptException:
+        pass  # shutdown while sleeping (with simulated time the clock may stop first)
