@@ -121,24 +121,30 @@ class DetourPlanner:
 
     # ---------- Path ----------
 
+    def snap_nodes(self, points_xy, snap_radius_m):
+        """C-space node per world point (N, 2): its own cell, else the nearest node within
+        snap_radius_m (e.g. a point inside the inflation margin), else -1."""
+        points_xy = np.asarray(points_xy, dtype=float).reshape(-1, 2)
+        rm = self.roadmap
+        r = np.floor((points_xy[:, 1] - rm.origin[1]) / rm.res).astype(np.int64)
+        c = np.floor((points_xy[:, 0] - rm.origin[0]) / rm.res).astype(np.int64)
+        h, w = rm.shape
+        ok = (r >= 0) & (r < h) & (c >= 0) & (c < w)
+        nodes = -np.ones(len(points_xy), dtype=np.int64)
+        nodes[ok] = self.node_of[r[ok], c[ok]]
+        missing = np.nonzero(nodes < 0)[0]
+        if len(missing) and self._tree is not None:
+            d, k = self._tree.query(points_xy[missing], distance_upper_bound=snap_radius_m)
+            hit = np.isfinite(d)
+            nodes[missing[hit]] = k[hit]
+        return nodes
+
     def _path_nodes(self, path_xy, snap_radius_m):
         """(node per path point or -1, metric arc length per path point)."""
         path_xy = np.asarray(path_xy, dtype=float)
         seg = np.hypot(*np.diff(path_xy, axis=0).T) if len(path_xy) > 1 else np.zeros(0)
         arc = np.concatenate([[0.0], np.cumsum(seg)])
-        rm = self.roadmap
-        r = np.floor((path_xy[:, 1] - rm.origin[1]) / rm.res).astype(np.int64)
-        c = np.floor((path_xy[:, 0] - rm.origin[0]) / rm.res).astype(np.int64)
-        h, w = rm.shape
-        ok = (r >= 0) & (r < h) & (c >= 0) & (c < w)
-        nodes = -np.ones(len(path_xy), dtype=np.int64)
-        nodes[ok] = self.node_of[r[ok], c[ok]]
-        missing = np.nonzero(nodes < 0)[0]
-        if len(missing) and self._tree is not None:  # e.g. start inside the inflation margin
-            d, k = self._tree.query(path_xy[missing], distance_upper_bound=snap_radius_m)
-            hit = np.isfinite(d)
-            nodes[missing[hit]] = k[hit]
-        return nodes, arc
+        return self.snap_nodes(path_xy, snap_radius_m), arc
 
     @staticmethod
     def project_to_path(points, path_xy, arc):

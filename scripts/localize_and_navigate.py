@@ -437,8 +437,9 @@ class Navigator:
         )
         self.nav_vel_pub = rospy.Publisher("/cmd_vel_mux/input/nav_vel", Twist, queue_size=10)
 
-        #Publishes current state of robot (IDLE, ALIGN, etc)
-        self.state_pub = rospy.Publisher("/robot_mode", Int32, queue_size=10)
+        #Publishes current state of robot (IDLE, ALIGN, etc). Latched: it is only published on a mode
+        # change, so late subscribers (e.g. observation_planner's scout idle check) need the last value
+        self.state_pub = rospy.Publisher("/robot_mode", Int32, queue_size=10, latch=True)
 
         self.waypoint_pub = rospy.Publisher("/waypoints", MarkerArray, queue_size=10)
         if self.use_social_astar:

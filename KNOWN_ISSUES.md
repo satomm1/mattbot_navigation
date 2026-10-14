@@ -115,3 +115,19 @@ Code references are relative to `mattbot_navigation/` unless another package is 
 
 - **The example numbers come from simulation.** They are from one offline run and one simulated run with an idealized robot (north corridor: predicted 13.8 m extra, driven 13 m). Replace them with robot results or label them as simulation.
 - **State the assumptions.** The discovery-cost assumption (5.6), N as a tuned constant (3.1), fixed q (3.2), the lack of coordination (3.5) and the one-detour limit (3.6) should be listed as limitations.
+
+## 10. Scout re-observation (`src/navigation_utils/scout.py`, `observation_planner.py` scouts)
+
+Only the decision exists (`/observation/scout`). Started on 2026-10-13. Most items are deliberately deferred.
+
+| # | Sev | Issue | Possible fix |
+|---|---|---|---|
+| 10.1 | **High** | **Nothing executes a scout.** `ScoutDecision.go` is published, but the navigator never drives one. `ObservationStop.SCOUT` and the policy's `RETURN` resume mode are placeholders. | Let the navigator take the chosen viewpoint as a goal when it has none, observe as at a detour viewpoint, then return (or stay) as the cost model assumed. |
+| 10.2 | Med | **The cost model has no tuned values.** `TravelTimeScoutCost` counts out-and-back driving, turning and looking, plus an opportunity cost `v·(fixed_s + per_s_away·T_away)`. Both opportunity parameters are 0 until calibrated, so a scout currently costs only its physical driving and looking. Battery is ignored. | Calibrate `fixed_s` and `per_s_away` once scouts run (e.g. `per_s_away` from the mission rate × the cost of a delayed mission). Add battery if needed. |
+| 10.3 | **High** | **No fleet coordination.** Every idle robot decides for itself, so several can choose the same object. There are no claims, and the nearest idle robot is not preferred. This extends 3.5. | Broadcast a short-lived claim through the ledger or DDS before leaving. Or let robots compare their `ScoutDecision`s (it carries `robot_id`, and `/observation/scout_query` evaluates any pose). |
+| 10.4 | Med | `ThresholdPolicy.covered_elsewhere` is a stub (always False). A scout may go for an object that a peer's planned path, or this robot's next patrol leg, will see anyway. | Check peers' paths (`/path_from_agent`) against the object's viewshed, and pending patrol goals. |
+| 10.5 | Med | "Idle" means `/robot_mode` has been IDLE for `~scout_min_idle_s` (10 s). That covers both "no goal" and "goal failed". It also covers a patrol robot waiting at a waypoint: after parking, the navigator clears the goal and goes IDLE, so a wait longer than 10 s counts as idle even though `patrol.py` will send the next point. Multi-agent missions are not considered. | Use an explicit "no goal and none pending" signal, and decide whether waits between patrol points should count. |
+| 10.6 | Med | N and q are constants (`~scout_n_trips`, `~scout_conclusive_prob`), as for detours (3.1, 3.2). | Same fixes as 3.1 and 3.2. |
+| 10.7 | Low | The detour grid's limitations apply: static C-space only (4.1), round versus square footprint (4.2), optimistic coarse viewpoint cells (4.3), 8-connected distances (4.4), and `/map_mod` ignored (5.1). If the robot's cell is not in C-space within 0.5 m, no scouts are computed. | Same fixes as the referenced items. |
+| 10.8 | Low | Cooldown and per-goal exclusion are shared with opportunistic stops and detours (`last_checked`). Objects abandoned by a detour are not excluded from scouts. | Decide once scouts are executed. |
+| 10.9 | Low | There is no scout PNG or offline tool like `plot_observation_detours.py`; only RViz markers and log lines. | Reuse `importance_viz.render_detour_png` with the routes in `ScoutResult.route_xy`. |

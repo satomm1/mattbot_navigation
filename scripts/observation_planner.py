@@ -24,6 +24,16 @@ beats its cost, V - C > ~detour_margin_m (observation_policy.py), and the naviga
           /observation/detours     MarkerArray: detour viewpoints, routes and extra distances
           ~detour_png_path         PNG of the last request's detours (+ .json)
 
+With ~scout_enabled (implies importance), a robot that has been IDLE (/robot_mode) for
+~scout_min_idle_s evaluates every ~scout_period_s whether to go out only to check objects, from its
+pose (TF map -> base_footprint): drive to an object's nearest viewpoint, look, and (cost model
+permitting) come back (navigation_utils/scout.py). A scout is worth sending if V - C > ~scout_margin_m,
+with C from the ~scout_cost_model (observation_policy.py). Decision only: nothing drives it yet.
+Extra outputs:
+          /observation/scout          ScoutDecision (latched): candidates, V, C, go
+          /observation/scout_markers  MarkerArray: scout viewpoints and routes
+Service:  /observation/scout_query    (mattbot_dds/EvaluateScout) evaluate from any pose
+
 Geometry is in navigation_utils/viewpoints.py, the check policy in observation_policy.py.
 """
 
@@ -35,16 +45,19 @@ import traceback
 
 import numpy as np
 import rospy
-from geometry_msgs.msg import Point
+import tf
+from geometry_msgs.msg import Point, Pose2D
 from nav_msgs.msg import OccupancyGrid
+from std_msgs.msg import Int32
 from visualization_msgs.msg import Marker, MarkerArray
-from mattbot_dds.msg import ObjectBeliefArray, ObservationEvent, ObservationStop
-from mattbot_dds.srv import SelectObservations, SelectObservationsResponse
+from mattbot_dds.msg import ObjectBeliefArray, ObservationEvent, ObservationStop, ScoutCandidate, ScoutDecision
+from mattbot_dds.srv import EvaluateScout, EvaluateScoutResponse, SelectObservations, SelectObservationsResponse
 
 from navigation_utils.observation_policy import Candidate, ThresholdPolicy
 from navigation_utils.viewpoints import blocking_mask, compute_viewshed, nearby_blockers
 
 RECOMPUTE_MOVE_M = 0.2  # recompute an object's viewshed if it moves further than this
+MODE_IDLE = 0  # /robot_mode value of localize_and_navigate Mode.IDLE
 
 
 class _RospyLogHandler(logging.Handler):
@@ -83,9 +96,10 @@ class ObservationPlannerNode:
         self.policy.cruise_speed = float(rospy.get_param("/cruising_velocity", 0.4))
         importance_enabled = bool(rospy.get_param("~importance_enabled", False))
         self.detour_enabled = bool(rospy.get_param("~detour_enabled", False))
-        self.importance = None  # RoadmapWorker (roadmap of /map, importance, detour planner)
-        if importance_enabled or self.detour_enabled:  # detours need I_o
-            self.importance = RoadmapWorker(True, self.detour_enabled)
+        self.scout_enabled = bool(rospy.get_param("~scout_enabled", False))
+        self.importance = None  # RoadmapWorker (roadmap of /map, importance, detour / scout planners)
+        if importance_enabled or self.detour_enabled or self.scout_enabled:  # detours and scouts need I_o
+            self.importance = RoadmapWorker(True, self.detour_enabled, self.scout_enabled)
             self.policy.importance_fn = self.importance.importance_of
             self.policy.importance_m_fn = self.importance.importance_m_of
         self.detour_params = None
@@ -124,6 +138,8 @@ class ObservationPlannerNode:
         rospy.Service("/observation/select", SelectObservations, self.select_srv)
         rospy.Timer(rospy.Duration(2.0), self.viz_timer)
         rospy.Timer(rospy.Duration(30.0), self.health_timer)
+        if self.scout_enabled:
+            self.init_scout()
 
     # ---------- Inputs ----------
 
@@ -252,24 +268,31 @@ class ObservationPlannerNode:
         planner = self.importance.detour_planner
         if planner is None:
             return None, {}
-        targets = {}
-        for c in dcands:
-            d_star = self.policy.max_detour_m(c)
-            if d_star <= 0:
-                continue  # not worth any detour (just seen, or blocks nothing): no search
-            vs = views[c.object_id]
-            cached = self.viewpoints.get(c.object_id)
-            if cached is None or cached[0] is not vs or cached[1] is not planner:
-                cached = (vs, planner, planner.viewpoint_nodes(vs))
-                self.viewpoints[c.object_id] = cached
-            targets[c.object_id] = (c.x, c.y, cached[2], d_star)
-        for oid in [oid for oid in self.viewpoints if oid not in self.viewsheds]:
-            del self.viewpoints[oid]
+        targets = self._viewpoint_targets(planner, dcands, views, self.policy.max_detour_m)
         t0 = time.time()  # wall clock: compute time
         detours = planner.compute(path_xy, targets, self.detour_params)
         rospy.logdebug("observation_planner: %d detour(s) for %d object(s) in %.0f ms",
                        len(detours), len(targets), 1000.0 * (time.time() - t0))  # wall clock: compute time
         return detours, targets
+
+    def _viewpoint_targets(self, planner, cands, views, limit_fn):
+        """{object_id: (x, y, viewpoint nodes, limit)} for planner.compute (call with self.lock held).
+        Objects with limit_fn(c) <= 0 (not worth any driving) are left out. Viewpoint nodes are
+        cached per viewshed (detours and scouts share the grid, so they share the cache)."""
+        targets = {}
+        for c in cands:
+            limit = limit_fn(c)
+            if limit <= 0:
+                continue  # not worth any driving (just seen, or blocks nothing): no search
+            vs = views[c.object_id]
+            cached = self.viewpoints.get(c.object_id)
+            if cached is None or cached[0] is not vs or cached[1] is not planner:
+                cached = (vs, planner, planner.viewpoint_nodes(vs))
+                self.viewpoints[c.object_id] = cached
+            targets[c.object_id] = (c.x, c.y, cached[2], limit)
+        for oid in [oid for oid in self.viewpoints if oid not in self.viewsheds]:
+            del self.viewpoints[oid]
+        return targets
 
     def log_detours(self, evaluations, targets):
         for ev in sorted(evaluations, key=lambda e: -e.net_m):
@@ -313,6 +336,197 @@ class ObservationPlannerNode:
                 rays.points += [Point(x=s.x, y=s.y), Point(x=c.x, y=c.y)]
             markers.markers += [m, text, rays]
         self.detours_pub.publish(markers)
+
+    # ---------- Scouts ----------
+
+    def init_scout(self):
+        from navigation_utils.observation_policy import SCOUT_COST_MODELS, ScoutValueParams
+        from navigation_utils.scout import ScoutParams
+
+        max_scout_m = float(rospy.get_param("~max_scout_m", 30.0))
+        self.scout_params = ScoutParams(max_scout_m=max_scout_m, r_max=self.r_max)
+        self.policy.scout_params = ScoutValueParams(
+            n_trips=float(rospy.get_param("~scout_n_trips", 5.0)),
+            conclusive_prob=float(rospy.get_param("~scout_conclusive_prob", 1.0)),
+            margin_m=float(rospy.get_param("~scout_margin_m", 0.0)),
+            max_scouts=int(rospy.get_param("~max_scouts", 1)),
+            hard_cap_m=max_scout_m,
+        )
+        # Pluggable cost: ~scout_cost_model names a ScoutCostModel, ~scout_cost_params are its kwargs
+        name = str(rospy.get_param("~scout_cost_model", "travel_time"))
+        if name not in SCOUT_COST_MODELS:
+            rospy.logwarn("observation_planner: unknown scout cost model %r (have %s); using travel_time",
+                          name, ", ".join(sorted(SCOUT_COST_MODELS)))
+            name = "travel_time"
+        params = dict(rospy.get_param("~scout_cost_params", {}))
+        try:
+            self.policy.scout_cost = SCOUT_COST_MODELS[name](**params)
+        except TypeError as exc:
+            rospy.logerr("observation_planner: bad ~scout_cost_params %s for %s (%s); using its defaults",
+                         params, name, exc)
+            self.policy.scout_cost = SCOUT_COST_MODELS[name]()
+            params = {}
+        self.scout_min_idle_s = float(rospy.get_param("~scout_min_idle_s", 10.0))
+        try:
+            self.robot_id = int(os.environ.get("ROBOT_ID", "-1"))
+        except ValueError:
+            self.robot_id = -1
+        self.idle_since = None  # ROS time /robot_mode became IDLE (None = not idle or unknown)
+        self.robot_mode = None
+        self.last_scout_published_idle = None
+        self.last_scout_log = None  # signature of the last logged periodic decision
+        self.tf_listener = tf.TransformListener()
+
+        self.scout_pub = rospy.Publisher("/observation/scout", ScoutDecision, queue_size=1, latch=True)
+        self.scout_markers_pub = rospy.Publisher("/observation/scout_markers", MarkerArray, queue_size=1, latch=True)
+        rospy.Subscriber("/robot_mode", Int32, self.robot_mode_callback, queue_size=10)
+        rospy.Service("/observation/scout_query", EvaluateScout, self.scout_query_srv)
+        rospy.Timer(rospy.Duration(float(rospy.get_param("~scout_period_s", 5.0))), self.scout_timer)
+        rospy.loginfo("observation_planner: scouts on (cost model %s %s, idle >= %.0f s)",
+                      name, params, self.scout_min_idle_s)
+
+    def robot_mode_callback(self, msg):
+        with self.lock:
+            if msg.data != MODE_IDLE:
+                self.idle_since = None
+            elif self.robot_mode != MODE_IDLE:
+                self.idle_since = rospy.get_time()
+            self.robot_mode = msg.data
+
+    def robot_pose(self):
+        """Robot pose in the local map frame (same TF lookup as the navigator), or None."""
+        try:
+            trans, rot = self.tf_listener.lookupTransform("/map", "/base_footprint", rospy.Time(0))
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+            return None
+        return Pose2D(x=trans[0], y=trans[1], theta=tf.transformations.euler_from_quaternion(rot)[2])
+
+    def scout_timer(self, _event):
+        """Periodic decision: evaluate scouts from the robot's pose while it is idle."""
+        now = rospy.get_time()
+        with self.lock:
+            idle = self.idle_since is not None and now - self.idle_since >= self.scout_min_idle_s
+        if not idle:
+            if self.last_scout_published_idle is not False:  # replace a stale "go" on the latched topic
+                decision, _ev = self.evaluate_scout(Pose2D(), require_idle=True, search=False)
+                self.scout_pub.publish(decision)
+                self.publish_scout_markers([])
+                self.last_scout_published_idle = False
+                self.last_scout_log = None
+            return
+        pose = self.robot_pose()
+        if pose is None:
+            rospy.logwarn_throttle(60, "observation_planner: no map -> base_footprint TF; no scout decision")
+            return
+        decision, evaluations = self.evaluate_scout(pose, require_idle=True)
+        self.scout_pub.publish(decision)
+        self.publish_scout_markers(evaluations)
+        self.last_scout_published_idle = True
+        signature = tuple((tuple(ev.object_ids), ev.chosen) for ev in evaluations)
+        if signature != self.last_scout_log:  # log on change only: an idle robot re-evaluates every period
+            self.last_scout_log = signature
+            self.log_scouts(evaluations)
+
+    def scout_query_srv(self, req):
+        """Evaluate from any pose; the periodic /observation/scout decision is left alone."""
+        decision, evaluations = self.evaluate_scout(req.start, req.require_idle)
+        self.publish_scout_markers(evaluations)
+        self.log_scouts(evaluations)
+        return EvaluateScoutResponse(decision=decision)
+
+    def evaluate_scout(self, start, require_idle, search=True):
+        """(ScoutDecision, ObservationEvaluations best net first) for scouts from start (Pose2D).
+        With require_idle, nothing is chosen unless the robot is idle."""
+        now = rospy.get_time()
+        decision = ScoutDecision(robot_id=self.robot_id, start=start, cost_model=self.policy.scout_cost.name)
+        decision.header.stamp = rospy.Time.now()
+        decision.header.frame_id = "map"
+        evaluations = []
+        with self.lock:
+            idle_s = now - self.idle_since if self.idle_since is not None else 0.0
+            decision.idle = self.idle_since is not None and idle_s >= self.scout_min_idle_s
+            decision.idle_s = idle_s
+            scout = self.importance.scout_planner
+            if search and self.blocking is not None and scout is not None:
+                eligible = [c for c in self.candidates if self.policy.scout_eligible(c, now)]
+                self.ensure_viewsheds(eligible)
+                views = {oid: vs for oid, (vs, _sig) in self.viewsheds.items()}
+                targets = self._viewpoint_targets(scout.grid, eligible, views, self.policy.max_scout_m)
+                results = scout.compute((start.x, start.y), targets, self.scout_params, start_heading=start.theta)
+                _chosen, evaluations = self.policy.scout_options(
+                    (start.x, start.y), self.candidates, views, now, (), results
+                )
+        if require_idle and not decision.idle:
+            for ev in evaluations:
+                ev.chosen = False
+        evaluations.sort(key=lambda e: -e.net_m)
+        for ev in evaluations:
+            s, r = ev.option.stop, ev.source
+            parts = ev.breakdown
+            decision.candidates.append(ScoutCandidate(
+                object_ids=ev.object_ids,
+                targets=[Point(x=c.x, y=c.y) for c in ev.option.candidates],
+                beliefs=[c.belief for c in ev.option.candidates],
+                values_m=ev.values_m,
+                x=s.x, y=s.y, heading=s.heading,
+                to_view_m=r.to_view_m, return_m=r.return_m,
+                value_m=ev.value_m, cost_m=ev.cost_m, net_m=ev.net_m,
+                opportunity_m=parts.get("fixed_m", 0.0) + parts.get("away_m", 0.0),
+                t_away_s=parts.get("t_away_s", 0.0),
+                chosen=ev.chosen, blocked=ev.blocked,
+            ))
+        decision.go = any(ev.chosen for ev in evaluations)
+        return decision, evaluations
+
+    def log_scouts(self, evaluations):
+        if not evaluations:
+            rospy.loginfo("observation_planner: no scout candidates")
+        for ev in evaluations:
+            parts = ev.breakdown
+            rospy.loginfo(
+                "observation_planner: scout %s: %.1f m away, V=%.1f m, C=%.1f m (opp=%.1f m, away=%.0f s) -> %s",
+                "+".join(ev.object_ids), ev.detour_m, ev.value_m, ev.cost_m,
+                parts.get("fixed_m", 0.0) + parts.get("away_m", 0.0), parts.get("t_away_s", 0.0),
+                "GO" if ev.chosen else "skip",
+            )
+
+    def publish_scout_markers(self, evaluations, frame_id="map"):
+        markers = MarkerArray(markers=[Marker(action=Marker.DELETEALL)])
+        for k, ev in enumerate(evaluations):
+            s = ev.option.stop
+            rgb = (0.1, 0.8, 0.3) if ev.chosen else (0.6, 0.6, 0.6)
+            m = Marker(ns="scout_viewpoints", id=k, type=Marker.SPHERE, action=Marker.ADD)
+            m.header.frame_id = frame_id
+            m.pose.position.x, m.pose.position.y = s.x, s.y
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = 0.25
+            m.color.r, m.color.g, m.color.b = rgb
+            m.color.a = 1.0
+            text = Marker(ns="scout_text", id=k, type=Marker.TEXT_VIEW_FACING, action=Marker.ADD)
+            text.header.frame_id = frame_id
+            text.pose.position.x, text.pose.position.y, text.pose.position.z = s.x, s.y, 0.5
+            text.pose.orientation.w = 1.0
+            text.scale.z = 0.22
+            text.color.r = text.color.g = text.color.b = text.color.a = 1.0
+            text.text = "scout %s %.1f m V=%.1f C=%.1f %s" % (
+                "+".join(ev.object_ids), ev.detour_m, ev.value_m, ev.cost_m, "GO" if ev.chosen else "skip")
+            route = Marker(ns="scout_routes", id=k, type=Marker.LINE_STRIP, action=Marker.ADD)
+            route.header.frame_id = frame_id
+            route.pose.orientation.w = 1.0
+            route.scale.x = 0.04
+            route.color.r, route.color.g, route.color.b = rgb
+            route.color.a = 0.8
+            route.points = [Point(x=float(x), y=float(y)) for x, y in ev.source.route_xy]
+            rays = Marker(ns="scout_rays", id=k, type=Marker.LINE_LIST, action=Marker.ADD)
+            rays.header.frame_id = frame_id
+            rays.pose.orientation.w = 1.0
+            rays.scale.x = 0.03
+            rays.color.r, rays.color.g, rays.color.b = rgb
+            rays.color.a = 0.8
+            for c in ev.option.candidates:
+                rays.points += [Point(x=s.x, y=s.y), Point(x=c.x, y=c.y)]
+            markers.markers += [m, text, rays] + ([route] if len(route.points) >= 2 else [])
+        self.scout_markers_pub.publish(markers)
 
     # ---------- Visualization ----------
 
@@ -364,9 +578,10 @@ class RoadmapWorker:
     roadmap, once, and again only if its footprint cells change (ObjectImportanceTracker).
     """
 
-    def __init__(self, importance_enabled=True, detour_enabled=False):
+    def __init__(self, importance_enabled=True, detour_enabled=False, scout_enabled=False):
         self.importance_enabled = importance_enabled
         self.detour_enabled = detour_enabled
+        self.scout_enabled = scout_enabled
         from navigation_utils.edge_blocking import BlockingParams
         from navigation_utils.obstacle_importance import ImportanceParams
         from navigation_utils.roadmap import DEFAULT_CACHE_DIR, RoadmapParams
@@ -401,6 +616,8 @@ class RoadmapWorker:
         )
         self.detour_png_min_interval_s = float(rospy.get_param("~detour_png_min_interval_s", 10.0))
         self.detour_planner = None
+        # Shares the detour planner's grid. TODO: a scout PNG (cf. importance_viz.render_detour_png).
+        self.scout_planner = None
         self.detour_snapshot = None  # (path_xy, detours, targets, options) of the last request
         self.detour_png_dirty = False
         self.last_detour_png = 0.0
@@ -499,10 +716,14 @@ class RoadmapWorker:
             data, info.width, info.height, info.resolution, origin, self.roadmap_params, self.cache_dir
         )
         self.map_msg, self.fingerprint, self.roadmap = msg, fp, roadmap
-        if self.detour_enabled:
+        if self.detour_enabled or self.scout_enabled:
             from navigation_utils.detour import DetourPlanner
 
             self.detour_planner = DetourPlanner(roadmap)
+        if self.scout_enabled:
+            from navigation_utils.scout import ScoutPlanner
+
+            self.scout_planner = ScoutPlanner(self.detour_planner)
         trips_info = ""
         if self.importance_enabled:
             trips = build_trip_set(roadmap, self.importance_params)

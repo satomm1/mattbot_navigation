@@ -21,6 +21,18 @@
   <arg name="observe_max_detour_m" default="15.0"/>
   <arg name="observe_detour_n_trips" default="5"/>
   <arg name="observe_detour_margin_m" default="0.0"/>
+  <!-- Scouts: while the robot is idle, decide whether to drive out only to re-check an object
+       (observation_planner publishes /observation/scout; decision only, nothing drives it yet). -->
+  <arg name="observe_scout" default="false"/>
+  <arg name="observe_max_scout_m" default="30.0"/>
+  <arg name="observe_scout_n_trips" default="5"/>
+  <arg name="observe_scout_margin_m" default="0.0"/>
+  <arg name="observe_scout_min_idle_s" default="10.0"/>
+  <arg name="observe_scout_cost_model" default="travel_time"/>
+  <!-- travel_time cost: out (and back) + turn and dwell + v * (fixed_s + per_s_away * time away) -->
+  <arg name="observe_scout_round_trip" default="true"/>
+  <arg name="observe_scout_fixed_s" default="0.0"/>
+  <arg name="observe_scout_per_s_away" default="0.0"/>
   <arg name="tall"   default="true"  />
   <arg name="car"    default="false" />
 
@@ -87,6 +99,13 @@
     <param name="max_detour_m" value="$(arg observe_max_detour_m)"/>
     <param name="detour_n_trips" value="$(arg observe_detour_n_trips)"/>
     <param name="detour_margin_m" value="$(arg observe_detour_margin_m)"/>
+    <param name="scout_enabled" value="$(arg observe_scout)"/>
+    <param name="max_scout_m" value="$(arg observe_max_scout_m)"/>
+    <param name="scout_n_trips" value="$(arg observe_scout_n_trips)"/>
+    <param name="scout_margin_m" value="$(arg observe_scout_margin_m)"/>
+    <param name="scout_min_idle_s" value="$(arg observe_scout_min_idle_s)"/>
+    <param name="scout_cost_model" value="$(arg observe_scout_cost_model)"/>
+    <rosparam param="scout_cost_params" subst_value="true">{round_trip: $(arg observe_scout_round_trip), fixed_s: $(arg observe_scout_fixed_s), per_s_away: $(arg observe_scout_per_s_away)}</rosparam>
   </node>
 
   <!-- Launch the patrol.py script only if patrol is true -->

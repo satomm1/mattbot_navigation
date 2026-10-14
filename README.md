@@ -40,7 +40,24 @@ rosrun mattbot_navigation plot_obstacle_importance.py --map $(rospack find mattb
 python3 -m pytest mattbot_navigation/test               # from src/
 ```
 
-Known limitations and open issues of importance, detours and the re-check policy are tracked in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+### Scout re-observation (decision only)
+
+`navigation_utils/scout.py`: a robot with **no goal of its own** drives out only to check an object. It shares the detour C-space grid; one Dijkstra from the robot gives the distance to every object's nearest viewpoint (`to_view_m`; `return_m` back to the start is the same on the symmetric grid). The value is the detour V with its own N and q (`~scout_n_trips`, `~scout_conclusive_prob`). The cost C comes from a pluggable `ScoutCostModel` (`observation_policy.py`), selected by name with `~scout_cost_model` and built with the kwargs in `~scout_cost_params`. The default model `travel_time` adds the opportunity cost of being away to the physical cost, all in metres (times converted at `v_cruise`):
+
+```
+travel = to_view (+ return if round_trip)          T_away = travel / v + turn / turn_rate + dwell * n   (s)
+C      = travel + v * (turn / turn_rate + dwell * n) + v * fixed_s + v * per_s_away * T_away
+```
+
+`fixed_s` is the cost of committing to a scout at all and `per_s_away` the cost per second the robot is unavailable (both 0 until calibrated; launch args `observe_scout_fixed_s`, `observe_scout_per_s_away`, and `observe_scout_round_trip` in the navigation launch files). Objects are searched only up to the distance at which even the cheapest scout (one target, no turn) costs V. A scout is worth sending if `V - C > ~scout_margin_m`, at most `~max_scouts` (default 1) per evaluation. Each `ScoutCandidate` reports `opportunity_m` and `t_away_s`.
+
+With `observe_scout:=true` (needs `ledger:=true observe:=true`; turns on importance and, by default, `ledger_blockout`), the observation planner evaluates scouts every `~scout_period_s` (5 s) once `/robot_mode` has been IDLE for `~scout_min_idle_s` (10 s), from the TF pose `map -> base_footprint`. **Nothing drives a scout yet.** Outputs: `/observation/scout` (`mattbot_dds/ScoutDecision`, latched: every candidate with V, C, GO/skip, and `go`) and `/observation/scout_markers`. Evaluate from any pose with:
+
+```bash
+rosservice call /observation/scout_query "{start: {x: 2.0, y: 1.8, theta: 0.0}, require_idle: false}"
+```
+
+Known limitations and open issues of importance, detours, scouts and the re-check policy are tracked in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
 ### Launch
 
