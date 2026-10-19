@@ -12,6 +12,9 @@ class Patrol:
         self.robot_state = 0
         self.parking_time = 0
         self.ready_for_next_point = False
+        # Navigator entered PARK_POSE for the active goal; arrival is the IDLE after it (parking, the
+        # arrival observation checks and the final heading turn all done)
+        self.parking_seen = False
         self.localized = False
         # Wait before publishing the next patrol point.
         self.next_wait_sec = 0.0
@@ -51,10 +54,13 @@ class Patrol:
         return patrol_points
 
     def robot_state_callback(self, msg):
-        if msg.data == 5 and self.robot_state != 5:
+        # Modes of localize_and_navigate.Mode: IDLE = 0, PARK_POSE = 5
+        if msg.data == 5 and self.active_goal_pose is not None:
+            self.parking_seen = True
+        elif msg.data == 0 and self.parking_seen and not self.ready_for_next_point:
             self.ready_for_next_point = True
             self.parking_time = rospy.get_time()
-        
+
         self.robot_state = msg.data
 
     def localized_callback(self, msg):
@@ -77,6 +83,7 @@ class Patrol:
             elif (
                 self.active_goal_pose is not None
                 and not self.ready_for_next_point
+                and not self.parking_seen  # parking / checking at the goal: a re-send would look like a new goal
                 and (current_time - self.last_goal_pub_time) >= self.goal_repub_period_sec
             ):
                 self.republish_active_goal()
@@ -100,6 +107,7 @@ class Patrol:
         )
         self.current_index = (self.current_index + 1) % len(self.patrol_points)
         self.ready_for_next_point = False
+        self.parking_seen = False
 
     def republish_active_goal(self):
         pose = self.active_goal_pose

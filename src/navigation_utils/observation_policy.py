@@ -5,16 +5,23 @@ Every option carries a kind, an estimated cost (extra seconds) and a value per o
 so policies can trade value against cost:
 
   OPPORTUNISTIC: the stop is on the planned path; cost = turn out + dwell + turn back.
+  AT_START / AT_GOAL: the robot looks while it is stopped anyway: from its start pose before leaving
+          (first plan for a goal only) or from the park pose on arrival; cost = turn + dwell.
   DETOUR: the stop is a viewpoint off the path (navigation_utils/detour.py: leave the path, look,
           replan to the goal).
 
 Opportunistic stops (ThresholdPolicy): objects with belief <= check_below_belief that are visible
 from the path. Value = importance * (1 - belief), importance from importance_fn (the observation
-planner passes I_o) or the importance() stub.
+planner passes I_o) or the importance() stub. On-path stops are never placed within skip_start_m /
+skip_goal_m of the start / goal; an eligible object that gets no on-path stop (only visible there,
+or its stop exceeds max_cost_s) is checked from the start pose (AT_START) or the park pose (AT_GOAL)
+if it is visible from there.
 
-Detours (value of information): only for objects that are NOT visible from any point of the path
-(those are left to opportunistic stops, whatever their belief). A detour pays off if the expected
-future driving it saves exceeds what it costs now, both in metres:
+Detours (value of information): only for objects that no opportunistic or endpoint stop serves. An
+object is left to those stops if it has one now, or if its belief is still above check_below_belief
+and some point they may use (a usable path point, the start pose if allowed, the goal) sees it: it
+gets a stop once its belief has decayed. A detour pays off if the expected future driving it saves
+exceeds what it costs now, both in metres:
 
     p_gone = (1 - b) / 2                      belief b in [0, 1]: probability the object has moved
     V      = q * N * p_gone * I_o             N trips would keep avoiding it; q = P(check conclusive)
@@ -39,12 +46,16 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-from navigation_utils.viewpoints import Stop, select_stops, wrap_angle
+import numpy as np
 
-# Option kinds
+from navigation_utils.viewpoints import Stop, path_headings, select_stops, usable_points, wrap_angle
+
+# Option kinds (mattbot_dds/ObservationStop)
 OPPORTUNISTIC = 0
 DETOUR = 1
 SCOUT = 2
+AT_START = 3
+AT_GOAL = 4
 
 # How the navigator continues after the observation
 REMAINING_PATH = 0  # stop is on the current path: continue its remaining trajectory
@@ -62,6 +73,7 @@ class Candidate:
     y: float
     belief: float
     width: float = 0.5  # m; known objects also block line of sight to other objects
+    last_stamp: float = None  # latest observation (ROS time); None = belief cannot be predicted (stays `belief`)
 
 
 @dataclass
@@ -76,6 +88,7 @@ class ObservationOption:
     value_m: float = 0.0  # DETOUR / SCOUT: V, expected future driving saved (sum over targets)
     cost_m: float = 0.0  # DETOUR / SCOUT: C, cost of the check now
     leave_xy: tuple = ()  # DETOUR: where the robot leaves the path; SCOUT: the start
+    to_view_s: float = 0.0  # DETOUR: leave point -> viewpoint; SCOUT: start -> viewpoint (s at cruise speed)
 
     @property
     def net_m(self):
@@ -133,6 +146,92 @@ class ObservationEvaluation:
 
 
 DetourEvaluation = ObservationEvaluation
+
+
+def covered_ids(options):
+    """Object ids served by options (ObservationOptions)."""
+    return frozenset(c.object_id for opt in options for c in opt.candidates)
+
+
+def object_belief(age_s, hold_s, decay_s):
+    """Belief that an object last observed age_s ago is still there: 1 for hold_s, then linear decay to
+    0 over decay_s (as mattbot_dds dds_utils/belief.py object_belief; copied to avoid the dependency)."""
+    if age_s <= hold_s:
+        return 1.0
+    if decay_s <= 0 or age_s >= hold_s + decay_s:
+        return 0.0
+    return 1.0 - (age_s - hold_s) / decay_s
+
+
+def check_etas(stops, times):
+    """Seconds from now until the check of each stop (in the given order).
+
+    stops: ObservationOptions or mattbot_dds ObservationStop msgs (kind, path_index, cost_s, to_view_s);
+    times: trajectory time (s from now) at each request path point. Stops are checked in path order
+    (AT_START first, AT_GOAL last); each one delays the later ones by its cost_s:
+        AT_START 0;  on-path times[i] + delay;  DETOUR times[leave] + delay + to_view_s;  AT_GOAL times[-1] + delay
+    """
+    times = np.asarray(times, dtype=float)
+    last = len(times) - 1
+
+    def order(k):
+        s = stops[k]
+        if s.kind == AT_START:
+            return (-1, 0, k)
+        if s.kind == AT_GOAL:
+            return (last + 1, 0, k)
+        return (int(s.path_index), int(s.kind == DETOUR), k)
+
+    etas = [0.0] * len(stops)
+    delay = 0.0
+    for k in sorted(range(len(stops)), key=order):
+        s = stops[k]
+        if s.kind == AT_START:
+            eta = 0.0
+        elif s.kind == AT_GOAL:
+            eta = float(times[last]) + delay
+        else:
+            eta = float(times[min(max(int(s.path_index), 0), last)]) + delay
+            if s.kind == DETOUR:
+                eta += float(getattr(s, "to_view_s", 0.0))
+        etas[k] = eta
+        delay += float(s.cost_s)
+    return etas
+
+
+def yields_to(kind, my_eta, my_id, intents, margin_s=10.0, commit_s=15.0, committed=False, remaining_s=None):
+    """The other robot's planned check of the same object that this one gives way to, or None.
+
+    intents: other robots' intents for the object (.robot_id, .kind, .eta, .committed). Earliest check wins:
+      DETOUR: never yields once committed with remaining_s < commit_s (nearly there). Otherwise yields to a
+              check earlier by more than margin_s; within the margin a committed check beats an uncommitted
+              one, then the lower robot id wins.
+      SCOUT:  the most expensive check: yields to any non-scout check that is not later by more than
+              margin_s; against another scout, as a detour (earlier wins, the lower id within the margin).
+      Opportunistic and endpoint checks never yield (None).
+    """
+    if kind not in (DETOUR, SCOUT):
+        return None
+    if kind == DETOUR and committed and remaining_s is not None and remaining_s < commit_s:
+        return None
+    winners = []
+    for o in intents:
+        if o.robot_id == my_id:
+            continue
+        if kind == SCOUT and o.kind != SCOUT:
+            wins = o.eta <= my_eta + margin_s
+        elif o.eta < my_eta - margin_s:
+            wins = True
+        elif abs(o.eta - my_eta) <= margin_s:
+            if kind == DETOUR and bool(o.committed) != bool(committed):
+                wins = bool(o.committed)
+            else:
+                wins = o.robot_id < my_id
+        else:
+            wins = False
+        if wins:
+            winners.append(o)
+    return min(winners, key=lambda o: (o.eta, o.robot_id)) if winners else None
 
 
 def p_gone(belief):
@@ -247,6 +346,19 @@ def opportunistic_cost_s(stop, turn_rate, dwell_s):
     return total_turn / turn_rate + dwell_s * len(stop.targets)
 
 
+def endpoint_cost_s(x, y, heading_in, heading_out, targets, turn_rate, dwell_s):
+    """Extra time for an AT_START / AT_GOAL stop at (x, y): turn from heading_in through targets (with
+    .x, .y) in order, dwell at each, then turn to heading_out (the path's start heading / the goal heading).
+    Only the part beyond the turn heading_in -> heading_out the robot makes anyway is extra."""
+    if not targets:
+        return 0.0
+    turn = sweep_turn(heading_in, x, y, targets)
+    last = math.atan2(targets[-1].y - y, targets[-1].x - x)
+    turn += abs(wrap_angle(heading_out - last))
+    turn -= abs(wrap_angle(heading_out - heading_in))
+    return max(turn, 0.0) / turn_rate + dwell_s * len(targets)
+
+
 class ObservationPolicy:
     """Base policy: decides which objects are worth checking and builds options for a path."""
 
@@ -269,6 +381,10 @@ class ThresholdPolicy(ObservationPolicy):
     Each object is checked at most once per call (i.e. per path); the caller passes objects
     already checked for the current goal in `exclude`. After a check, an object is not
     eligible again for cooldown_s (perception may not have resolved it yet).
+
+    Time: with hold_s / decay_s set and candidates carrying last_stamp, every rule is evaluated at the
+    time the check would happen (belief_at): a path request with `times` plans a stop wherever the
+    object will be due when the robot gets there, and revalidate() re-applies the rules when it does.
     """
 
     def __init__(
@@ -289,7 +405,16 @@ class ThresholdPolicy(ObservationPolicy):
         detour_params=None,  # DetourValueParams
         scout_params=None,  # ScoutValueParams
         scout_cost=None,  # ScoutCostModel (default TravelTimeScoutCost)
+        hold_s=None,  # belief model (mattbot_dds object_belief_map ~hold_s / ~decay_s); None = no prediction
+        decay_s=None,
+        robot_id=None,  # this robot, for fleet coordination (None: no coordination)
+        intent_margin_s=10.0,  # yields_to margin
     ):
+        self.hold_s = hold_s
+        self.decay_s = decay_s
+        self.robot_id = robot_id
+        self.intent_margin_s = intent_margin_s
+        self.peer_intents = []  # other robots' live intents (mattbot_dds /observation/intents), set by the planner
         self.importance_fn = importance_fn
         self.importance_m_fn = importance_m_fn
         self.detour_params = detour_params or DetourValueParams()
@@ -311,30 +436,95 @@ class ThresholdPolicy(ObservationPolicy):
     def record_check(self, object_id, t):
         self.last_checked[object_id] = max(t, self.last_checked.get(object_id, t))
 
-    def eligible(self, candidate, now, exclude=()):
-        if candidate.object_id in exclude or candidate.belief > self.check_below_belief:
-            return False
+    # ---------- Belief and eligibility over time ----------
+
+    def belief_at(self, candidate, t=None):
+        """Belief at ROS time t if no new observation arrives (candidate.belief without a model or t)."""
+        if t is None or candidate.last_stamp is None or self.hold_s is None or self.decay_s is None:
+            return candidate.belief
+        return object_belief(t - candidate.last_stamp, self.hold_s, self.decay_s)
+
+    def in_cooldown(self, candidate, t):
         last = self.last_checked.get(candidate.object_id)
-        return last is None or now - last >= self.cooldown_s
+        return last is not None and t - last < self.cooldown_s
+
+    def eligible_at(self, candidate, t, exclude=()):
+        """Due an opportunistic / endpoint check at time t: not excluded, belief <= check_below_belief, no cooldown."""
+        return (candidate.object_id not in exclude and not self.in_cooldown(candidate, t)
+                and self.belief_at(candidate, t) <= self.check_below_belief)
+
+    def eligible(self, candidate, now, exclude=()):
+        return self.eligible_at(candidate, now, exclude)
+
+    def t_due(self, candidate, now, exclude=()):
+        """Earliest time >= now at which the object is eligible if nothing new is observed (inf: not without
+        new information). Belief only falls and cooldowns only end, so it stays eligible from then on."""
+        if candidate.object_id in exclude:
+            return math.inf
+        t = now
+        last = self.last_checked.get(candidate.object_id)
+        if last is not None:
+            t = max(t, last + self.cooldown_s)
+        if self.belief_at(candidate, t) <= self.check_below_belief:
+            return t
+        if candidate.last_stamp is None or self.hold_s is None or self.decay_s is None:
+            return math.inf
+        if self.decay_s <= 0:
+            t_b = candidate.last_stamp + self.hold_s + 1e-6  # belief drops to 0 right after the hold
+        else:
+            t_b = candidate.last_stamp + self.hold_s + (1.0 - self.check_below_belief) * self.decay_s
+        return max(t, t_b)
 
     def importance(self, candidate):
         return self.importance_fn(candidate) if self.importance_fn is not None else importance(candidate)
 
-    def value(self, candidate):
-        return self.importance(candidate) * (1.0 - candidate.belief)
+    def value(self, candidate, t=None):
+        """importance * (1 - belief), with the belief at time t (now: candidate.belief)."""
+        return self.importance(candidate) * (1.0 - self.belief_at(candidate, t))
+
+    @staticmethod
+    def _path_times(path_xy, times):
+        """Trajectory time (s from now) per path point; zeros without times (everything decided for now)."""
+        n = len(path_xy)
+        if times is None or len(times) != n:
+            return np.zeros(n)
+        return np.asarray(times, dtype=float)
 
     # ---------- Opportunistic ----------
 
-    def options(self, path_xy, candidates, viewsheds, now, exclude=(), detours=None):
-        """Opportunistic options along path_xy, then the chosen DETOUR options (detours:
+    def options(self, path_xy, candidates, viewsheds, now, exclude=(), detours=None, start_pose=None,
+                goal_theta=None, times=None):
+        """Opportunistic and endpoint options along path_xy, then the chosen DETOUR options (detours:
         {object_id: detour.DetourResult} for detour_candidates(); None = no detours)."""
-        options = self.opportunistic_options(path_xy, candidates, viewsheds, now, exclude)
+        options = self.opportunistic_options(path_xy, candidates, viewsheds, now, exclude, start_pose, goal_theta,
+                                             times)
         if detours is not None:
-            options += self.detour_options(path_xy, candidates, viewsheds, now, exclude, detours)[0]
+            options += self.detour_options(path_xy, candidates, viewsheds, now, exclude, detours,
+                                           covered=covered_ids(options),
+                                           start_xy=start_pose[:2] if start_pose is not None else None,
+                                           times=times)[0]
         return options
 
-    def opportunistic_options(self, path_xy, candidates, viewsheds, now, exclude=()):
-        eligible = {c.object_id: c for c in self.eligible_candidates(candidates, now, exclude)}
+    def opportunistic_options(self, path_xy, candidates, viewsheds, now, exclude=(), start_pose=None,
+                              goal_theta=None, times=None):
+        """On-path stops along path_xy, then at most one AT_START and one AT_GOAL stop for eligible
+        objects that got no on-path stop.
+
+        start_pose: (x, y, theta) of the robot when it may look before leaving (first plan for a goal),
+        else None (no AT_START). goal_theta: final heading at the goal (default: the path's end heading).
+        The AT_GOAL stop is at path_xy[-1], which must be the park pose.
+        times: trajectory time (s from now) per path point. An object may get a stop wherever it will be
+        due when the robot gets there (t_due); without times only objects due now are considered.
+        """
+        path_xy = np.asarray(path_xy, dtype=float)
+        tt = self._path_times(path_xy, times)
+        t_end = now + (float(tt[-1]) if len(tt) else 0.0)
+        due = {}  # object_id -> (Candidate, t_due), due by the end of the path
+        for c in candidates:
+            td = self.t_due(c, now, exclude)
+            if td <= t_end + 1e-9:
+                due[c.object_id] = (c, td)
+        eligible = {oid: c for oid, (c, _td) in due.items()}
         stops = select_stops(
             path_xy,
             [(c.object_id, c.x, c.y) for c in eligible.values()],
@@ -344,6 +534,7 @@ class ThresholdPolicy(ObservationPolicy):
             skip_goal_m=self.skip_goal_m,
             merge_m=self.merge_m,
             max_turn=self.max_turn,
+            due_masks={oid: now + tt >= td - 1e-9 for oid, (_c, td) in due.items() if td > now},
         )
         options = []
         for stop in stops:
@@ -351,17 +542,68 @@ class ThresholdPolicy(ObservationPolicy):
             if self.max_cost_s > 0 and cost > self.max_cost_s:
                 continue
             cands = [eligible[object_id] for object_id, _x, _y in stop.targets]
+            t_stop = now + float(tt[stop.path_index]) if times is not None else None
             options.append(
                 ObservationOption(
                     kind=OPPORTUNISTIC,
                     resume=REMAINING_PATH,
                     stop=stop,
                     candidates=cands,
-                    values=[self.value(c) for c in cands],
+                    values=[self.value(c, t_stop) for c in cands],
                     cost_s=cost,
                 )
             )
+        due_at = {oid: td for oid, (_c, td) in due.items()}
+        options += self.endpoint_options(path_xy, eligible, viewsheds, covered_ids(options), start_pose, goal_theta,
+                                         due_at=due_at, now=now, t_end=t_end if times is not None else None)
         return options
+
+    # ---------- Endpoints ----------
+
+    def endpoint_options(self, path_xy, eligible, viewsheds, covered=(), start_pose=None, goal_theta=None,
+                         due_at=None, now=None, t_end=None):
+        """AT_START / AT_GOAL options for the eligible objects ({object_id: Candidate}) not in covered.
+
+        An object visible from the start pose goes to AT_START (the robot is there now), else one
+        visible from the park pose path_xy[-1] to AT_GOAL. A bundle over max_cost_s loses its
+        lowest-value targets until it fits. due_at {object_id: t_due} with now / t_end (arrival time
+        at the goal): AT_START only takes objects due now, AT_GOAL those due on arrival.
+        """
+        path_xy = np.asarray(path_xy, dtype=float)
+        if len(path_xy) < 2:
+            return []
+        rest = [c for oid, c in eligible.items() if oid not in covered and oid in viewsheds]
+        headings = path_headings(path_xy)
+        gx, gy = float(path_xy[-1, 0]), float(path_xy[-1, 1])
+        ends = []
+        if start_pose is not None:
+            sx, sy, sth = (float(v) for v in start_pose)
+            ends.append((AT_START, 0, sx, sy, sth, float(headings[0]), now))
+        g_out = float(goal_theta) if goal_theta is not None else float(headings[-1])
+        ends.append((AT_GOAL, len(path_xy) - 1, gx, gy, float(headings[-1]), g_out, t_end))
+
+        options = []
+        for kind, index, x, y, heading_in, heading_out, t_check in ends:
+            targets = [c for c in rest if viewsheds[c.object_id].contains_xy([(x, y)])[0]
+                       and (due_at is None or t_check is None or due_at[c.object_id] <= t_check + 1e-9)]
+            option = self._endpoint_option(kind, index, x, y, heading_in, heading_out, targets, t_check)
+            if option is not None:
+                options.append(option)
+                taken = {c.object_id for c in option.candidates}
+                rest = [c for c in rest if c.object_id not in taken]
+        return options
+
+    def _endpoint_option(self, kind, index, x, y, heading_in, heading_out, targets, t_check=None):
+        targets = sorted(targets, key=lambda c: (-self.value(c, t_check), c.object_id))  # most valuable first
+        while targets:
+            ordered = sorted(targets, key=lambda c: wrap_angle(math.atan2(c.y - y, c.x - x) - heading_in))
+            cost = endpoint_cost_s(x, y, heading_in, heading_out, ordered, self.turn_rate, self.dwell_s)
+            if self.max_cost_s <= 0 or cost <= self.max_cost_s:
+                stop = Stop(index, x, y, heading_out, [(c.object_id, c.x, c.y) for c in ordered])
+                return ObservationOption(kind=kind, resume=REMAINING_PATH, stop=stop, candidates=ordered,
+                                         values=[self.value(c, t_check) for c in ordered], cost_s=cost)
+            targets.pop()  # drop the least valuable target
+        return None
 
     # ---------- Detours ----------
 
@@ -374,30 +616,63 @@ class ThresholdPolicy(ObservationPolicy):
             return False
         return self.importance_m_fn is not None and self.importance_m_fn(candidate) is not None
 
-    @staticmethod
-    def checkable_from_path(path_xy, viewshed):
-        """Visible from any point of the path (incl. near start / goal): an opportunistic job."""
-        return bool(viewshed.contains_xy(path_xy).any())
+    def checkable_from_path(self, path_xy, viewshed, start_xy=None):
+        """Visible from a point an opportunistic or endpoint stop may use: a usable path point (outside
+        the skip zones), the park pose path_xy[-1], or the start (x, y) if the robot may look from there."""
+        path_xy = np.asarray(path_xy, dtype=float).reshape(-1, 2)
+        if len(path_xy) == 0:
+            return False
+        points = [path_xy[usable_points(path_xy, self.skip_start_m, self.skip_goal_m)], path_xy[-1:]]
+        if start_xy is not None:
+            points.append(np.asarray(start_xy, dtype=float).reshape(1, 2))
+        return bool(viewshed.contains_xy(np.concatenate(points)).any())
 
-    def detour_candidates(self, path_xy, candidates, viewsheds, now, exclude=()):
-        """Eligible objects that no point of the path can see: the only ones a detour may serve."""
+    def detour_candidates(self, path_xy, candidates, viewsheds, now, exclude=(), covered=None, start_xy=None,
+                          times=None):
+        """Eligible objects no opportunistic or endpoint stop serves: the only ones a detour may serve.
+
+        Left out: objects in covered (they have a stop on this path), and objects not yet due an
+        opportunistic check by the end of this path (belief still above check_below_belief then) that a
+        usable point sees (checkable_from_path): they get a stop once their belief has decayed.
+        covered=None computes it with opportunistic_options (start heading taken from the path).
+        """
+        path_xy = np.asarray(path_xy, dtype=float)
+        tt = self._path_times(path_xy, times)
+        t_end = now + (float(tt[-1]) if len(tt) else 0.0)
+        if covered is None:
+            start_pose = None
+            if start_xy is not None:
+                start_pose = (start_xy[0], start_xy[1], float(path_headings(path_xy)[0]))
+            covered = covered_ids(self.opportunistic_options(path_xy, candidates, viewsheds, now, exclude, start_pose,
+                                                             times=times))
         out = []
         for c in candidates:
             vs = viewsheds.get(c.object_id)
-            if vs is None or not self.detour_eligible(c, now, exclude):
+            if vs is None or c.object_id in covered or not self.detour_eligible(c, now, exclude):
                 continue
-            if not self.checkable_from_path(path_xy, vs):
-                out.append(c)
+            if self.t_due(c, now, exclude) > t_end + 1e-9 and self.checkable_from_path(path_xy, vs, start_xy):
+                continue
+            out.append(c)
         return out
 
-    def detour_value_m(self, candidate):
+    def detour_value_m(self, candidate, t=None):
+        """V of a detour check at time t (belief then; now: candidate.belief)."""
         p = self.detour_params
-        return detour_value_m(self.importance_m_fn(candidate), candidate.belief, p.n_trips, p.conclusive_prob)
+        return detour_value_m(self.importance_m_fn(candidate), self.belief_at(candidate, t), p.n_trips,
+                              p.conclusive_prob)
 
-    def max_detour_m(self, candidate):
-        """D*: the longest detour that could pay off for this object alone (<= 0: never)."""
-        d_star = self.detour_value_m(candidate) - self.cruise_speed * self.dwell_s
+    def max_detour_m(self, candidate, t=None):
+        """D*: the longest detour that could pay off for this object alone (<= 0: never). t: the latest
+        time the check could happen (lowest belief, largest V), so that D* stays an upper bound."""
+        d_star = self.detour_value_m(candidate, t) - self.cruise_speed * self.dwell_s
         return min(d_star, self.detour_params.hard_cap_m)
+
+    def detour_bound_time(self, now, times=None):
+        """Latest time a detour on this path could check (end of the path plus the longest detour), for
+        max_detour_m; None without times (V as of now)."""
+        if times is None or not len(times):
+            return None
+        return now + float(times[-1]) + self.detour_params.hard_cap_m / self.cruise_speed
 
     def detour_cost_m(self, detour, targets):
         """C: extra driving + cruise_speed * (turn through the targets from the arrival heading
@@ -415,45 +690,62 @@ class ThresholdPolicy(ObservationPolicy):
             return "branches at the goal"
         return ""
 
-    def detour_options(self, path_xy, candidates, viewsheds, now, exclude=(), detours=None):
+    def detour_options(self, path_xy, candidates, viewsheds, now, exclude=(), detours=None, covered=None,
+                       start_xy=None, times=None):
         """Detours worth driving. Returns (chosen ObservationOptions, all DetourEvaluations).
 
         One evaluation per object with a detour result: its best viewpoint, bundled with every
         other detour candidate visible from there (values add). Options with V - C > margin are
         taken best-first by net benefit, without sharing objects, up to max_detours_per_path.
         Blocked ones (detour_blocked: branching off at the start or goal) are evaluated but never taken.
+        covered / start_xy: as for detour_candidates(). times: trajectory time per path point; V uses
+        the belief when the robot would look (leave point time + leave point -> viewpoint).
         """
         detours = detours or {}
-        cands = {c.object_id: c for c in self.detour_candidates(path_xy, candidates, viewsheds, now, exclude)}
+        path_xy = np.asarray(path_xy, dtype=float)
+        tt = self._path_times(path_xy, times)
+        cands = {c.object_id: c for c in self.detour_candidates(path_xy, candidates, viewsheds, now, exclude,
+                                                                covered, start_xy, times)}
         evaluations = []
         for object_id, c in cands.items():
             d = detours.get(object_id)
             if d is None:
                 continue
             vx, vy = d.viewpoint_xy
-            targets = self._bundle(c, cands, viewsheds, vx, vy, d.arrival_heading)
-            values = [self.detour_value_m(u) for u in targets]
+            to_view_s = d.to_view_m / self.cruise_speed
+            t_look = now + float(tt[min(d.leave_index, len(tt) - 1)]) + to_view_s if times is not None else None
+            eta = t_look if t_look is not None else now + to_view_s
+            winner = self.peer_yield(DETOUR, c.object_id, eta)
+            targets = [u for u in self._bundle(c, cands, viewsheds, vx, vy, d.arrival_heading)
+                       if u is c or self.peer_yield(DETOUR, u.object_id, eta) is None]  # others check those first
+            values = [self.detour_value_m(u, t_look) for u in targets]
             cost_m = self.detour_cost_m(d, targets)
             stop = Stop(d.leave_index, vx, vy, d.arrival_heading, [(u.object_id, u.x, u.y) for u in targets])
             option = ObservationOption(
                 kind=DETOUR, resume=REPLAN, stop=stop, candidates=targets, values=values,
                 cost_s=cost_m / self.cruise_speed, detour_m=d.detour_m, value_m=sum(values), cost_m=cost_m,
-                leave_xy=tuple(d.leave_xy),
+                leave_xy=tuple(d.leave_xy), to_view_s=to_view_s,
             )
+            blocked = self.detour_blocked(d) or ("robot %d checks first" % winner.robot_id if winner else "")
             evaluations.append(ObservationEvaluation([u.object_id for u in targets], d.detour_m, sum(values),
                                                      cost_m, option=option, values_m=values,
-                                                     blocked=self.detour_blocked(d), source=d))
+                                                     blocked=blocked, source=d))
         p = self.detour_params
         chosen = self._choose(evaluations, p.max_detours_per_path, p.margin_m, self.max_cost_s)
         return chosen, evaluations
 
     # ---------- Scouts ----------
 
-    def covered_elsewhere(self, candidate):
-        """True if the object will be checked without a scout (stub: always False).
+    def peer_yield(self, kind, object_id, eta):
+        """The other robot's intent a check of object_id at eta gives way to (yields_to), or None."""
+        if self.robot_id is None or not self.peer_intents:
+            return None
+        mine = [o for o in self.peer_intents if o.object_id == object_id]
+        return yields_to(kind, eta, self.robot_id, mine, self.intent_margin_s) if mine else None
 
-        TODO: a peer's planned path passes one of its viewpoints, or another robot has claimed it.
-        """
+    def covered_elsewhere(self, candidate):
+        """True if the object will be checked without a scout. Peer checks are compared per scout in
+        scout_options (they depend on the scout's ETA); nothing else is known here."""
         return False
 
     def scout_eligible(self, candidate, now, exclude=()):
@@ -464,13 +756,17 @@ class ThresholdPolicy(ObservationPolicy):
         """Eligible objects with a viewshed."""
         return [c for c in candidates if c.object_id in viewsheds and self.scout_eligible(c, now, exclude)]
 
-    def scout_value_m(self, candidate):
+    def scout_value_m(self, candidate, t=None):
+        """V of a scout check at time t (belief then; now: candidate.belief)."""
         p = self.scout_params
-        return detour_value_m(self.importance_m_fn(candidate), candidate.belief, p.n_trips, p.conclusive_prob)
+        return detour_value_m(self.importance_m_fn(candidate), self.belief_at(candidate, t), p.n_trips,
+                              p.conclusive_prob)
 
-    def max_scout_m(self, candidate):
-        """Longest start -> viewpoint distance that could pay off for this object alone (<= 0: never)."""
-        limit = self.scout_cost.travel_limit_m(self.scout_value_m(candidate), self)
+    def max_scout_m(self, candidate, now=None):
+        """Longest start -> viewpoint distance that could pay off for this object alone (<= 0: never).
+        now: V is taken at now + hard_cap / v (the latest arrival searched), so the limit is an upper bound."""
+        t = None if now is None else now + self.scout_params.hard_cap_m / self.cruise_speed
+        limit = self.scout_cost.travel_limit_m(self.scout_value_m(candidate, t), self)
         return min(limit, self.scout_params.hard_cap_m)
 
     def scout_options(self, start_xy, candidates, viewsheds, now, exclude=(), scouts=None):
@@ -490,21 +786,61 @@ class ThresholdPolicy(ObservationPolicy):
             if r is None:
                 continue
             vx, vy = r.viewpoint_xy
-            targets = self._bundle(c, cands, viewsheds, vx, vy, r.arrival_heading)
-            values = [self.scout_value_m(u) for u in targets]
+            to_view_s = r.to_view_m / self.cruise_speed
+            eta = now + to_view_s
+            winner = self.peer_yield(SCOUT, c.object_id, eta)
+            targets = [u for u in self._bundle(c, cands, viewsheds, vx, vy, r.arrival_heading)
+                       if u is c or self.peer_yield(SCOUT, u.object_id, eta) is None]  # others check those first
+            values = [self.scout_value_m(u, eta) for u in targets]
             parts = self.scout_cost.breakdown(r, targets, self)
             cost_m = parts["total_m"]
             stop = Stop(-1, vx, vy, r.arrival_heading, [(u.object_id, u.x, u.y) for u in targets])
             option = ObservationOption(
                 kind=SCOUT, resume=RETURN, stop=stop, candidates=targets, values=values,
                 cost_s=cost_m / self.cruise_speed, detour_m=r.to_view_m, value_m=sum(values), cost_m=cost_m,
-                leave_xy=tuple(r.start_xy),
+                leave_xy=tuple(r.start_xy), to_view_s=to_view_s,
             )
             evaluations.append(ObservationEvaluation([u.object_id for u in targets], r.to_view_m, sum(values),
                                                      cost_m, option=option, values_m=values, kind=SCOUT,
-                                                     source=r, breakdown=parts))
+                                                     source=r, breakdown=parts,
+                                                     blocked="robot %d checks first" % winner.robot_id if winner else ""))
         p = self.scout_params
         return self._choose(evaluations, p.max_scouts, p.margin_m), evaluations
+
+    # ---------- Revalidation (when the check is about to happen) ----------
+
+    def revalidate(self, kind, object_ids, candidates, now, planned_eta=None, cost_s=0.0):
+        """Re-apply the rules to a planned check just before it happens. Returns [(due, reason)] per object.
+
+        candidates: {object_id: Candidate}, the current ledger state (a missing object is gone). The
+        rules are evaluated at max(now, planned_eta): arriving early must not cancel a check the plan
+        timed for later; a new observation (own or a peer's), a removal or a finished check changes them.
+          OPPORTUNISTIC / AT_START / AT_GOAL: eligible_at (in the ledger, no cooldown, belief <= threshold).
+          DETOUR / SCOUT: in the ledger, no cooldown, and the remaining targets together still worth it:
+                          V(t) - cost_s * cruise_speed > margin (cost_s: what is still to be spent).
+        """
+        t = now if planned_eta is None else max(now, planned_eta)
+        out = []
+        for oid in object_ids:
+            c = candidates.get(oid)
+            if c is None:
+                out.append((False, "gone"))
+            elif self.in_cooldown(c, t):
+                out.append((False, "checked %.0f s ago" % (t - self.last_checked[oid])))
+            elif kind not in (DETOUR, SCOUT) and self.belief_at(c, t) > self.check_below_belief:
+                out.append((False, "belief %.2f > %.2f" % (self.belief_at(c, t), self.check_below_belief)))
+            else:
+                out.append((True, ""))
+        if kind in (DETOUR, SCOUT) and self.importance_m_fn is not None:
+            live = [candidates[oid] for oid, (due, _r) in zip(object_ids, out) if due]
+            value_fn, p = (self.detour_value_m, self.detour_params) if kind == DETOUR else \
+                (self.scout_value_m, self.scout_params)
+            value = sum(value_fn(c, t) for c in live if self.importance_m_fn(c) is not None)
+            cost = cost_s * self.cruise_speed
+            if live and value - cost <= p.margin_m:
+                reason = "not worth it now (V=%.1f m, C=%.1f m)" % (value, cost)
+                out = [(False, reason) if due else (due, r) for due, r in out]
+        return out
 
     # ---------- Shared by detours and scouts ----------
 

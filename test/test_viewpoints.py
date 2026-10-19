@@ -4,7 +4,7 @@ import math
 
 import numpy as np
 
-from navigation_utils.viewpoints import blocking_mask, compute_viewshed, nearby_blockers, select_stops
+from navigation_utils.viewpoints import blocking_mask, compute_viewshed, nearby_blockers, select_stops, usable_points
 
 RES = 0.1
 
@@ -167,3 +167,11 @@ def test_overshoot_stop_used_when_object_only_visible_behind():
     vs = views(obj, r_min=1.2, blocking=blocking)
     (stop,) = select_stops(straight_path(0.0, 8.0, n=81), [obj], vs, r_pref=2.0)
     assert stop.x > obj[1]  # past the object: it can only be seen looking back
+
+
+def test_usable_points_skip_zones():
+    path = straight_path(0.0, 3.0, n=31)  # 0.1 m spacing
+    usable = usable_points(path, skip_start_m=0.5, skip_goal_m=0.8)
+    assert not usable[:5].any() and usable[5]  # arc < 0.5 m
+    assert usable[21] and not usable[23:].any()  # within 0.8 m (straight line) of the goal
+    assert not usable_points(path[:1]).any()

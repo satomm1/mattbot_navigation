@@ -32,9 +32,10 @@ from navigation_utils.observation_policy import (  # noqa: E402
     DetourValueParams,
     Candidate,
     ThresholdPolicy,
+    covered_ids,
 )
 from navigation_utils.roadmap import DEFAULT_CACHE_DIR, RoadmapParams, load_or_build_roadmap  # noqa: E402
-from navigation_utils.viewpoints import blocking_mask, compute_viewshed, nearby_blockers  # noqa: E402
+from navigation_utils.viewpoints import blocking_mask, compute_viewshed, nearby_blockers, path_headings  # noqa: E402
 
 
 def xy_arg(text):
@@ -107,13 +108,17 @@ def main():
     )
     cands = [Candidate(oid, "object", x, y, beliefs[oid], w) for oid, (x, y, w) in objects.items()]
     t2 = time.time()
-    dcands = policy.detour_candidates(path_xy, cands, views, now=0.0)
+    # A trip from the path start (first plan for its goal): the robot may look from the start pose too
+    start_pose = (float(path_xy[0, 0]), float(path_xy[0, 1]), float(path_headings(path_xy)[0]))
+    options = policy.opportunistic_options(path_xy, cands, views, now=0.0, start_pose=start_pose)
+    covered = covered_ids(options)
+    dcands = policy.detour_candidates(path_xy, cands, views, now=0.0, covered=covered, start_xy=start_pose[:2])
     targets = {c.object_id: (c.x, c.y, planner.viewpoint_nodes(views[c.object_id]), policy.max_detour_m(c))
                for c in dcands}
     targets = {oid: t for oid, t in targets.items() if t[3] > 0}
     detours = planner.compute(path_xy, targets, DetourParams(max_detour_m=args.max_detour, r_max=args.r_max))
-    options = policy.opportunistic_options(path_xy, cands, views, now=0.0)
-    chosen, evaluations = policy.detour_options(path_xy, cands, views, now=0.0, detours=detours)
+    chosen, evaluations = policy.detour_options(path_xy, cands, views, now=0.0, detours=detours, covered=covered,
+                                                start_xy=start_pose[:2])
     t3 = time.time()
 
     on_stop = {c.object_id for o in options for c in o.candidates}

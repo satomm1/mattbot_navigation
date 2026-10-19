@@ -4,7 +4,8 @@
 Inputs:   /map                  static map; line of sight is computed on it
           /object_beliefs       per-object belief (mattbot_dds object_belief_map.py)
           /observation/events   navigator observation progress (for the per-object cooldown)
-Service:  /observation/select   (mattbot_dds/SelectObservations) path -> observation stops
+Service:  /observation/select   (mattbot_dds/SelectObservations) path (+ trajectory times) -> observation stops
+          /observation/revalidate (mattbot_dds/RevalidateStop) re-apply the rules to a stop about to happen
 Outputs:  /observation/viewsheds  OccupancyGrid: union of viewsheds of objects due a check (RViz)
           /observation/stops      MarkerArray: last selected stops and their targets (RViz)
 
@@ -50,10 +51,15 @@ from geometry_msgs.msg import Point, Pose2D
 from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import Int32
 from visualization_msgs.msg import Marker, MarkerArray
-from mattbot_dds.msg import ObjectBeliefArray, ObservationEvent, ObservationStop, ScoutCandidate, ScoutDecision
-from mattbot_dds.srv import EvaluateScout, EvaluateScoutResponse, SelectObservations, SelectObservationsResponse
+from mattbot_dds.msg import (
+    ObjectBeliefArray, ObservationEvent, ObservationIntentArray, ObservationStop, ScoutCandidate, ScoutDecision,
+)
+from mattbot_dds.srv import (
+    EvaluateScout, EvaluateScoutResponse, RevalidateStop, RevalidateStopResponse, SelectObservations,
+    SelectObservationsResponse,
+)
 
-from navigation_utils.observation_policy import Candidate, ThresholdPolicy
+from navigation_utils.observation_policy import Candidate, ThresholdPolicy, covered_ids
 from navigation_utils.viewpoints import blocking_mask, compute_viewshed, nearby_blockers
 
 RECOMPUTE_MOVE_M = 0.2  # recompute an object's viewshed if it moves further than this
@@ -135,7 +141,13 @@ class ObservationPlannerNode:
         rospy.Subscriber("/map", OccupancyGrid, self.map_callback, queue_size=1)
         rospy.Subscriber("/object_beliefs", ObjectBeliefArray, self.beliefs_callback, queue_size=1)
         rospy.Subscriber("/observation/events", ObservationEvent, self.event_callback, queue_size=50)
+        # Fleet coordination: detours and scouts give way to other robots' earlier checks (observation_policy.yields_to)
+        self.coordinate = bool(rospy.get_param("~coordinate", True))
+        self.policy.intent_margin_s = float(rospy.get_param("~intent_margin_s", 10.0))
+        if self.coordinate:
+            rospy.Subscriber("/observation/intents", ObservationIntentArray, self.intents_callback, queue_size=1)
         rospy.Service("/observation/select", SelectObservations, self.select_srv)
+        rospy.Service("/observation/revalidate", RevalidateStop, self.revalidate_srv)
         rospy.Timer(rospy.Duration(2.0), self.viz_timer)
         rospy.Timer(rospy.Duration(30.0), self.health_timer)
         if self.scout_enabled:
@@ -155,14 +167,22 @@ class ObservationPlannerNode:
 
     def beliefs_callback(self, msg):
         cands = [
-            Candidate(o.object_id, o.class_name, o.local_x, o.local_y, o.belief, float(o.width))
+            Candidate(o.object_id, o.class_name, o.local_x, o.local_y, o.belief, float(o.width), o.last_stamp)
             for o in msg.objects
         ]
         with self.lock:
             self.candidates = cands
+            # Belief model, so the rules can be evaluated for when a check would happen
+            self.policy.hold_s, self.policy.decay_s = float(msg.hold_s), float(msg.decay_s)
             self.last_beliefs_time = rospy.get_time()
         if self.importance is not None:
             self.importance.set_objects({c.object_id: (c.x, c.y, c.width) for c in cands})
+
+    def intents_callback(self, msg):
+        """Live intents of the fleet (observation_ledger); the policy compares with the other robots' only."""
+        with self.lock:
+            self.policy.robot_id = msg.robot_id
+            self.policy.peer_intents = [i for i in msg.intents if i.robot_id != msg.robot_id]
 
     def event_callback(self, msg):
         if msg.event == ObservationEvent.ENDED:
@@ -204,26 +224,38 @@ class ObservationPlannerNode:
 
     def select_srv(self, req):
         path_xy = np.array([[p.pose.position.x, p.pose.position.y] for p in req.path.poses], dtype=float)
+        times = list(req.times) if len(req.times) == len(path_xy) else None  # None: decide for now only
         exclude = set(req.exclude_object_ids)
         with self.lock:
             if self.blocking is None or len(path_xy) < 2:
                 return SelectObservationsResponse(stops=[])
             now = rospy.get_time()  # cooldowns use the navigator's window times (ROS time)
-            eligible = self.policy.eligible_candidates(self.candidates, now, exclude)
+            # Objects due an opportunistic check by the time the robot reaches the end of this path
+            t_end = now + (times[-1] if times is not None else 0.0)
+            eligible = [c for c in self.candidates if self.policy.t_due(c, now, exclude) <= t_end + 1e-9]
             detour_eligible = []
             if self.detour_enabled:  # no belief threshold for detours: they need viewsheds too
                 detour_eligible = [c for c in self.candidates if self.policy.detour_eligible(c, now, exclude)]
             self.ensure_viewsheds({c.object_id: c for c in eligible + detour_eligible}.values())
             views = {oid: vs for oid, (vs, _sig) in self.viewsheds.items()}
-            options = self.policy.opportunistic_options(path_xy, self.candidates, views, now, exclude)
+            # Look from the start pose only on the first plan for a goal (the robot is stopped there)
+            start_pose = (req.start.x, req.start.y, req.start.theta) if req.allow_start_check else None
+            start_xy = start_pose[:2] if start_pose is not None else None
+            options = self.policy.opportunistic_options(
+                path_xy, self.candidates, views, now, exclude, start_pose, req.goal.theta, times
+            )
+            covered = covered_ids(options)
             evaluations, detours, targets = [], None, {}
             if self.detour_enabled:
-                # Objects visible from any point of the path are left to opportunistic stops
-                dcands = self.policy.detour_candidates(path_xy, self.candidates, views, now, exclude)
-                detours, targets = self.compute_detours(path_xy, dcands, views)
+                # Objects an opportunistic or endpoint stop serves (now, or once their belief decays) are left to it
+                dcands = self.policy.detour_candidates(
+                    path_xy, self.candidates, views, now, exclude, covered=covered, start_xy=start_xy, times=times
+                )
+                detours, targets = self.compute_detours(path_xy, dcands, views, self.policy.detour_bound_time(now, times))
                 if detours is not None:
                     chosen, evaluations = self.policy.detour_options(
-                        path_xy, self.candidates, views, now, exclude, detours
+                        path_xy, self.candidates, views, now, exclude, detours, covered=covered, start_xy=start_xy,
+                        times=times,
                     )
                     options += chosen
         if self.detour_enabled:
@@ -231,7 +263,8 @@ class ObservationPlannerNode:
             self.publish_detour_markers(evaluations, req.path.header.frame_id or "map")
             visible = [(c.object_id, c.x, c.y) for c in self.candidates
                        if c.object_id in views and c.object_id not in targets
-                       and self.policy.checkable_from_path(path_xy, views[c.object_id])]
+                       and (c.object_id in covered
+                            or self.policy.checkable_from_path(path_xy, views[c.object_id], start_xy))]
             self.importance.set_detours(path_xy, detours, targets, options, evaluations, visible)
 
         stops = []
@@ -250,6 +283,7 @@ class ObservationPlannerNode:
                     beliefs=[c.belief for c in opt.candidates],
                     values=opt.values,
                     cost_s=opt.cost_s,
+                    to_view_s=opt.to_view_s,
                 )
             )
         if stops:
@@ -260,15 +294,28 @@ class ObservationPlannerNode:
         self.publish_stop_markers(stops, req.path.header.frame_id or "map")
         return SelectObservationsResponse(stops=stops)
 
+    def revalidate_srv(self, req):
+        """Re-apply the rules to a stop that is about to happen (navigator: stop trigger, detour leave
+        point, viewpoint arrival), with the current ledger state."""
+        with self.lock:
+            cands = {c.object_id: c for c in self.candidates}
+            results = self.policy.revalidate(req.kind, list(req.object_ids), cands, rospy.get_time(),
+                                             req.planned_eta or None, req.cost_s)
+        for oid, (due, reason) in zip(req.object_ids, results):
+            if not due:
+                rospy.loginfo("observation_planner: %s no longer due a check (%s)", oid, reason)
+        return RevalidateStopResponse(due=[d for d, _r in results], reasons=[r for _d, r in results])
+
     # ---------- Detours ----------
 
-    def compute_detours(self, path_xy, dcands, views):
+    def compute_detours(self, path_xy, dcands, views, t_bound=None):
         """Detours for detour candidates, each searched up to its own D* (call with self.lock
-        held). Returns (detours, targets), detours None while the roadmap is not ready."""
+        held). t_bound: latest time a check could happen (D* bound). Returns (detours, targets),
+        detours None while the roadmap is not ready."""
         planner = self.importance.detour_planner
         if planner is None:
             return None, {}
-        targets = self._viewpoint_targets(planner, dcands, views, self.policy.max_detour_m)
+        targets = self._viewpoint_targets(planner, dcands, views, lambda c: self.policy.max_detour_m(c, t_bound))
         t0 = time.time()  # wall clock: compute time
         detours = planner.compute(path_xy, targets, self.detour_params)
         rospy.logdebug("observation_planner: %d detour(s) for %d object(s) in %.0f ms",
@@ -451,7 +498,8 @@ class ObservationPlannerNode:
                 eligible = [c for c in self.candidates if self.policy.scout_eligible(c, now)]
                 self.ensure_viewsheds(eligible)
                 views = {oid: vs for oid, (vs, _sig) in self.viewsheds.items()}
-                targets = self._viewpoint_targets(scout.grid, eligible, views, self.policy.max_scout_m)
+                targets = self._viewpoint_targets(scout.grid, eligible, views,
+                                                  lambda c: self.policy.max_scout_m(c, now))
                 results = scout.compute((start.x, start.y), targets, self.scout_params, start_heading=start.theta)
                 _chosen, evaluations = self.policy.scout_options(
                     (start.x, start.y), self.candidates, views, now, (), results
@@ -487,7 +535,7 @@ class ObservationPlannerNode:
                 "observation_planner: scout %s: %.1f m away, V=%.1f m, C=%.1f m (opp=%.1f m, away=%.0f s) -> %s",
                 "+".join(ev.object_ids), ev.detour_m, ev.value_m, ev.cost_m,
                 parts.get("fixed_m", 0.0) + parts.get("away_m", 0.0), parts.get("t_away_s", 0.0),
-                "GO" if ev.chosen else "skip",
+                "GO" if ev.chosen else "skip (%s)" % ev.blocked if ev.blocked else "skip",
             )
 
     def publish_scout_markers(self, evaluations, frame_id="map"):

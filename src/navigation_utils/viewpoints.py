@@ -139,8 +139,21 @@ def path_headings(path_xy):
     return np.arctan2(d[:, 1], d[:, 0])
 
 
+def usable_points(path_xy, skip_start_m=0.5, skip_goal_m=0.8):
+    """Bool per point of path_xy (N, 2): may an on-path stop be placed there. Points within
+    skip_start_m (arc length) of the start or skip_goal_m (straight line) of the goal are not usable."""
+    path_xy = np.asarray(path_xy, dtype=float)
+    if len(path_xy) < 2:
+        return np.zeros(len(path_xy), dtype=bool)
+    seg = np.hypot(*np.diff(path_xy, axis=0).T)
+    arc = np.concatenate([[0.0], np.cumsum(seg)])
+    to_goal = np.hypot(*(path_xy - path_xy[-1]).T)
+    return (arc >= skip_start_m) & (to_goal >= skip_goal_m)
+
+
 def select_stops(
-    path_xy, targets, viewsheds, r_pref=2.0, skip_start_m=0.5, skip_goal_m=0.8, merge_m=0.5, max_turn=math.pi / 2
+    path_xy, targets, viewsheds, r_pref=2.0, skip_start_m=0.5, skip_goal_m=0.8, merge_m=0.5, max_turn=math.pi / 2,
+    due_masks=None,
 ):
     """Choose where along path_xy (N, 2) to stop and observe each target.
 
@@ -151,15 +164,16 @@ def select_stops(
     path heading are preferred; points that need a larger turn (the object is behind, i.e. the
     stop overshoots it) are used only if there are no others. None = no preference. Points within skip_start_m (arc length) of the start or
     skip_goal_m of the goal are not used. Stops within merge_m of arc length are merged into
-    the earlier one. Returns [Stop, ...] ordered along the path.
+    the earlier one. due_masks {object_id: bool per path point}: only points where the object is due
+    (e.g. its belief will have decayed by the time the robot gets there) may be used.
+    Returns [Stop, ...] ordered along the path.
     """
     path_xy = np.asarray(path_xy, dtype=float)
     if len(path_xy) < 2:
         return []
     seg = np.hypot(*np.diff(path_xy, axis=0).T)
     arc = np.concatenate([[0.0], np.cumsum(seg)])
-    to_goal = np.hypot(*(path_xy - path_xy[-1]).T)
-    usable = (arc >= skip_start_m) & (to_goal >= skip_goal_m)
+    usable = usable_points(path_xy, skip_start_m, skip_goal_m)
 
     headings = path_headings(path_xy)
     picks = []  # (path_index, object_id, x, y)
@@ -168,6 +182,8 @@ def select_stops(
         if vs is None:
             continue
         ok = usable & vs.contains_xy(path_xy)
+        if due_masks is not None and object_id in due_masks:
+            ok &= due_masks[object_id]
         if not ok.any():
             continue
         if max_turn is not None:

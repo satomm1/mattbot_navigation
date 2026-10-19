@@ -23,9 +23,17 @@ Implements navigation for the mobile robot. Uses A* to plan paths, smooths them 
 - **Computed once**: each obstacle is evaluated alone against the obstacle-free roadmap; other obstacles and belief never change it. It is recomputed only if its own footprint changes the set of blocked edges.
 - **Outputs** (`observe_importance:=true`): `/observation/roadmap` and `/observation/importance` (RViz MarkerArrays), `~/.ros/mattbot_roadmap/importance_latest.png` and `.json`.
 
+### Endpoint checks
+
+On-path stops are never placed within `skip_start_m` (0.5 m) of the start or `skip_goal_m` (0.8 m) of the goal. An eligible object that gets no on-path stop is checked while the robot is stopped anyway:
+- **AT_START**: from the start pose before ALIGN. Only on the first plan for a goal (`SelectObservations.allow_start_check`), never on a mid-trip replan.
+- **AT_GOAL**: from the park pose, after PARK_POSE and before the final heading turn (which is also the turn back). `patrol.py` counts a waypoint as reached on the IDLE after parking, so its wait starts after these checks.
+
+The cost is only the turn and dwell beyond the turn the robot makes anyway. A bundle over `max_cost_s` drops its least valuable targets. Both kinds are `ObservationStop` kinds (`mattbot_dds`), so the planner and navigator must be deployed together.
+
 ### Observation detours
 
-`navigation_utils/detour.py`: extra driving needed to see an object that **no point of the planned path can see** (objects visible from the path are always left to opportunistic stops). Each object's viewshed (the same ray casting as opportunistic stops) is mapped to reachable C-space cells; the robot leaves the path anywhere, drives to a viewpoint, looks, and replans to the goal. detour(v) = F(v) + G(v) - L, with F one Dijkstra from the whole path (offset by distance driven along it) and G one from the goal, so a path query costs two grid Dijkstras for all objects (~15 ms on the y2e2 map).
+`navigation_utils/detour.py`: extra driving needed to see an object that **no opportunistic or endpoint stop serves**: it got no stop on this path, or (belief still above `check_below_belief`) no usable path point, start pose or park pose sees it. Each object's viewshed (the same ray casting as opportunistic stops) is mapped to reachable C-space cells; the robot leaves the path anywhere, drives to a viewpoint, looks, and replans to the goal. detour(v) = F(v) + G(v) - L, with F one Dijkstra from the whole path (offset by distance driven along it) and G one from the goal, so a path query costs two grid Dijkstras for all objects (~15 ms on the y2e2 map).
 
 **Decision** (`observation_policy.py`, value of information, all in metres): for a ledger object with belief b in [0, 1],
 `p_gone = (1 - b)/2`, `V = q * N * p_gone * I_o` (driving the fleet saves over the next N trips if the check finds it gone), `C = detour + v_cruise * (turn + dwell)`. A detour is taken if `V - C > margin`, at most one per path (objects seen from the same viewpoint are bundled; their V adds). `D* = V - v_cruise * dwell` bounds each object's search; objects with D* <= 0 (just seen, or blocking nothing) are never searched.
@@ -58,6 +66,27 @@ rosservice call /observation/scout_query "{start: {x: 2.0, y: 1.8, theta: 0.0}, 
 ```
 
 Known limitations and open issues of importance, detours, scouts and the re-check policy are tracked in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+
+### Check timing and revalidation
+
+The rules are evaluated for the time a check would happen, not for when the path is requested. The navigator sends the trajectory time of every request pose (`SelectObservations.times`). The planner predicts each object's belief with the belief model of `/object_beliefs` (hold `hold_s` after `last_stamp`, then linear decay over `decay_s`):
+- An object gets an on-path stop only where it will be due when the robot gets there (`ThresholdPolicy.t_due`: belief ≤ `check_below_belief` and cooldown over). An object that decays while the robot drives is therefore checked on this leg, not the next one.
+- AT_GOAL takes objects due on arrival. Detour and scout values V use the belief at the moment the robot would look.
+- `check_etas` gives each stop's check time: trajectory time, plus the cost of the checks before it, plus leave point → viewpoint for a detour.
+
+When the robot gets to a stop, it asks `/observation/revalidate` (`mattbot_dds/RevalidateStop`) whether the stop still passes the rules with the current ledger, evaluated at max(now, planned time). An object that was re-sighted (own camera or a peer), removed, or checked in the meantime is skipped (`"Skipping check of X (reason)"`). A detour is also dropped at its leave point if no target is still worth it, and its viewpoint check is skipped if nothing is left. If the service cannot be called, the robot does the check.
+
+### Fleet coordination
+
+Robots announce their planned checks so that two robots do not check the same object at once. The earliest check wins.
+- **Announcing:** the navigator publishes its complete current set (`/observation/intents_local`, `mattbot_dds/ObservationIntentArray`: object, kind, ETA, committed) on every change and at 1 Hz. The ledger node sends it to the other robots on DDS `IntentTopic{id}` every 2 s and on change. ETAs travel as seconds from the send time, so robots need no synced clocks. It also publishes every live intent of the fleet on `/observation/intents`. A robot whose set has not been refreshed for 10 s is forgotten.
+- **Who gives way** (`observation_policy.yields_to`):
+  - **Opportunistic and endpoint checks** never give way. They are skipped only by revalidation.
+  - **A detour** gives way to another robot's check of any kind that is earlier by more than `observe_intent_margin_s` (10 s). Within the margin, a committed check (en route or observing) beats an uncommitted one, then the lower robot id wins. This is tested at plan time (`skip (robot N checks first)`), every cycle before the leave point, and while driving to the viewpoint (`"Detour to check X yielded to robot N"`, then the robot replans to its goal). It no longer gives way within `observe_intent_commit_s` (15 s) of the viewpoint.
+  - **A scout**, the most expensive check, gives way to any check that is not later by more than the margin, unless that check is also a scout and its robot has a higher id. For now this only blocks scout decisions, because scouts are not executed.
+- A yielded object is not offered again while the winner still plans its check. If the winner withdraws, a pending detour comes back at once.
+- Launch args: `observe_coordinate` (default true; false = no announcing or giving way), `observe_intent_margin_s`, `observe_intent_commit_s`.
+- All robots must run this version. A robot with the old stack announces nothing, so newer robots never give way to it.
 
 ### Launch
 
