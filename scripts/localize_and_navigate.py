@@ -1663,30 +1663,29 @@ class Navigator:
             )
 
         _nav_loginfo("computing navigation plan")
-        success = False
+        # A failure is retried once, in any mode; a second failure clears the goal. (Outside IDLE /
+        # STOPPED_FOR_AGENT a failure used to fall into the success branch and loop on solve() forever.)
+        success = problem.solve()
         while not success:
-            success = problem.solve()
-            if not success and (self.mode == Mode.IDLE or self.mode == Mode.STOPPED_FOR_AGENT):
-                _nav_loginfo("Planning failed")
-                if self._detour is not None:
-                    # Never count a failed detour leg against the real goal (would clear it)
-                    self._abandon_detour("no path to the viewpoint")
-                    return
-                self.times_planned_failed += 1
-
-                if self.times_planned_failed > 1:
-                    _nav_loginfo("Planning failed too many times, stopping")
-                    self.times_planned_failed = 0
-
-                    self.x_g = None
-                    self.y_g = None
-                    self.theta_g = None
-                    self.switch_mode(Mode.IDLE)
-                    return
-            else:
+            _nav_loginfo("Planning failed")
+            if self._detour is not None:
+                # Never count a failed detour leg against the real goal (would clear it)
+                self._abandon_detour("no path to the viewpoint")
+                return
+            self.times_planned_failed += 1
+            if self.times_planned_failed > 1:
+                _nav_loginfo("Planning failed too many times, stopping")
                 self.times_planned_failed = 0
-                _nav_loginfo("Planning Succeeded")
-                planned_path = problem.path
+                self.x_g = None
+                self.y_g = None
+                self.theta_g = None
+                self.nav_vel_pub.publish(Twist())
+                self.switch_mode(Mode.IDLE)
+                return
+            success = problem.solve()
+        self.times_planned_failed = 0
+        _nav_loginfo("Planning Succeeded")
+        planned_path = problem.path
 
         if self.use_social_astar and self.frequent is not None:
             tel = getattr(problem, "last_solve_telemetry", None)
@@ -1708,8 +1707,13 @@ class Navigator:
         if planned_path == None:
             return
         elif len(planned_path) < 4:
-            _nav_loginfo("Path too short to track")
-            # self._set_park_goal_from_traj(self._traj_endpoint_for_park(planned_path))
+            # Already (almost) at the goal: park at the end of this path with the goal heading. The cached park
+            # target belongs to an earlier plan (or is the map origin before any plan): the pose controller would
+            # drive straight at it, ignoring obstacles.
+            end = planned_path[-1] if len(planned_path) else (gx, gy)
+            self.park_x, self.park_y = float(end[0]), float(end[1])
+            self.park_th = float(gth) if gth is not None else float(self.theta)
+            _nav_loginfo("Path too short to track; parking at (%.2f, %.2f)", self.park_x, self.park_y)
             self._enter_park_pose()
             return
 

@@ -82,13 +82,13 @@ Code references are relative to `mattbot_navigation/` unless another package is 
 | 6.4 | Low | `path_still_valid` now ignores path points within `robot_d` of the robot, so a ledger object appearing right next to it doesn't cause stop/replan loops. A real new blockout within 0.8 m ahead is also ignored by this check, though other safety layers such as person stops still apply. | Ignore only blockouts that already overlapped the robot when they appeared. |
 | 6.5 | Low | Detours (and all observation) are disabled during multi-agent missions (`localize_and_navigate_multi_agent.py`, `_observation_allowed`). | Integrate with the multi-agent timing first, if wanted. |
 
-**Pre-existing navigator issues noticed along the way.** None of these were changed.
-- `replan()` failure loop: outside IDLE and STOPPED_FOR_AGENT, a failed `solve()` loops again, and its `else` branch reads `problem.path` as if planning had succeeded.
+**Pre-existing navigator issues noticed along the way.** Two are fixed (marked); the others are unchanged.
+- ~~`replan()` failure loop~~ **Fixed (2026-10-19):** outside IDLE and STOPPED_FOR_AGENT, a failed `solve()` fell into the success branch and looped on `solve()` forever (the navigator loop froze). A failure is now retried once in any mode, and a second one clears the goal.
 - `cmd_nav_callback` cannot interrupt TRACK, because `replan()` returns early in TRACK.
 - The goal check in `external_goal_callback` and the post-recovery start check use the static `occupancy` only, so a goal inside an object blockout is accepted.
 - `map_callback` builds `occupancy` only once; later `/navigation_map` updates are ignored (marked FIXME in the code).
 - `aligned_goal` is defined twice.
-- The "Path too short to track" branch parks at a stale `park_x/y` (the refresh line is commented out).
+- ~~The "Path too short to track" branch parks at a stale `park_x/y`~~ **Fixed (2026-10-19):** with a goal (almost) at the robot, the pose controller drove straight, ignoring obstacles, toward the previous plan's end or the map origin (0, 0), or never got there. It now parks at the end of the short path with the goal heading. Sim: `goal_at_robot`.
 - The second planning failure clears `x_g/y_g/theta_g`. Detours are guarded against this, but other callers aren't.
 
 ## 7. Mapper and ledger blockout (`scripts/occupancy_grid_mapper.py`)
