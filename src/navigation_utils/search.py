@@ -3,6 +3,8 @@ import math
 import numpy as np
 import time
 
+from navigation_utils import lattice_astar
+
 class AStar(object):
     """Represents a motion planning problem to be solved using A*"""
 
@@ -166,6 +168,13 @@ class AStar(object):
         return list(reversed(path))
 
     def solve(self, step_resolution=1):
+        footprint_lookup = getattr(self.occupancy, "footprint_lookup", None)
+        if step_resolution == 1 and footprint_lookup is not None:
+            free = footprint_lookup()
+            solved = self._solve_compiled(free) if self.use_compiled else None
+            if solved is not None:
+                return solved
+            return self._solve_on_lookup(free)
         time_limit = self.max_plan_time_sec
 
         t_start = time.time()  # wall clock: time_limit is a compute budget
@@ -203,4 +212,136 @@ class AStar(object):
                         self.priority_queue,
                         (current_cost + edge + self.h(x_neigh) - h_current, x_neigh),
                     )
+        return False
+
+    use_compiled = True  # the numba loop when numba is available (lattice_astar.AVAILABLE)
+
+    def _solve_compiled(self, free):
+        """_solve_on_lookup in compiled code (navigation_utils.lattice_astar): the same path. Sets only self.path
+        (not closed_set / came_from / cost_to_arrive). None when it cannot be used."""
+        if self.robots_x is not None:
+            robots = list(zip(self.robots_x, self.robots_y))
+            objects = [(self.obj_x[ii], self.obj_y[ii], self.obj_d[ii] / 2 + self.robots_d / 2)
+                       for ii in range(len(self.obj_x))]
+            robots_d2 = self.robots_d * self.robots_d
+        else:
+            robots, objects, robots_d2 = [], [], 0.0
+        t_start = time.time()  # wall clock: compute time
+        result = lattice_astar.solve(free, self.occupancy, self.resolution, self._neighbor_offsets,
+                                     (self._x_min, self._x_max, self._y_min, self._y_max), self.x_init, self.x_goal,
+                                     robots, robots_d2, objects, self.max_plan_time_sec)
+        if result is None:
+            return None
+        status, path = result
+        if status == lattice_astar.FOUND:
+            self.path = path
+            t_end = time.time()  # wall clock: compute time
+            print(f"A* found a path in {t_end - t_start:.2f} seconds.")
+            return True
+        if status == lattice_astar.TIMED_OUT:
+            print("A* took too long.")
+        return False
+
+    def _solve_on_lookup(self, free):
+        """solve() with get_neighbors / is_free / h / distance inlined and the occupancy's precomputed footprint
+        lookup (StochOccupancyGrid2D.footprint_lookup) in place of occupancy.is_free. The same float states,
+        expansion order, costs and tie-breaks as solve(), so the same path; only faster (A* dominates planning).
+        """
+        occ = self.occupancy
+        width, height = occ.width, occ.height
+        free_cells = np.ascontiguousarray(free, dtype=bool).tobytes()  # row-major, 1 = free
+        ox, oy, gres = occ.origin_x, occ.origin_y, occ.resolution
+        # occupancy.is_free re-snaps to its own resolution; a no-op for states already on the same lattice.
+        resnap = gres != self.resolution
+        occupancy_is_free = occ.is_free
+        res = self.resolution
+        offsets = self._neighbor_offsets
+        xmin, xmax, ymin, ymax = self._x_min, self._x_max, self._y_min, self._y_max
+        gx_goal, gy_goal = self.x_goal
+        if self.robots_x is not None:
+            robots_d2 = self.robots_d * self.robots_d
+            robots = list(zip(self.robots_x, self.robots_y))
+            objects = [(self.obj_x[ii], self.obj_y[ii], self.obj_d[ii] / 2 + self.robots_d / 2)
+                       for ii in range(len(self.obj_x))]
+        else:
+            robots = objects = None
+
+        closed_set = self.closed_set
+        came_from = self.came_from
+        cost_to_arrive = self.cost_to_arrive
+        queue = self.priority_queue
+        heappop, heappush, hypot = heapq.heappop, heapq.heappush, math.hypot
+        time_limit = self.max_plan_time_sec
+
+        t_start = time.time()  # wall clock: time_limit is a compute budget
+        while queue:
+            current_cost, x_current = heappop(queue)
+            if x_current in closed_set:
+                continue
+
+            if x_current == self.x_goal:
+                t_end = time.time()  # wall clock: compute time
+                self.path = self.reconstruct_path()
+                print(f"A* found a path in {t_end - t_start:.2f} seconds.")
+                return True
+
+            if time.time() - t_start > time_limit:  # wall clock: compute budget
+                print("A* took too long.")
+                return False
+
+            closed_set.add(x_current)
+            x0, y0 = x_current
+            h_current = abs(x0 - gx_goal) + abs(y0 - gy_goal)
+            cost_current = cost_to_arrive[x_current]
+
+            for dx, dy in offsets:
+                # get_neighbors
+                nx = x0 + dx
+                ny = y0 + dy
+                if nx < xmin or nx >= xmax or ny < ymin or ny >= ymax:
+                    continue
+                sx = res * round(nx / res)
+                sy = res * round(ny / res)
+                # is_free
+                if not (xmin <= sx < xmax and ymin <= sy < ymax):
+                    continue
+                if resnap:
+                    cx, cy = gres * round(sx / gres), gres * round(sy / gres)
+                else:
+                    cx, cy = sx, sy
+                grid_x = int((cx - ox) / gres)
+                grid_y = int((cy - oy) / gres)
+                if 0 <= grid_x < width and 0 <= grid_y < height:
+                    if not free_cells[grid_y * width + grid_x]:
+                        continue
+                elif not occupancy_is_free((sx, sy)):
+                    continue
+                if robots is not None:
+                    blocked = False
+                    for rx, ry in robots:
+                        ddx = rx - sx
+                        ddy = ry - sy
+                        if ddx * ddx + ddy * ddy < robots_d2:
+                            blocked = True
+                            break
+                    if not blocked:
+                        for qx, qy, r in objects:
+                            ddx = qx - sx
+                            ddy = qy - sy
+                            if ddx * ddx + ddy * ddy < r * r:
+                                blocked = True
+                                break
+                    if blocked:
+                        continue
+                x_neigh = (sx, sy)
+                # solve
+                if x_neigh in closed_set:
+                    continue
+                edge = hypot(x0 - sx, y0 - sy)
+                tentative_cost_to_arrive = cost_current + edge
+                if x_neigh not in cost_to_arrive or tentative_cost_to_arrive < cost_to_arrive[x_neigh]:
+                    came_from[x_neigh] = x_current
+                    cost_to_arrive[x_neigh] = tentative_cost_to_arrive
+                    heappush(queue, (current_cost + edge + (abs(sx - gx_goal) + abs(sy - gy_goal)) - h_current,
+                                     x_neigh))
         return False

@@ -2,3 +2,4 @@
 maps/occupancy_grid_map.json
 *.pyc
 scripts/patrol.txt
+__pycache__/

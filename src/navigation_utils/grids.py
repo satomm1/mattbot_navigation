@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.ndimage import maximum_filter1d
 
 from social_path_planning import (
     attach_wall_distance_cache,
@@ -40,6 +41,8 @@ class StochOccupancyGrid2D(object):
         self.thresh = thresh
         self.robot_d=robot_d
         self._d_right = None  # Cache for distance to the nearest wall on the right
+        self._footprint_free = None  # (probs, robot_d, resolution, HxW bool): is_free for every cell
+        self._footprint_misses = (None, None, None, 0)  # (probs, robot_d, resolution, window checks)
         self._wall_distance_cache_use_ros_layout = wall_distance_cache_use_ros_layout
 
         self.extent = [self.origin_x, self.origin_x + self.width * self.resolution,
@@ -110,17 +113,73 @@ class StochOccupancyGrid2D(object):
         x, y = self.snap_to_grid(state)
         grid_x = int((x - self.origin_x) / self.resolution)
         grid_y = int((y - self.origin_y) / self.resolution)
+        if 0 <= grid_x < self.width and 0 <= grid_y < self.height:
+            free = self._footprint_lookup()
+            if free is not None:
+                return bool(free[grid_y, grid_x])
+        return self._is_free_window(grid_x, grid_y)
 
+    def _footprint_window(self, grid_x, grid_y):
         half_config_size = int(round(self.robot_d / 2 / self.resolution))
         config_x_lower = max(0, grid_x - half_config_size)
         config_y_lower = max(0, grid_y - half_config_size)
         config_x_upper = min(self.width, grid_x + half_config_size)
         config_y_upper = min(self.height, grid_y + half_config_size)
-        window = self.probs[config_y_lower:config_y_upper, config_x_lower:config_x_upper]
+        return config_x_lower, config_x_upper, config_y_lower, config_y_upper
+
+    def _is_free_window(self, grid_x, grid_y):
+        x0, x1, y0, y1 = self._footprint_window(grid_x, grid_y)
+        window = self.probs[y0:y1, x0:x1]
         if window.size == 0:
             return False
         return not np.any(window > 85)
-    
+
+    # A planner calls is_free on hundreds of thousands of cells per plan, so after this many window checks on
+    # the same probs / robot_d, is_free is precomputed for the whole grid (about the cost of that many checks).
+    FOOTPRINT_LOOKUP_AFTER = 2000
+
+    def _footprint_lookup(self):
+        """The precomputed is_free grid, once is_free has checked enough cells with the same probs / robot_d."""
+        key = (self.probs, self.robot_d, self.resolution)
+        free = self._footprint_free
+        if free is not None and free[0] is key[0] and free[1:3] == key[1:]:
+            return free[3]
+        probs, robot_d, resolution, misses = self._footprint_misses
+        if probs is key[0] and (robot_d, resolution) == key[1:]:
+            misses += 1
+        else:
+            misses = 1
+        if misses < self.FOOTPRINT_LOOKUP_AFTER:
+            self._footprint_misses = key + (misses,)
+            return None
+        return self.footprint_lookup()
+
+    def footprint_lookup(self):
+        """HxW bool: is_free for every cell (row = grid_y, col = grid_x), cached for the current probs / robot_d.
+
+        probs and robot_d are compared by identity / value, so assigning a new probs array (or a shallow copy
+        with its own probs or robot_d) rebuilds it; changing probs in place is not detected.
+        """
+        key = (self.probs, self.robot_d, self.resolution)
+        free = self._footprint_free
+        if free is None or free[0] is not key[0] or free[1:3] != key[1:]:
+            self._footprint_free = key + (self.footprint_free_grid(),)
+            self._footprint_misses = (None, None, None, 0)
+        return self._footprint_free[3]
+
+    def footprint_free_grid(self):
+        """is_free for every cell, built (not cached): no cell > 85 in the window [g - h, g + h) on both axes.
+
+        The window is clipped to the map, so it is never empty inside the map unless h is 0 (never free)."""
+        half_config_size = int(round(self.robot_d / 2 / self.resolution))
+        if half_config_size <= 0:
+            return np.zeros((self.height, self.width), dtype=bool)
+        n = 2 * half_config_size  # an even size with origin 0 covers [i - h, i + h)
+        occupied = np.asarray(self.probs > 85)
+        occupied = maximum_filter1d(occupied, n, axis=0, mode="constant", cval=0)
+        occupied = maximum_filter1d(occupied, n, axis=1, mode="constant", cval=0)
+        return ~occupied
+
     def find_nearest_free(self, state, max_radius=1.0, step=None):
         """
         Return (free_xy, distance_m) nearest to state within max_radius, or (None, None).
