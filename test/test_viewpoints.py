@@ -175,3 +175,36 @@ def test_usable_points_skip_zones():
     assert not usable[:5].any() and usable[5]  # arc < 0.5 m
     assert usable[21] and not usable[23:].any()  # within 0.8 m (straight line) of the goal
     assert not usable_points(path[:1]).any()
+
+
+# ---- width rule (obj_width): most of the object must be in view ----
+
+def test_width_viewshed_range_and_wall():
+    vs = compute_viewshed(empty_map(), (5.0, 3.0), (0.0, 0.0), RES, r_min=1.0, r_max=2.0, obj_width=0.5)
+    assert vs.contains_xy([(6.55, 3.05)])[0] and not vs.contains_xy([(5.55, 3.05), (7.55, 3.05)]).any()
+    blocking = empty_map()
+    blocking[:, 60] = True  # vertical wall at x = 6.0..6.1
+    vs = compute_viewshed(blocking, (5.0, 3.0), (0.0, 0.0), RES, r_min=0.5, r_max=3.0, obj_width=0.5)
+    assert vs.contains_xy([(5.85, 3.05), (3.05, 3.05)]).all()
+    assert not vs.contains_xy([(7.05, 3.05), (6.05, 3.05)]).any()
+
+
+def test_wall_corner_hiding_most_of_the_object_is_not_a_viewpoint():
+    """From (2.05, 3.05) a 1 m object at (5, 3) is seen past a wall corner at x = 4.0..4.1."""
+    hides_most = empty_map()
+    hides_most[30:, 40] = True  # wall from y = 3.0 up: hides the centre and the upper half
+    vs = compute_viewshed(hides_most, (5.0, 3.0), (0.0, 0.0), RES, r_min=1.0, r_max=3.5, obj_width=1.0)
+    assert not vs.contains_xy([(2.05, 3.05)])[0]
+    clips_edge = empty_map()
+    clips_edge[32:, 40] = True  # wall from y = 3.2 up: hides only the top edge
+    vs = compute_viewshed(clips_edge, (5.0, 3.0), (0.0, 0.0), RES, r_min=1.0, r_max=3.5, obj_width=1.0)
+    assert vs.contains_xy([(2.05, 3.05)])[0]
+
+
+def test_one_stray_cell_does_not_hide_a_wide_object():
+    blocking = empty_map()
+    blocking[30, 40] = True  # one cell on the line from (2.05, 3.05) to the object
+    vs = compute_viewshed(blocking, (5.0, 3.0), (0.0, 0.0), RES, r_min=1.0, r_max=3.5, obj_width=1.0)
+    assert vs.contains_xy([(2.05, 3.05)])[0]
+    narrow = compute_viewshed(blocking, (5.0, 3.0), (0.0, 0.0), RES, r_min=1.0, r_max=3.5)
+    assert not narrow.contains_xy([(2.05, 3.05)])[0]  # the single centre ray is blocked

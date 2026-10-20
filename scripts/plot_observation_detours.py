@@ -89,7 +89,8 @@ def main():
     views = {}
     for oid, (x, y, w) in objects.items():
         blockers, _sig = nearby_blockers(oid, (x, y), all_objects, args.r_max + 1.0)
-        views[oid] = compute_viewshed(blocking, (x, y), origin, res, args.r_min, args.r_max, blockers=blockers)
+        views[oid] = compute_viewshed(blocking, (x, y), origin, res, args.r_min, args.r_max, blockers=blockers,
+                                      obj_width=w)
     t1 = time.time()
     beliefs = {oid: args.belief for oid in objects}
     for item in filter(None, args.beliefs.split(",")):
