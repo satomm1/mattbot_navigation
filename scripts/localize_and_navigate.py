@@ -2244,7 +2244,15 @@ class Navigator:
         )
         self.nav_vel_pub.publish(Twist())
         self.switch_mode(Mode.IDLE)
+        plan_started = self.current_plan_start_time
         self.replan()  # plans to _active_goal(): the viewpoint
+        if self._detour is not None and self.current_plan_start_time != plan_started:
+            # cost_s is only the extra time over staying on the path; a detour can leave the path well before its
+            # viewpoint, so the deadline also covers the planned drive there, the align pause and the looking
+            needed = (self.current_plan_duration + float(self.post_align_pause_sec)
+                      + self.observe_dwell_s * len(stop.object_ids))
+            self._detour["deadline"] = max(self._detour["deadline"], rospy.get_time()
+                                           + self.observe_detour_timeout_factor * needed + 20.0)
 
     def _approach_viewpoint(self, x, y, heading):
         """PARK_POSE onto a detour viewpoint before looking (see observe_viewpoint_tol_m). False if the robot is

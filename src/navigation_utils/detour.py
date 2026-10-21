@@ -18,6 +18,11 @@ Dijkstras for all objects together. L is taken as F(g) so that an on-path viewpo
 Far objects are skipped before any search with a lower bound from straight-line distances:
     detour >= min_i (arc_i + |P_i - o|) + |o - g| - L - 2 r_max
 (every viewpoint lies within r_max of the object o).
+
+Objects the navigator plans around (its /object_map: ledger blockouts, confirmed detections) are not in the
+static C-space. blocked_cells() turns such a layer into coarse cells (inflated by the robot radius, as walls
+are in roadmap.cfree) and DetourPlanner(roadmap, blocked) leaves them out; BlockedPlanners keeps one grid per
+object-layer version, so detours and scouts are priced on the map the robot will drive.
 """
 
 import math
@@ -30,6 +35,7 @@ from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import cKDTree
 
 _STEPS = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+OBJECT_LAYER_OCCUPIED = 86  # the navigator treats object-layer cells > 85 as occupied (StochOccupancyGrid2D.is_free)
 
 
 @dataclass
@@ -73,12 +79,83 @@ class DetourResult:
         }
 
 
-class DetourPlanner:
-    """Grid graph over a roadmap's C-space; built once per roadmap."""
+def blocked_cells(roadmap, layer, origin, resolution, inflate_m, threshold=50):
+    """Coarse roadmap cells (bool, roadmap.cfree's shape) whose centre is within inflate_m of a cell >= threshold
+    of a fine layer (HxW, e.g. the navigator's /object_map, origin / resolution its own). None if none is."""
+    layer = np.asarray(layer)
+    occupied = layer >= threshold
+    if not occupied.any():
+        return None
+    rows, cols = np.nonzero(occupied)
+    # Only the neighbourhood of the occupied cells can be blocked: work on its bounding box
+    pad = int(math.ceil(inflate_m / resolution)) + 1
+    r0, r1 = max(rows.min() - pad, 0), min(rows.max() + pad, layer.shape[0] - 1)
+    c0, c1 = max(cols.min() - pad, 0), min(cols.max() + pad, layer.shape[1] - 1)
+    from scipy import ndimage
 
-    def __init__(self, roadmap):
+    dist = ndimage.distance_transform_edt(~occupied[r0:r1 + 1, c0:c1 + 1]) * resolution  # to the nearest occupied cell
+    h, w = roadmap.shape
+    out = np.zeros((h, w), dtype=bool)
+    x0, x1 = origin[0] + c0 * resolution, origin[0] + (c1 + 1) * resolution
+    y0, y1 = origin[1] + r0 * resolution, origin[1] + (r1 + 1) * resolution
+    rc0 = max(int(math.floor((y0 - roadmap.origin[1]) / roadmap.res)), 0)
+    rc1 = min(int(math.ceil((y1 - roadmap.origin[1]) / roadmap.res)), h - 1)
+    cc0 = max(int(math.floor((x0 - roadmap.origin[0]) / roadmap.res)), 0)
+    cc1 = min(int(math.ceil((x1 - roadmap.origin[0]) / roadmap.res)), w - 1)
+    if rc0 > rc1 or cc0 > cc1:
+        return None
+    rr, cc = np.mgrid[rc0:rc1 + 1, cc0:cc1 + 1]
+    cy = roadmap.origin[1] + (rr + 0.5) * roadmap.res  # coarse cell centres
+    cx = roadmap.origin[0] + (cc + 0.5) * roadmap.res
+    fr = np.floor((cy - origin[1]) / resolution).astype(np.int64) - r0
+    fc = np.floor((cx - origin[0]) / resolution).astype(np.int64) - c0
+    inside = (fr >= 0) & (fr < dist.shape[0]) & (fc >= 0) & (fc < dist.shape[1])
+    near = np.zeros(rr.shape, dtype=bool)
+    near[inside] = dist[fr[inside], fc[inside]] <= inflate_m
+    out[rc0:rc1 + 1, cc0:cc1 + 1] = near
+    return out if out.any() else None
+
+
+class BlockedPlanners:
+    """The DetourPlanner (and ScoutPlanner) for the current object layer, rebuilt when its version key changes.
+    base: the static planner (no layer, or nothing blocked)."""
+
+    def __init__(self, base, inflate_m, with_scout=False, threshold=OBJECT_LAYER_OCCUPIED):
+        self.base = base
+        self.inflate_m = float(inflate_m)
+        self.threshold = threshold
+        self.with_scout = with_scout
+        self.key = None
+        self.planner = base
+        self.scout = self._scout(base)
+
+    def _scout(self, planner):
+        if not self.with_scout:
+            return None
+        from navigation_utils.scout import ScoutPlanner
+
+        return ScoutPlanner(planner)
+
+    def get(self, layer, key, origin, resolution):
+        """(DetourPlanner, ScoutPlanner or None) with the layer's objects blocked. key: hashable layer version
+        (layer None: nothing blocked)."""
+        key = None if layer is None else key
+        if key != self.key:
+            blocked = None if layer is None else blocked_cells(self.base.roadmap, layer, origin, resolution,
+                                                              self.inflate_m, self.threshold)
+            self.planner = self.base if blocked is None else DetourPlanner(self.base.roadmap, blocked)
+            self.scout = self._scout(self.planner)
+            self.key = key
+        return self.planner, self.scout
+
+
+class DetourPlanner:
+    """Grid graph over a roadmap's C-space; built once per roadmap (and per set of blocked cells)."""
+
+    def __init__(self, roadmap, blocked=None):
+        """blocked: coarse cells to leave out (blocked_cells: objects the navigator plans around), or None."""
         self.roadmap = roadmap
-        free = roadmap.cfree
+        free = roadmap.cfree if blocked is None else roadmap.cfree & ~blocked
         h, w = free.shape
         self.cells = np.argwhere(free)  # node -> (row, col)
         self.n = len(self.cells)

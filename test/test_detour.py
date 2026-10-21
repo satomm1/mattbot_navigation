@@ -172,3 +172,46 @@ def test_project_to_path():
     dist, along = DetourPlanner.project_to_path([(2.0, 1.0), (5.0, 2.0), (-1.0, 0.0)], path, arc)
     assert dist.tolist() == pytest.approx([1.0, 1.0, 1.0])
     assert along.tolist() == pytest.approx([2.0, 6.0, 0.0])
+
+
+# ---- objects the navigator plans around (KNOWN_ISSUES 4.1) ----
+
+def object_layer(shape, boxes, value=100):
+    """Fine layer (RES, origin (0, 0)) as the navigator's /object_map: value inside each (x0, y0, x1, y1), else -1."""
+    layer = np.full(shape, -1, dtype=np.int16)
+    for x0, y0, x1, y1 in boxes:
+        layer[int(round(y0 / RES)):int(round(y1 / RES)), int(round(x0 / RES)):int(round(x1 / RES))] = value
+    return layer
+
+
+def test_object_in_the_door_closes_the_detour_into_the_room(room):
+    from navigation_utils.detour import BlockedPlanners, blocked_cells
+
+    rm, planner, blocking = room
+    grid = corridor_with_room()
+    path = corridor_path(planner)
+    _vs, t = target(planner, blocking, "box", 10.0, 7.0)
+    assert "box" in planner.compute(path, {"box": t})  # static grid: through the door
+    door = object_layer(grid.shape, [(8.6, 3.0, 9.4, 3.6)])  # a chair in the doorway
+    cells = blocked_cells(rm, door, (0.0, 0.0), RES, 0.4)
+    assert cells is not None and cells.sum() > 0
+    planners = BlockedPlanners(planner, 0.4)
+    blocked, _scout = planners.get(door, "v1", (0.0, 0.0), RES)
+    _vs, tb = target(blocked, blocking, "box", 10.0, 7.0)
+    assert "box" not in blocked.compute(path, {"box": tb})  # the door is closed: no way to a viewpoint
+    assert planners.get(door, "v1", (0.0, 0.0), RES)[0] is blocked  # cached per version key
+    far = object_layer(grid.shape, [(14.0, 1.2, 14.4, 1.6)])  # an object at the far end of the corridor
+    other, _s = planners.get(far, "v2", (0.0, 0.0), RES)
+    _vs, to = target(other, blocking, "box", 10.0, 7.0)
+    assert other.compute(path[:len(path) // 2], {"box": to})["box"].detour_m == pytest.approx(
+        planner.compute(path[:len(path) // 2], {"box": t})["box"].detour_m, abs=1e-6)
+    assert planners.get(None, None, None, None)[0] is planner  # no layer: the static grid
+
+
+def test_low_values_in_the_object_layer_do_not_block(room):
+    from navigation_utils.detour import OBJECT_LAYER_OCCUPIED, blocked_cells
+
+    rm, _planner, _blocking = room
+    grid = corridor_with_room()
+    weak = object_layer(grid.shape, [(8.6, 3.0, 9.4, 3.6)], value=OBJECT_LAYER_OCCUPIED - 1)
+    assert blocked_cells(rm, weak, (0.0, 0.0), RES, 0.4, OBJECT_LAYER_OCCUPIED) is None

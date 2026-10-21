@@ -2,6 +2,10 @@
 """Chooses where along a planned path to stop and check whether ledger objects are still there.
 
 Inputs:   /map                  static map; line of sight is computed on it
+          /map_mod              manual map edits (optional): the roadmap, detour grid and importance use
+                                max(/map, /map_mod), as the navigator's /navigation_map does
+          /object_map           the navigator's object layer (occupancy_grid_mapper): detours and scouts are
+                                priced on the driving grid with these objects blocked (KNOWN_ISSUES 4.1)
           /object_beliefs       per-object belief (mattbot_dds object_belief_map.py)
           /observation/events   navigator observation progress (for the per-object cooldown)
 Service:  /observation/select   (mattbot_dds/SelectObservations) path (+ trajectory times) -> observation stops
@@ -134,11 +138,14 @@ class ObservationPlannerNode:
         self.blocking = None
         self.viewsheds = {}  # object_id -> (Viewshed, blocker signature)
         self.candidates = []
+        self.object_layer = None  # (layer, version key, origin, resolution) of /object_map
         self.last_beliefs_time = None
 
         self.viewshed_pub = rospy.Publisher("/observation/viewsheds", OccupancyGrid, queue_size=1, latch=True)
         self.stops_pub = rospy.Publisher("/observation/stops", MarkerArray, queue_size=1, latch=True)
         rospy.Subscriber("/map", OccupancyGrid, self.map_callback, queue_size=1)
+        rospy.Subscriber("/map_mod", OccupancyGrid, self.map_mod_callback, queue_size=1)
+        rospy.Subscriber("/object_map", OccupancyGrid, self.object_map_callback, queue_size=1)
         rospy.Subscriber("/object_beliefs", ObjectBeliefArray, self.beliefs_callback, queue_size=1)
         rospy.Subscriber("/observation/events", ObservationEvent, self.event_callback, queue_size=50)
         # Fleet coordination: detours and scouts give way to other robots' earlier checks (observation_policy.yields_to)
@@ -164,6 +171,27 @@ class ObservationPlannerNode:
         rospy.loginfo("observation_planner: map %dx%d @ %.3f m", msg.info.width, msg.info.height, msg.info.resolution)
         if self.importance is not None:
             self.importance.set_map(msg)
+
+    def map_mod_callback(self, msg):
+        if self.importance is not None:
+            self.importance.set_map_mod(msg)
+
+    def object_map_callback(self, msg):
+        """The navigator's object layer: blocked for detour / scout distances (the version key is its content)."""
+        import hashlib
+
+        layer = np.asarray(msg.data, dtype=np.int8).reshape(msg.info.height, msg.info.width)
+        key = hashlib.sha1(layer.tobytes()).hexdigest()
+        with self.lock:
+            self.object_layer = (layer, key, (msg.info.origin.position.x, msg.info.origin.position.y),
+                                 msg.info.resolution)
+
+    def _planners(self):
+        """(DetourPlanner, ScoutPlanner) with the navigator's current objects blocked (call with self.lock held)."""
+        if self.importance.blocked is None:
+            return self.importance.detour_planner, self.importance.scout_planner
+        layer, key, origin, res = self.object_layer if self.object_layer is not None else (None, None, None, None)
+        return self.importance.blocked.get(layer, key, origin, res)
 
     def beliefs_callback(self, msg):
         cands = [
@@ -317,6 +345,7 @@ class ObservationPlannerNode:
         planner = self.importance.detour_planner
         if planner is None:
             return None, {}
+        planner = self._planners()[0]
         targets = self._viewpoint_targets(planner, dcands, views, lambda c: self.policy.max_detour_m(c, t_bound))
         t0 = time.time()  # wall clock: compute time
         detours = planner.compute(path_xy, targets, self.detour_params)
@@ -496,6 +525,8 @@ class ObservationPlannerNode:
             decision.idle = self.idle_since is not None and idle_s >= self.scout_min_idle_s
             decision.idle_s = idle_s
             scout = self.importance.scout_planner
+            if scout is not None:
+                scout = self._planners()[1]
             if search and self.blocking is not None and scout is not None:
                 eligible = [c for c in self.candidates if self.policy.scout_eligible(c, now)]
                 self.ensure_viewsheds(eligible)
@@ -675,6 +706,8 @@ class RoadmapWorker:
         self.lock = threading.Lock()
         self.wake = threading.Event()
         self.pending_map = None
+        self.map_mod_msg = None  # /map_mod (manual edits), merged into the roadmap's map
+        self.blocked = None  # detour.BlockedPlanners: detour / scout grids with the object layer blocked
         self.objects = None  # latest {object_id: (x, y, width)} (local map frame)
         self.objects_dirty = False
         self.map_msg = None
@@ -696,6 +729,14 @@ class RoadmapWorker:
     def set_map(self, msg):
         with self.lock:
             self.pending_map = msg
+        self.wake.set()
+
+    def set_map_mod(self, msg):
+        """Manual edits: rebuild the roadmap from max(/map, /map_mod) (once the static map is known)."""
+        with self.lock:
+            self.map_mod_msg = msg
+            if self.pending_map is None and self.map_msg is not None:
+                self.pending_map = self.map_msg
         self.wake.set()
 
     def set_detours(self, path_xy, detours, targets, options, evaluations=(), visible=()):
@@ -758,6 +799,10 @@ class RoadmapWorker:
         data = np.asarray(msg.data, dtype=np.int8)
         info = msg.info
         origin = (info.origin.position.x, info.origin.position.y)
+        mod = self.map_mod_msg
+        if mod is not None and len(mod.data) == len(data) and mod.info.width == info.width:
+            # The navigator drives on max(/map, /map_mod) (its /navigation_map); line of sight stays on /map
+            data = np.maximum(data, np.asarray(mod.data, dtype=np.int8))
         fp = map_fingerprint(data, info.width, info.height, info.resolution, origin, self.roadmap_params)
         if fp == self.fingerprint:
             return  # same static map: keep the roadmap and every computed importance
@@ -767,9 +812,11 @@ class RoadmapWorker:
         )
         self.map_msg, self.fingerprint, self.roadmap = msg, fp, roadmap
         if self.detour_enabled or self.scout_enabled:
-            from navigation_utils.detour import DetourPlanner
+            from navigation_utils.detour import BlockedPlanners, DetourPlanner
 
             self.detour_planner = DetourPlanner(roadmap)
+            self.blocked = BlockedPlanners(self.detour_planner, self.roadmap_params.robot_radius,
+                                           with_scout=self.scout_enabled)
         if self.scout_enabled:
             from navigation_utils.scout import ScoutPlanner
 
