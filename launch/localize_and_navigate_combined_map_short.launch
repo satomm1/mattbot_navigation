@@ -38,10 +38,7 @@
   <arg name="observe_intent_margin_s" default="10.0"/>
   <arg name="observe_intent_commit_s" default="15.0"/>
 
-  <param name="alpha1" value="0.075"/>
-  <param name="alpha2" value="0.2"/>
-  <param name="alpha3" value="0.1"/>
-  <param name="alpha4" value="0.075"/>
+  <!-- AMCL odom/laser values live in mattbot_bringup/launch/amcl.launch; z_hit/z_rand/sigma_hit below are read by mattbot_mcl/localization_quality -->
   <param name="z_hit"  value="0.95"/>
   <param name="z_rand" value="0.05"/>
   <param name="sigma_hit" value="0.15"/>

@@ -12,7 +12,6 @@ from mattbot_dds.msg import (
 )
 from mattbot_dds.srv import RevalidateStop, SelectObservations
 import tf
-from dynamic_reconfigure.client import Client
 
 import copy
 import time
@@ -428,14 +427,8 @@ class Navigator:
 
         self.om_prev = 0.0
 
-        # Get AMCL parameters to use
-        self.alpha1 = rospy.get_param('/alpha1', 0.1)
-        self.alpha2 = rospy.get_param('/alpha2', 0.1)
-        self.alpha3 = rospy.get_param('/alpha3', 0.1)
-        self.alpha4 = rospy.get_param('/alpha4', 0.1)
-        self.z_hit = rospy.get_param('/z_hit', 0.95)
-        self.z_rand = rospy.get_param('/z_rand', 0.05)
-        self.sigma_hit = rospy.get_param('/sigma_hit', 0.15)
+        # AMCL odom/laser parameters are set once in mattbot_bringup/launch/amcl.launch (and amcl_car.launch).
+        # They are not reconfigured at runtime because any AMCL reconfigure rebuilds the particle filter.
 
         self.track_accel_max = rospy.get_param('~track_accel_max', 0.3)
         self.track_soft_start_sec = rospy.get_param('~track_soft_start_sec', 1.5)
@@ -2476,25 +2469,6 @@ class Navigator:
                     self.is_localized = True
                     self.localized_pub.publish(True)
                     self.switch_mode(Mode.IDLE)
-
-                    client = Client('amcl', timeout=30)
-                    # Get current configuration
-                    config = client.get_configuration()
-                    # _nav_loginfo("Current configuration: %s", config)
-
-                    # Update parameters to emphasize sensor measurements
-                    params = {
-                        # Measurement model parameters
-                        'laser_z_hit': self.z_hit,            # Increase hit weight (default ~0.7)
-                        'laser_z_rand': self.z_rand,          # Decrease random weight (default ~0.2)
-                        'laser_sigma_hit': self.sigma_hit,        # Decrease sigma for higher confidence
-                        'odom_alpha1': self.alpha1,
-                        'odom_alpha2': self.alpha2,
-                        'odom_alpha3': self.alpha3,
-                        'odom_alpha4': self.alpha4
-                    }
-                    client.update_configuration(params)
-                    _nav_loginfo("Updated AMCL parameters for better localization after initial pose.")
 
             elif self.mode == Mode.ALIGN:
                 if self._aligned_since is not None:

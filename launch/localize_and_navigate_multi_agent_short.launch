@@ -9,10 +9,7 @@
 
   <param name="enable_depth_occupancy_grid" value="$(arg enable_depth_occupancy_grid)"/>
 
-  <param name="alpha1" value="0.8"/>
-  <param name="alpha2" value="0.8"/>
-  <param name="alpha3" value="0.8"/>
-  <param name="alpha4" value="0.8"/>
+  <!-- AMCL odom/laser values live in mattbot_bringup/launch/amcl.launch; z_hit/z_rand/sigma_hit below are read by mattbot_mcl/localization_quality -->
   <param name="z_hit"  value="0.95"/>
   <param name="z_rand" value="0.05"/>
   <param name="sigma_hit" value="0.01"/>
