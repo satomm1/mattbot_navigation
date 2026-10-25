@@ -60,7 +60,7 @@ AT_GOAL = 4
 # How the navigator continues after the observation
 REMAINING_PATH = 0  # stop is on the current path: continue its remaining trajectory
 REPLAN = 1  # stop is off the path: replan to the goal from the stop
-RETURN = 2  # scout: no goal to resume (placeholder until scouts are executed)
+RETURN = 2  # scout: no goal to resume; drive back to where the scout started
 
 
 @dataclass
@@ -232,6 +232,62 @@ def yields_to(kind, my_eta, my_id, intents, margin_s=10.0, commit_s=15.0, commit
         if wins:
             winners.append(o)
     return min(winners, key=lambda o: (o.eta, o.robot_id)) if winners else None
+
+
+ANY_HEIGHT = ("", "any", "all", "*")
+
+
+def parse_robot_heights(text):
+    """Robot heights allowed to scout from a launch value: "short", "short,tall", ... -> frozenset of lower-case
+    names, or None (every height) for "", "any", "all" or "*"."""
+    names = [t.strip().lower() for t in str(text or "").split(",")]
+    names = [t for t in names if t]
+    if not names or any(t in ANY_HEIGHT for t in names):
+        return None
+    return frozenset(names)
+
+
+def scout_height_allowed(heights, robot_height):
+    """May a robot of this height (ROBOT_HEIGHT) scout? heights: parse_robot_heights(); an unknown height (empty)
+    never matches a restricted list."""
+    if heights is None:
+        return True
+    return str(robot_height or "").strip().lower() in heights
+
+
+def scout_deadline(now, to_view_s, n_targets, dwell_s, factor, plan_s=None, align_s=0.0, previous=None):
+    """When a scout's outbound leg is abandoned as too slow, as for a detour (factor x the drive + the looks + 20 s):
+    from the estimated drive before the plan exists, then (plan_s: the planned trajectory's duration, align_s: the
+    align pause) never less than that and at least factor x the planned drive. previous: the deadline so far."""
+    looks = float(dwell_s) * max(int(n_targets), 1)
+    deadline = now + float(factor) * (float(to_view_s) + looks) + 20.0
+    if plan_s is not None:
+        deadline = max(deadline, now + float(factor) * (float(plan_s) + float(align_s) + looks) + 20.0)
+    if previous is not None:
+        deadline = max(deadline, float(previous))
+    return deadline
+
+
+def pick_scout(decision, now, pose_xy, last_stamp, max_age_s=12.0, max_offset_m=0.5):
+    """(candidate, "") to drive from a ScoutDecision, or (None, reason). A decision is used once (its stamp must be
+    newer than last_stamp, the decision the previous scout started from), only while fresh (max_age_s, so a latched
+    "go" from before a goal never restarts one), and only if it was evaluated from about here (start within
+    max_offset_m of pose_xy). The candidate is the first chosen one (candidates are sorted best net first)."""
+    if decision is None:
+        return None, "no decision"
+    if not decision.go:
+        return None, "no go"
+    stamp = decision.header.stamp.to_sec() if hasattr(decision.header.stamp, "to_sec") else float(decision.header.stamp)
+    if stamp <= last_stamp:
+        return None, "decision already used"
+    if now - stamp > max_age_s:
+        return None, "decision too old (%.0f s)" % (now - stamp)
+    if math.hypot(decision.start.x - pose_xy[0], decision.start.y - pose_xy[1]) > max_offset_m:
+        return None, "decision from another pose"
+    for cand in decision.candidates:
+        if cand.chosen:
+            return cand, ""
+    return None, "no chosen candidate"
 
 
 def p_gone(belief):

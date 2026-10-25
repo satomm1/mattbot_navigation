@@ -33,7 +33,10 @@ With ~scout_enabled (implies importance), a robot that has been IDLE (/robot_mod
 ~scout_min_idle_s evaluates every ~scout_period_s whether to go out only to check objects, from its
 pose (TF map -> base_footprint): drive to an object's nearest viewpoint, look, and (cost model
 permitting) come back (navigation_utils/scout.py). A scout is worth sending if V - C > ~scout_margin_m,
-with C from the ~scout_cost_model (observation_policy.py). Decision only: nothing drives it yet.
+with C from the ~scout_cost_model (observation_policy.py). The navigator drives a GO with
+~observe_scout_execute, and only after no goal was received or active for its own ~scout_min_idle_s.
+~scout_robot_heights (e.g. "short", "short,tall"; "any" or empty = every robot) limits which robots scout
+at all (ROBOT_HEIGHT): on any other robot no scouts are evaluated or published.
 Extra outputs:
           /observation/scout          ScoutDecision (latched): candidates, V, C, go
           /observation/scout_markers  MarkerArray: scout viewpoints and routes
@@ -63,7 +66,9 @@ from mattbot_dds.srv import (
     SelectObservationsResponse,
 )
 
-from navigation_utils.observation_policy import Candidate, ThresholdPolicy, covered_ids
+from navigation_utils.observation_policy import (
+    Candidate, ThresholdPolicy, covered_ids, parse_robot_heights, scout_height_allowed,
+)
 from navigation_utils.viewpoints import blocking_mask, compute_viewshed, nearby_blockers
 
 RECOMPUTE_MOVE_M = 0.2  # recompute an object's viewshed if it moves further than this
@@ -107,6 +112,12 @@ class ObservationPlannerNode:
         importance_enabled = bool(rospy.get_param("~importance_enabled", False))
         self.detour_enabled = bool(rospy.get_param("~detour_enabled", False))
         self.scout_enabled = bool(rospy.get_param("~scout_enabled", False))
+        heights_text = str(rospy.get_param("~scout_robot_heights", "any"))
+        robot_height = os.environ.get("ROBOT_HEIGHT", "")
+        if self.scout_enabled and not scout_height_allowed(parse_robot_heights(heights_text), robot_height):
+            rospy.loginfo("observation_planner: scouts off on this robot (ROBOT_HEIGHT=%r not in scout_robot_heights=%s)",
+                          robot_height, heights_text)
+            self.scout_enabled = False
         self.importance = None  # RoadmapWorker (roadmap of /map, importance, detour / scout planners)
         if importance_enabled or self.detour_enabled or self.scout_enabled:  # detours and scouts need I_o
             self.importance = RoadmapWorker(True, self.detour_enabled, self.scout_enabled)

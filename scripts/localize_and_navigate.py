@@ -9,6 +9,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 from mattbot_image_detection.msg import DetectedObject, DetectedObjectArray
 from mattbot_dds.msg import (
     AgentPath, AgentLocation, ObservationEvent, ObservationIntent, ObservationIntentArray, ObservationStop,
+    ScoutDecision,
 )
 from mattbot_dds.srv import RevalidateStop, SelectObservations
 import tf
@@ -38,7 +39,7 @@ from navigation_utils import (
     compute_smoothed_traj,
     plan_start_heading,
 )
-from navigation_utils.observation_policy import check_etas, yields_to
+from navigation_utils.observation_policy import check_etas, pick_scout, scout_deadline, yields_to
 
 
 V_PREV_THRES = 0.0001
@@ -395,6 +396,20 @@ class Navigator:
         self.intents_local_pub = rospy.Publisher('/observation/intents_local', ObservationIntentArray, queue_size=2)
         if self.observe_coordinate:
             rospy.Subscriber('/observation/intents', ObservationIntentArray, self.fleet_intents_callback, queue_size=1)
+        # Scouts (observation_planner ~scout_enabled decides on /observation/scout): with ~observe_scout_execute an
+        # idle robot drives a GO decision: to the viewpoint (x_g... is the viewpoint, then the start pose), looks,
+        # and drives back. Only after no goal was received or active for ~scout_min_idle_s.
+        self.observe_scout_execute = bool(rospy.get_param('~observe_scout_execute', False))
+        self.scout_min_idle_s = float(rospy.get_param('~scout_min_idle_s', 10.0))
+        self.scout_round_trip = bool(rospy.get_param('~scout_round_trip', True))
+        self.scout_decision_max_age_s = float(rospy.get_param('~scout_decision_max_age_s', 12.0))
+        self._scout = None  # {"entry", "home", "returning", "round_trip", "goal", "deadline"} while a scout is active
+        self._scout_decision = None  # latest /observation/scout (ScoutDecision)
+        self._scout_used_stamp = 0.0  # stamp of the decision the last scout started from (each is used once)
+        self._last_goal_t = rospy.get_time()  # last time a goal was received or active (start-up counts)
+        self._scout_idle_since = None  # ROS time the run loop first saw IDLE during a scout (watchdog)
+        if self.observe_scout_execute and self.observe_enabled:
+            rospy.Subscriber('/observation/scout', ScoutDecision, self.scout_decision_callback, queue_size=1)
         self._aligned_since = None  # ROS time when post-align dwell started (before TRACK)
         self.start_pos_thresh = (
             0.2  # threshold to be far enough into the plan to recompute it
@@ -514,6 +529,9 @@ class Navigator:
         """
         loads in goal if different from current goal, and replans
         """
+        self._last_goal_t = rospy.get_time()
+        if self._scout is not None:
+            self._cancel_scout("new goal", clear_goal=True)  # any goal ends a scout, even the one before it
         if (
             data.x != self.x_g
             or data.y != self.y_g
@@ -529,7 +547,9 @@ class Navigator:
         """Human / fleet stop (e.g. from DDS via /stop): halt motion and go to IDLE."""
         if not msg.data:
             return
+        self._last_goal_t = rospy.get_time()  # no scouting right after a stop either
         self._cancel_detour("stop")
+        self._cancel_scout("stop", clear_goal=True)
         self._start_stop = self._goal_stop = None
         if self.mode == Mode.IDLE:
             return
@@ -543,6 +563,10 @@ class Navigator:
         """
         Callback for external goals, such as from voice commands or from DDS
         """
+        self._last_goal_t = rospy.get_time()  # even a duplicate or invalid goal: someone is giving this robot work
+        if self._scout is not None:
+            # Any goal ends a scout, including the goal it was sent before (x_g is now None: not a duplicate)
+            self._cancel_scout("new goal", clear_goal=True)
         # Make sure the goal is different from the current goal
         if (
             self.x_g is not None
@@ -1589,15 +1613,20 @@ class Navigator:
             self.switch_mode(Mode.IDLE)
             if self._detour is not None:
                 self._abandon_detour("no free start cell")
+            elif self._scout is not None:
+                self._abandon_scout("no free start cell")
             return
         self.plan_start = x_init
         gx, gy, gth = self._active_goal()  # the detour viewpoint while a detour is active
         x_goal = self.snap_to_grid((gx, gy))
-        if self._detour is not None and not combined_occupancy.is_free(x_goal):
+        if (self._detour is not None or self._scout_outbound()) and not combined_occupancy.is_free(x_goal):
             # Viewpoints come from a round-robot C-space; the navigator checks a square footprint
             nearest, _dist = combined_occupancy.find_nearest_free(x_goal, max_radius=0.4, step=self.plan_resolution)
             if nearest is None:
-                self._abandon_detour("viewpoint not free")
+                if self._detour is not None:
+                    self._abandon_detour("viewpoint not free")
+                else:
+                    self._abandon_scout("viewpoint not free")
                 return
             x_goal = nearest
 
@@ -1672,6 +1701,9 @@ class Navigator:
                 # Never count a failed detour leg against the real goal (would clear it)
                 self._abandon_detour("no path to the viewpoint")
                 return
+            if self._scout is not None:
+                self._abandon_scout("no path to the viewpoint" if self._scout_outbound() else "no path home")
+                return
             self.times_planned_failed += 1
             if self.times_planned_failed > 1:
                 _nav_loginfo("Planning failed too many times, stopping")
@@ -1703,6 +1735,9 @@ class Navigator:
         # Check whether path is too short
         if self._detour is not None and (planned_path is None or len(planned_path) < 4):
             self._arrive_at_detour_viewpoint()  # already (almost) at the viewpoint: look from here
+            return
+        if self._scout_outbound() and (planned_path is None or len(planned_path) < 4):
+            self._arrive_at_scout_viewpoint()  # already (almost) at the viewpoint: look from here (not park)
             return
         if planned_path == None:
             return
@@ -1800,6 +1835,8 @@ class Navigator:
             return
         if self._detour is not None:
             return  # no stops on the way to a detour viewpoint; the replan after it asks again
+        if self._scout is not None:
+            return  # no stops on a scout's way out or back
         goal = (self.x_g, self.y_g, self.theta_g)
         first_plan = goal != self._observe_goal  # the robot may look from its start pose before leaving
         if first_plan:
@@ -2011,6 +2048,9 @@ class Navigator:
                 self._load_remaining_plan(0)  # leave: ALIGN to the path, then TRACK
             elif entry["stop"].kind == ObservationStop.AT_GOAL:
                 self._finish_park_pose()  # the final heading turn is also the turn back
+            elif entry["stop"].kind == ObservationStop.SCOUT:
+                _nav_loginfo("Scout done")
+                self._end_scout()  # drive back to where the scout started
             elif entry["stop"].resume == ObservationStop.REPLAN:
                 if self._detour is not None:
                     _nav_loginfo("Detour done; replanning to the goal")
@@ -2085,6 +2125,9 @@ class Navigator:
             out += [(self._observe_stop["stop"].kind, oid, now, True) for oid in ids]
         if self._start_stop is not None:
             out += [(ObservationStop.AT_START, oid, now, False) for oid in self._start_stop["stop"].object_ids]
+        if self._scout_outbound() and self.mode not in OBSERVE_MODES:
+            eta = now + self._overhead_s() + max(self.current_plan_duration - self._progress, 0.0)
+            out += [(ObservationStop.SCOUT, oid, eta, True) for oid in self._scout["entry"]["stop"].object_ids]
         if self._detour is not None:
             if self.mode not in OBSERVE_MODES:
                 eta = now + self._overhead_s() + max(self.current_plan_duration - self._progress, 0.0)
@@ -2144,6 +2187,8 @@ class Navigator:
         the goal: True); a pending one is marked and not announced, and dropped at its leave point if it still yields."""
         if not self.observe_coordinate or self._fleet_intents is None:
             return False
+        if self._scout_outbound():
+            return self._check_scout_yields()
         if self._detour is not None:
             remaining = max(self.current_plan_duration - self._progress, 0.0)
             winners = self._detour_winners(self._detour["stop"], rospy.get_time() + remaining, committed=True,
@@ -2176,6 +2221,8 @@ class Navigator:
         otherwise the goal. A detour whose goal was replaced (any goal source) is dropped."""
         if self._detour is not None and self._detour["goal"] != (self.x_g, self.y_g, self.theta_g):
             self._cancel_detour("goal changed")
+        if self._scout is not None and self._scout["goal"] != (self.x_g, self.y_g, self.theta_g):
+            self._cancel_scout("goal changed", clear_goal=False)  # the goal belongs to whoever set it
         if self._detour is not None:
             s = self._detour["stop"]
             return s.x, s.y, self._detour["heading"]
@@ -2298,6 +2345,154 @@ class Navigator:
         if self._detour is not None:
             _nav_loginfo("Detour cancelled (%s)", reason)
             self._detour = None
+
+    # ---------- Scouts ----------
+
+    def scout_decision_callback(self, msg):
+        self._scout_decision = msg  # read by the run loop only
+
+    def _scout_outbound(self):
+        return self._scout is not None and not self._scout["returning"]
+
+    def _maybe_start_scout(self):
+        """In IDLE: drive a fresh GO decision (observation_planner /observation/scout) if no goal was received or
+        active for scout_min_idle_s and nothing else is going on."""
+        if not (self.observe_scout_execute and self._observation_allowed()) or self._scout is not None:
+            return
+        if self.x_g is not None or self._detour is not None or self.mode != Mode.IDLE:
+            return
+        now = rospy.get_time()
+        if now - self._last_goal_t < self.scout_min_idle_s:
+            return
+        cand, _reason = pick_scout(self._scout_decision, now, (self.x, self.y), self._scout_used_stamp,
+                                   self.scout_decision_max_age_s)
+        if cand is None:
+            return
+        self._scout_used_stamp = self._scout_decision.header.stamp.to_sec()
+        self._start_scout(cand)
+
+    def _start_scout(self, cand):
+        """Drive to the scout's viewpoint (x_g... = the viewpoint), look, then back to here (round trip)."""
+        v = max(float(self.v_des), 1e-3)
+        stop = ObservationStop(
+            kind=ObservationStop.SCOUT, resume=ObservationStop.RETURN, path_index=-1, x=cand.x, y=cand.y,
+            heading=cand.heading, object_ids=list(cand.object_ids), targets=list(cand.targets),
+            beliefs=list(cand.beliefs), values=list(cand.values_m), cost_s=float(cand.cost_m) / v,
+            to_view_s=float(cand.to_view_m) / v,
+        )
+        now = rospy.get_time()
+        entry = {"idx": 0, "t": 0.0, "stop": stop, "detour": False, "eta": now + stop.to_view_s}
+        goal = (float(cand.x), float(cand.y), float(cand.heading))
+        self._scout = {
+            "entry": entry, "home": (float(self.x), float(self.y), float(self.theta)), "returning": False,
+            "round_trip": self.scout_round_trip, "goal": goal,
+            "deadline": scout_deadline(now, stop.to_view_s, len(stop.object_ids), self.observe_dwell_s,
+                                       self.observe_detour_timeout_factor),
+        }
+        # A scout is a goal of its own: every object may be checked once on it, and the next real goal starts fresh
+        self._observed_this_goal = set()
+        self._detour_skipped = set()
+        self._observe_goal = None
+        self._viewpoint_approach = None
+        self._scout_idle_since = None
+        _nav_loginfo("Scout to (%.2f, %.2f) to check %s (est. %.0f s)", stop.x, stop.y, "+".join(stop.object_ids),
+                     stop.cost_s)
+        self.x_g, self.y_g, self.theta_g = goal
+        self._intents_dirty = True
+        self.nav_vel_pub.publish(Twist())
+        self.switch_mode(Mode.IDLE)
+        plan_started = self.current_plan_start_time
+        self.replan()
+        if self._scout_outbound() and self.current_plan_start_time != plan_started:
+            self._scout["deadline"] = scout_deadline(
+                rospy.get_time(), stop.to_view_s, len(stop.object_ids), self.observe_dwell_s,
+                self.observe_detour_timeout_factor, plan_s=self.current_plan_duration,
+                align_s=self.post_align_pause_sec, previous=self._scout["deadline"])
+
+    def _arrive_at_scout_viewpoint(self):
+        """As _arrive_at_detour_viewpoint: decide what is due before parking on the viewpoint, park, look."""
+        entry = self._scout["entry"]
+        stop = entry["stop"]
+        if self._viewpoint_approach is not None:  # parked on the viewpoint (or timed out): look from here
+            self._viewpoint_approach = None
+            due = self._approach_due
+        else:
+            due = self._due_targets(entry)
+            if due and self._approach_viewpoint(stop.x, stop.y, stop.heading):
+                self._approach_due = due
+                return
+        _nav_loginfo("Reached scout viewpoint")
+        self.nav_vel_pub.publish(Twist())
+        if not self._start_observation_stop(entry, due):
+            _nav_loginfo("Scout done (targets no longer due)")
+            self._end_scout()
+
+    def _end_scout(self):
+        """After the look (or giving way, or giving up on the way out): drive back to where the scout started, or
+        stay here (one way)."""
+        if self._scout is None:
+            return
+        self._viewpoint_approach = None
+        self._intents_dirty = True
+        if self._scout["round_trip"]:
+            self._scout["returning"] = True
+            self._scout["goal"] = self._scout["home"]
+            self.x_g, self.y_g, self.theta_g = self._scout["home"]
+            self.nav_vel_pub.publish(Twist())
+            self.switch_mode(Mode.IDLE)
+            self.replan()
+        else:
+            self._scout = None
+            self.x_g = self.y_g = self.theta_g = None
+            self.nav_vel_pub.publish(Twist())
+            self.switch_mode(Mode.IDLE)
+
+    def _abandon_scout(self, reason):
+        """Give up: on the way out, drive back; on the way back, stay where the robot is."""
+        if self._scout is None:
+            return
+        if self._scout_outbound():
+            _nav_loginfo("Scout abandoned (%s); returning", reason)
+            self._end_scout()
+            return
+        _nav_loginfo("Scout return failed (%s); staying here", reason)
+        self._cancel_scout_state()
+        self.x_g = self.y_g = self.theta_g = None
+        self.nav_vel_pub.publish(Twist())
+        self.switch_mode(Mode.IDLE)
+
+    def _cancel_scout(self, reason, clear_goal):
+        """Drop the scout without driving anywhere (new goal, /stop). clear_goal: the goal was the scout's own."""
+        if self._scout is None:
+            return
+        _nav_loginfo("Scout cancelled (%s)", reason)
+        self._cancel_scout_state()
+        if clear_goal:
+            self.x_g = self.y_g = self.theta_g = None
+
+    def _cancel_scout_state(self):
+        self._viewpoint_approach = None
+        self._scout = None
+        self._scout_idle_since = None
+        self._intents_dirty = True
+
+    def _check_scout_yields(self):
+        """On the way out: give way (go back) if another robot checks every target first (observation_policy
+        yields_to SCOUT: any non-scout check not later by more than the margin; no commit window)."""
+        stop = self._scout["entry"]["stop"]
+        eta = rospy.get_time() + max(self.current_plan_duration - self._progress, 0.0)
+        winners = []
+        for oid in stop.object_ids:
+            w = yields_to(ObservationStop.SCOUT, eta, self.my_id, self._peer_intents(oid), self.intent_margin_s)
+            if w is None:
+                return False
+            winners.append((oid, w))
+        for oid, w in winners:
+            self._yielded[oid] = w.robot_id
+        _nav_loginfo("Scout to check %s yielded to robot %s", "+".join(stop.object_ids),
+                     ",".join(sorted({str(w.robot_id) for _oid, w in winners})))
+        self._end_scout()
+        return True
 
     def _nearest_plan_index(self, idx, window=40):
         """Trajectory sample nearest the robot, searched around idx (robot may stop short or overshoot)."""
@@ -2449,8 +2644,19 @@ class Navigator:
 
             # STATE MACHINE LOGIC
             # some transitions handled by callbacks
+            if self.x_g is not None:
+                self._last_goal_t = rospy.get_time()  # a goal is active (the scout's own as well)
             if self.mode == Mode.IDLE:
-                pass
+                if self._scout is not None:
+                    # A scout never rests in IDLE (it replans at once): stuck here means TF loss, a failed recovery
+                    # or no map. Give up rather than keep a stale scout goal.
+                    if self._scout_idle_since is None:
+                        self._scout_idle_since = rospy.get_time()
+                    elif rospy.get_time() - self._scout_idle_since > 3.0:
+                        self._scout_idle_since = None
+                        self._abandon_scout("stopped")
+                else:
+                    self._maybe_start_scout()
             elif self.mode == Mode.WAITING_FOR_INIT:
                 if self.received_initial_pose:
                     _nav_loginfo("Have initial pose, switching to Localize to Get better estimate")
@@ -2491,6 +2697,8 @@ class Navigator:
                 elif self.near_goal():
                     if self._detour is not None:
                         self._arrive_at_detour_viewpoint()
+                    elif self._scout_outbound():
+                        self._arrive_at_scout_viewpoint()
                     else:
                         self._enter_park_pose()
                 elif self._observation_due():
@@ -2500,6 +2708,8 @@ class Navigator:
                         self._start_observation_stop()
                 elif self._detour is not None and rospy.get_time() > self._detour["deadline"]:
                     self._abandon_detour("took too long")
+                elif self._scout_outbound() and rospy.get_time() > self._scout["deadline"]:
+                    self._abandon_scout("took too long")
                 elif(not self.path_still_valid(self.current_plan)):
                     # Path no longer valid ---> replan
                     _nav_loginfo("replanning because path is no longer valid")
@@ -2564,6 +2774,8 @@ class Navigator:
                         self.replan()  # we aren't near the goal but we thought we should have been, so replan
                     elif self._detour is not None:
                         self._arrive_at_detour_viewpoint()
+                    elif self._scout_outbound():
+                        self._arrive_at_scout_viewpoint()
                     else:
                         _nav_loginfo("Going to park because out of time and near goal")
                         self._enter_park_pose()
@@ -2572,11 +2784,15 @@ class Navigator:
                 self._observe_step()
 
             elif self.mode == Mode.PARK_POSE and self._viewpoint_approach is not None:
-                if self._detour is None:
-                    self._viewpoint_approach = None  # detour cancelled meanwhile
+                if self._detour is None and not self._scout_outbound():
+                    self._viewpoint_approach = None  # detour / scout cancelled meanwhile
                     self.switch_mode(Mode.IDLE)
                 elif self.at_park_pose() or rospy.get_time() - self._viewpoint_approach > VIEWPOINT_APPROACH_TIMEOUT_S:
-                    self._arrive_at_detour_viewpoint()  # on the viewpoint (or gave up): look from here
+                    # on the viewpoint (or gave up): look from here
+                    if self._detour is not None:
+                        self._arrive_at_detour_viewpoint()
+                    else:
+                        self._arrive_at_scout_viewpoint()
             elif self.mode == Mode.PARK_POSE:
                 if self.at_park_pose():
                     if self._start_goal_check():
@@ -2587,9 +2803,13 @@ class Navigator:
 
             elif self.mode == Mode.PARK_HEADING:
                 if self.aligned_goal():
+                    if self._scout is not None:
+                        _nav_loginfo("Back from scout")
+                        self._cancel_scout_state()
                     self.x_g = None
                     self.y_g = None
                     self.theta_g = None
+                    self._last_goal_t = rospy.get_time()  # a goal or scout just ended: wait the full idle time again
                     self.switch_mode(Mode.IDLE)
             elif self.mode == Mode.BACKING:
                 current_time = rospy.get_rostime().to_sec()

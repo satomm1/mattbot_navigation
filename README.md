@@ -48,7 +48,7 @@ rosrun mattbot_navigation plot_obstacle_importance.py --map $(rospack find mattb
 python3 -m pytest mattbot_navigation/test               # from src/
 ```
 
-### Scout re-observation (decision only)
+### Scout re-observation
 
 `navigation_utils/scout.py`: a robot with **no goal of its own** drives out only to check an object. It shares the detour C-space grid; one Dijkstra from the robot gives the distance to every object's nearest viewpoint (`to_view_m`; `return_m` back to the start is the same on the symmetric grid). The value is the detour V with its own N and q (`~scout_n_trips`, `~scout_conclusive_prob`). The cost C comes from a pluggable `ScoutCostModel` (`observation_policy.py`), selected by name with `~scout_cost_model` and built with the kwargs in `~scout_cost_params`. The default model `travel_time` adds the opportunity cost of being away to the physical cost, all in metres (times converted at `v_cruise`):
 
@@ -59,11 +59,24 @@ C      = travel + v * (turn / turn_rate + dwell * n) + v * fixed_s + v * per_s_a
 
 `fixed_s` is the cost of committing to a scout at all and `per_s_away` the cost per second the robot is unavailable (both 0 until calibrated; launch args `observe_scout_fixed_s`, `observe_scout_per_s_away`, and `observe_scout_round_trip` in the navigation launch files). Objects are searched only up to the distance at which even the cheapest scout (one target, no turn) costs V. A scout is worth sending if `V - C > ~scout_margin_m`, at most `~max_scouts` (default 1) per evaluation. Each `ScoutCandidate` reports `opportunity_m` and `t_away_s`.
 
-With `observe_scout:=true` (needs `ledger:=true observe:=true`; turns on importance and, by default, `ledger_blockout`), the observation planner evaluates scouts every `~scout_period_s` (5 s) once `/robot_mode` has been IDLE for `~scout_min_idle_s` (10 s), from the TF pose `map -> base_footprint`. **Nothing drives a scout yet.** Outputs: `/observation/scout` (`mattbot_dds/ScoutDecision`, latched: every candidate with V, C, GO/skip, and `go`) and `/observation/scout_markers`. Evaluate from any pose with:
+With `observe_scout:=true` (needs `ledger:=true observe:=true`; turns on importance and, by default, `ledger_blockout`), the observation planner evaluates scouts every `~scout_period_s` (5 s) once `/robot_mode` has been IDLE for `~scout_min_idle_s` (10 s), from the TF pose `map -> base_footprint`. Outputs: `/observation/scout` (`mattbot_dds/ScoutDecision`, latched: every candidate with V, C, GO/skip, and `go`) and `/observation/scout_markers`. Evaluate from any pose with:
 
 ```bash
 rosservice call /observation/scout_query "{start: {x: 2.0, y: 1.8, theta: 0.0}, require_idle: false}"
 ```
+
+**Which robots scout:** `scout_robot_heights` (default `short`) lists the `ROBOT_HEIGHT` values allowed to scout, e.g. `scout_robot_heights:=short,tall`; `any` (or empty) allows every robot. On any other robot the planner logs `scouts off on this robot (...)` and evaluates and publishes no scouts. A robot whose `ROBOT_HEIGHT` is unset never matches a restricted list.
+
+**Execution** (`observe_scout_execute:=true`, default off): the navigator drives a GO decision when it is IDLE, has no goal, and has had none received or active for `observe_scout_min_idle_s` (also the planner's idle time; raise it above patrol pauses). A decision is used once, only while fresh (`~scout_decision_max_age_s`, 12 s) and only if it was evaluated within 0.5 m of the robot. The scout is a goal of its own:
+- It drives to the viewpoint (`"Scout to (x, y) to check X (est. N s)"`), decides what is still due, parks on the viewpoint (`~observe_viewpoint_tol_m`, 0.1 m, at most 15 s) and looks (`SCOUT` stops on `/observation/events`), as at a detour viewpoint (`"Reached scout viewpoint"`, `"Scout done"`).
+- Then it drives back to where it started and turns to its old heading (`"Back from scout"`; `observe_scout_round_trip`, default true). The no-goal time starts again there.
+- Nothing is due on arrival (e.g. the camera re-sighted the object on the way): `"Scout done (targets no longer due)"`, and back.
+- No on-path stops on either leg; every object may be checked once on the scout, and the next real goal starts fresh.
+- Times come from the decision's metres at `/cruising_velocity`. Deadline of the way out, as for a detour: `observe_detour_timeout_factor` x (the drive + align pause + dwell per target) + 20 s, never less than the estimate.
+- **Cancelled** (`"Scout cancelled (new goal)"` / `(stop)`): any goal (`/external_goal`, `/voice_goal`, `/cmd_nav`, RViz), including the one the robot had before, or `/stop`; the robot takes the new goal or stays.
+- **Abandoned on the way out** (`"Scout abandoned (reason); returning"`): no path or no free start cell, viewpoint not free (snapped up to 0.4 m), deadline passed, or stuck in IDLE for 3 s (TF loss, failed recovery). It drives back.
+- **Return failed** (`"Scout return failed (reason); staying here"`): no path back; the robot stays.
+- While on the way out it announces its check (`SCOUT`, committed) and gives way en route as below (`"Scout to check X yielded to robot N"`, then back).
 
 Known limitations and open issues of importance, detours, scouts and the re-check policy are tracked in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
@@ -83,7 +96,7 @@ Robots announce their planned checks so that two robots do not check the same ob
 - **Who gives way** (`observation_policy.yields_to`):
   - **Opportunistic and endpoint checks** never give way. They are skipped only by revalidation.
   - **A detour** gives way to another robot's check of any kind that is earlier by more than `observe_intent_margin_s` (10 s). Within the margin, a committed check (en route or observing) beats an uncommitted one, then the lower robot id wins. This is tested at plan time (`skip (robot N checks first)`), every cycle before the leave point, and while driving to the viewpoint (`"Detour to check X yielded to robot N"`, then the robot replans to its goal). It no longer gives way within `observe_intent_commit_s` (15 s) of the viewpoint.
-  - **A scout**, the most expensive check, gives way to any check that is not later by more than the margin, unless that check is also a scout and its robot has a higher id. For now this only blocks scout decisions, because scouts are not executed.
+  - **A scout**, the most expensive check, gives way to any check that is not later by more than the margin, unless that check is also a scout and its robot has a higher id. This blocks scout decisions (`robot N checks first`) and, with `observe_scout_execute`, a scout on its way out (it drives back). Two idle robots that decide in the same second may both set off; the en-route test sends one back once their announcements arrive (1–2 s).
 - A yielded object is not offered again while the winner still plans its check. If the winner withdraws, a pending detour comes back at once.
 - Launch args: `observe_coordinate` (default true; false = no announcing or giving way), `observe_intent_margin_s`, `observe_intent_commit_s`.
 - All robots must run this version. A robot with the old stack announces nothing, so newer robots never give way to it.

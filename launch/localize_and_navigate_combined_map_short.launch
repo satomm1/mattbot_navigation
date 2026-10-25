@@ -23,8 +23,10 @@
   <arg name="observe_detour_n_trips" default="5"/>
   <arg name="observe_detour_margin_m" default="0.0"/>
   <!-- Scouts: while the robot is idle, decide whether to drive out only to re-check an object
-       (observation_planner publishes /observation/scout; decision only, nothing drives it yet). -->
+       (observation_planner publishes /observation/scout; the navigator drives it with observe_scout_execute). -->
   <arg name="observe_scout" default="false"/>
+  <arg name="observe_scout_execute" default="false"/>  <!-- navigator drives GO decisions (after no goal for observe_scout_min_idle_s), then returns -->
+  <arg name="scout_robot_heights" default="short"/>  <!-- ROBOT_HEIGHT values that scout ("short,tall"; "any" = every robot) -->
   <arg name="observe_max_scout_m" default="30.0"/>
   <arg name="observe_scout_n_trips" default="5"/>
   <arg name="observe_scout_margin_m" default="0.0"/>
@@ -69,6 +71,9 @@
   <node name="navigator_node" pkg="mattbot_navigation" type="localize_and_navigate.py" output="screen">
     <param name="observe_enabled" value="$(arg observe)"/>
     <param name="observe_detour_enabled" value="$(arg observe_detour)"/>
+    <param name="observe_scout_execute" value="$(arg observe_scout_execute)"/>
+    <param name="scout_min_idle_s" value="$(arg observe_scout_min_idle_s)"/>
+    <param name="scout_round_trip" value="$(arg observe_scout_round_trip)"/>
     <param name="observe_dwell_s" value="$(arg observe_dwell_s)"/>
     <param name="observe_coordinate" value="$(arg observe_coordinate)"/>
     <param name="intent_margin_s" value="$(arg observe_intent_margin_s)"/>
@@ -97,6 +102,7 @@
     <param name="detour_n_trips" value="$(arg observe_detour_n_trips)"/>
     <param name="detour_margin_m" value="$(arg observe_detour_margin_m)"/>
     <param name="scout_enabled" value="$(arg observe_scout)"/>
+    <param name="scout_robot_heights" value="$(arg scout_robot_heights)"/>
     <param name="max_scout_m" value="$(arg observe_max_scout_m)"/>
     <param name="scout_n_trips" value="$(arg observe_scout_n_trips)"/>
     <param name="scout_margin_m" value="$(arg observe_scout_margin_m)"/>

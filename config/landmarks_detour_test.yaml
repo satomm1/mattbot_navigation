@@ -1,0 +1,9 @@
+# Landmarks for the single-robot detour test on current_map (2026-10-25): the route runs up the main
+# hallway (start -> goal) past the side hallway that branches east at y ~ 19; east is further down the side
+# hallway, so a cone in it (test position (12.0, 19.0)) closes trips to east and is worth a detour.
+# Offline check (the planner's own code, current_map + map_mod, belief 0.5): I_o 15.5 m, detour +4.3 m,
+# V 19.4 m > C 5.9 m -> GO. Use with observe_landmarks_file (see landmarks.example.yaml).
+# Coordinates are x, y in metres in this robot's local map frame.
+start: [6.00, 15.34]
+goal:  [6.00, 22.38]
+east:  [21.50, 19.00]
