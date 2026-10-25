@@ -76,7 +76,7 @@ rosservice call /observation/scout_query "{start: {x: 2.0, y: 1.8, theta: 0.0}, 
 - **Cancelled** (`"Scout cancelled (new goal)"` / `(stop)`): any goal (`/external_goal`, `/voice_goal`, `/cmd_nav`, RViz), including the one the robot had before, or `/stop`; the robot takes the new goal or stays.
 - **Abandoned on the way out** (`"Scout abandoned (reason); returning"`): no path or no free start cell, viewpoint not free (snapped up to 0.4 m), deadline passed, or stuck in IDLE for 3 s (TF loss, failed recovery). It drives back.
 - **Return failed** (`"Scout return failed (reason); staying here"`): no path back; the robot stays.
-- While on the way out it announces its check (`SCOUT`, committed) and gives way en route as below (`"Scout to check X yielded to robot N"`, then back).
+- While on the way out it announces its check (`SCOUT`, committed) and gives way as below (`"Scout to check X yielded to robot N"`, then back): while driving, and also while still turning toward its route (ALIGN) or parking on the viewpoint, so a scout that has not started moving (or cannot: motors off) still turns back.
 
 Known limitations and open issues of importance, detours, scouts and the re-check policy are tracked in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 

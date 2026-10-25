@@ -2500,11 +2500,19 @@ class Navigator:
         self._scout_idle_since = None
         self._intents_dirty = True
 
+    def _scout_gives_way(self):
+        """Outside TRACK (turning before the drive, parking on the viewpoint): the same give-way test as while
+        driving, so a scout that has not started moving yet still turns back. True if it gave way."""
+        if not self._scout_outbound() or not self.observe_coordinate or self._fleet_intents is None:
+            return False
+        return self._check_scout_yields()
+
     def _check_scout_yields(self):
         """On the way out: give way (go back) if another robot checks every target first (observation_policy
         yields_to SCOUT: any non-scout check not later by more than the margin; no commit window)."""
         stop = self._scout["entry"]["stop"]
-        eta = rospy.get_time() + max(self.current_plan_duration - self._progress, 0.0)
+        # As announced (_planned_checks): the align pause outside TRACK, then the plan time left
+        eta = rospy.get_time() + self._overhead_s() + max(self.current_plan_duration - self._progress, 0.0)
         winners = []
         for oid in stop.object_ids:
             w = yields_to(ObservationStop.SCOUT, eta, self.my_id, self._peer_intents(oid), self.intent_margin_s)
@@ -2701,7 +2709,9 @@ class Navigator:
                     self.switch_mode(Mode.IDLE)
 
             elif self.mode == Mode.ALIGN:
-                if self._aligned_since is not None:
+                if self._scout_gives_way():
+                    pass  # another robot checks first: driving back instead (replanned)
+                elif self._aligned_since is not None:
                     if self._post_align_pause_elapsed() >= self.post_align_pause_sec:
                         self._aligned_since = None
                         self.current_plan_start_time = rospy.get_rostime()
@@ -2808,7 +2818,9 @@ class Navigator:
                 self._observe_step()
 
             elif self.mode == Mode.PARK_POSE and self._viewpoint_approach is not None:
-                if self._detour is None and not self._scout_outbound():
+                if self._scout_gives_way():
+                    pass  # another robot checks first: driving back instead (replanned)
+                elif self._detour is None and not self._scout_outbound():
                     self._viewpoint_approach = None  # detour / scout cancelled meanwhile
                     self.switch_mode(Mode.IDLE)
                 elif self.at_park_pose() or rospy.get_time() - self._viewpoint_approach > VIEWPOINT_APPROACH_TIMEOUT_S:
