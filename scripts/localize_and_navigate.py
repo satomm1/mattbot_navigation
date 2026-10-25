@@ -16,6 +16,7 @@ import tf
 
 import copy
 import time
+import threading
 import numpy as np
 import networkx as nx
 from numpy import linalg
@@ -523,6 +524,9 @@ class Navigator:
         self.switch_mode(Mode.WAITING_FOR_INIT)
 
         self.url='http://127.0.0.1:5000/gemini'
+        # Screen/speech notices (see _notify_screen): the same text is not re-sent within this many seconds
+        self.notice_min_interval_sec = rospy.get_param('~notice_min_interval_sec', 3.0)
+        self._notice_last_sent = {}
 
 
     def cmd_nav_callback(self, data):
@@ -1260,6 +1264,7 @@ class Navigator:
             self.track_start_time = rospy.get_rostime().to_sec()
             self._odom_history = []
             self._reset_plan_clock_slip()
+            self.robot_slowed_by_person = False  # So a person already nearby re-triggers the slow notice
         self.mode = new_mode
         self._intents_dirty = True
         self.state_pub.publish(self.mode.value)
@@ -1456,6 +1461,28 @@ class Navigator:
             self.object_near_occupancy.update(object_probs)
             self.object_in_path = self.object_intersect_path()
 
+    def _notify_screen(self, text, speak=False):
+        """
+        Send a notice to the screen server at self.url as
+            {"query": text, "query_type": "print_to_screen", "speak": speak}
+        speak=False: print to screen only. speak=True: print to screen and say it aloud.
+        Posted from a background thread (this runs in the control loop); the same text is sent at most once
+        per notice_min_interval_sec.
+        """
+        now = time.time()
+        if now - self._notice_last_sent.get(text, -np.inf) < self.notice_min_interval_sec:
+            return
+        self._notice_last_sent[text] = now
+        data = {'query': text, 'query_type': 'print_to_screen', 'speak': bool(speak)}
+
+        def post():
+            try:
+                requests.post(self.url, json=data, timeout=2.0)
+            except requests.exceptions.RequestException as e:
+                _nav_logwarn("Error sending screen notice %r: %s", text, e)
+
+        threading.Thread(target=post, daemon=True).start()
+
     def modify_velocity_for_person(self, V, om):
         """
         Scale cmd_vel for nearby people (TRACK mode only).
@@ -1469,11 +1496,7 @@ class Navigator:
             if not self.robot_stopped_by_person:
                 self.stopped_for_person_time = rospy.get_rostime().to_sec()
                 _nav_loginfo("Stopping for person")
-                # data = {'query': "Excuse Me!", 'query_type': 'print_to_screen'}
-                # try:
-                #     requests.post(self.url, json=data)
-                # except requests.exceptions.RequestException as e:
-                #     _nav_loginfo("Error sending request: %s", e)
+                self._notify_screen("Excuse me!", speak=True)
                 self.switch_mode(Mode.STOPPED_FOR_PERSON)
             self.robot_stopped_by_person = True
             return V, om
@@ -1481,6 +1504,7 @@ class Navigator:
         if self.distance_to_person < PERSON_SLOW_DISTANCE:
             if not self.robot_slowed_by_person:
                 _nav_loginfo("Slowing down for person")
+                self._notify_screen("Slowing for human", speak=False)
                 self.robot_slowed_by_person = True
             return V * PERSON_SLOW_SCALE, om * PERSON_SLOW_SCALE
 
