@@ -515,6 +515,9 @@ class Navigator:
         self.localized_pub = rospy.Publisher("/localized", Bool, queue_size=10)
         self.initialpose_pub = rospy.Publisher("/initialpose", PoseWithCovarianceStamped, queue_size=10)
         self.invalid_goal_pub = rospy.Publisher("/invalid_goal", Pose2D, queue_size=10)
+        # Outbound-only (as patrol.py): data_publisher forwards it to DDS as MSG_GOAL, so the central GUI knows the
+        # goals the navigator sets itself (a scout's viewpoint, then home) and shows their paths
+        self.dds_goal_pub = rospy.Publisher("/patrol_goal_for_dds", Pose2D, queue_size=10)
 
         self.has_stopped = False
 
@@ -2422,6 +2425,7 @@ class Navigator:
         _nav_loginfo("Scout to (%.2f, %.2f) to check %s (est. %.0f s)", stop.x, stop.y, "+".join(stop.object_ids),
                      stop.cost_s)
         self.x_g, self.y_g, self.theta_g = goal
+        self.dds_goal_pub.publish(Pose2D(*goal))
         self._intents_dirty = True
         self.nav_vel_pub.publish(Twist())
         self.switch_mode(Mode.IDLE)
@@ -2462,6 +2466,7 @@ class Navigator:
             self._scout["returning"] = True
             self._scout["goal"] = self._scout["home"]
             self.x_g, self.y_g, self.theta_g = self._scout["home"]
+            self.dds_goal_pub.publish(Pose2D(*self._scout["home"]))
             self.nav_vel_pub.publish(Twist())
             self.switch_mode(Mode.IDLE)
             self.replan()
