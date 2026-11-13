@@ -9,6 +9,7 @@ from navigation_utils.observation_policy import (
     AT_GOAL,
     DETOUR,
     SCOUT,
+    is_own_goal,
     parse_robot_heights,
     pick_scout,
     scout_deadline,
@@ -47,6 +48,17 @@ def test_deadline_from_the_estimate_then_the_plan():
     assert longer == pytest.approx(101.0 + 2.0 * (50.0 + 1.0 + 8.0) + 20.0)
     shorter = scout_deadline(101.0, 30.0, 2, 4.0, 2.0, plan_s=5.0, align_s=1.0, previous=est)
     assert shorter >= est
+
+
+# ---------- The scout's own goal, echoed back by the fleet GUI ----------
+
+def test_own_goal_echo_matches_after_a_frame_round_trip_only():
+    viewpoint = (8.5, 19.1, 1.57)
+    assert is_own_goal((8.5004, 19.0998, 1.5702), viewpoint)  # reference-frame round trip: not bit-identical
+    assert is_own_goal((8.5, 19.1, 1.57 - 2 * 3.14159265), viewpoint)  # the same heading, wrapped
+    assert not is_own_goal((9.0, 19.1, 1.57), viewpoint)  # another place: new work, cancels the scout
+    assert not is_own_goal((8.5, 19.1, -1.57), viewpoint)  # the same place, another heading
+    assert not is_own_goal((8.5, 19.1, 1.57), None)
 
 
 # ---------- Which decision a navigator drives ----------

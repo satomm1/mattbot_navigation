@@ -40,7 +40,7 @@ from navigation_utils import (
     compute_smoothed_traj,
     plan_start_heading,
 )
-from navigation_utils.observation_policy import check_etas, pick_scout, scout_deadline, yields_to
+from navigation_utils.observation_policy import check_etas, is_own_goal, pick_scout, scout_deadline, yields_to
 
 
 V_PREV_THRES = 0.0001
@@ -536,6 +536,8 @@ class Navigator:
         """
         loads in goal if different from current goal, and replans
         """
+        if self._scout_goal_echo(data):
+            return
         self._last_goal_t = rospy.get_time()
         if self._scout is not None:
             self._cancel_scout("new goal", clear_goal=True)  # any goal ends a scout, even the one before it
@@ -570,6 +572,8 @@ class Navigator:
         """
         Callback for external goals, such as from voice commands or from DDS
         """
+        if self._scout_goal_echo(msg):
+            return
         self._last_goal_t = rospy.get_time()  # even a duplicate or invalid goal: someone is giving this robot work
         if self._scout is not None:
             # Any goal ends a scout, including the goal it was sent before (x_g is now None: not a duplicate)
@@ -2489,6 +2493,19 @@ class Navigator:
         self.x_g = self.y_g = self.theta_g = None
         self.nav_vel_pub.publish(Twist())
         self.switch_mode(Mode.IDLE)
+
+    def _scout_goal_echo(self, msg):
+        """True (and ignore it) if a goal is the scout's own, announced on /patrol_goal_for_dds and sent back by
+        the fleet GUI: only a different goal cancels a scout."""
+        if self._scout is None:
+            return False
+        stop = self._scout["entry"]["stop"]
+        goal = (msg.x, msg.y, msg.theta)
+        # Either leg's goal: a late echo of the viewpoint may arrive after the return has started
+        if not (is_own_goal(goal, (stop.x, stop.y, stop.heading)) or is_own_goal(goal, self._scout["home"])):
+            return False
+        _nav_loginfo("Goal is the scout's own (echoed back over DDS), ignoring")
+        return True
 
     def _cancel_scout(self, reason, clear_goal):
         """Drop the scout without driving anywhere (new goal, /stop). clear_goal: the goal was the scout's own."""

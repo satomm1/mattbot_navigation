@@ -268,6 +268,16 @@ def scout_deadline(now, to_view_s, n_targets, dwell_s, factor, plan_s=None, alig
     return deadline
 
 
+def is_own_goal(goal, pose, tol_m=0.1, tol_rad=0.1):
+    """True if an incoming goal (x, y, theta) is about the pose (x, y, theta) this robot announced itself: a scout's
+    viewpoint or home sent to DDS comes back from the fleet GUI as a goal, after a round trip through the reference
+    frame (so not bit-identical). Such an echo is not new work and must not cancel the scout."""
+    if pose is None:
+        return False
+    return (math.hypot(goal[0] - pose[0], goal[1] - pose[1]) <= tol_m
+            and abs(wrap_angle(goal[2] - pose[2])) <= tol_rad)
+
+
 def pick_scout(decision, now, pose_xy, last_stamp, max_age_s=12.0, max_offset_m=0.5):
     """(candidate, "") to drive from a ScoutDecision, or (None, reason). A decision is used once (its stamp must be
     newer than last_stamp, the decision the previous scout started from), only while fresh (max_age_s, so a latched
