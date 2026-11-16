@@ -67,6 +67,8 @@
        uses classical. -->
   <arg name="local_planner" default="classical"/>
   <arg name="qlp_bundle" default=""/>
+  <!-- qlp only: people for its obstacle rows. none | tracked_people (needs mattbot_image_detection people_tracker) -->
+  <arg name="qlp_obstacle_source" default="none"/>
 
   <!-- Launch the occupancy grid mapper -->
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
@@ -95,6 +97,7 @@
     <param name="max_plan_time_sec" value="$(arg max_plan_time_sec)"/>
     <param name="local_planner" value="$(arg local_planner)"/>
     <param name="qlp_bundle" value="$(arg qlp_bundle)"/>
+    <param name="qlp_obstacle_source" value="$(arg qlp_obstacle_source)"/>
     <!-- qlp only: the Jetson's default OpenBLAS kernel returns NaN from float32 matmul (torch) -->
     <env if="$(eval local_planner == 'qlp')" name="OPENBLAS_CORETYPE" value="CORTEXA57"/>
   </node>

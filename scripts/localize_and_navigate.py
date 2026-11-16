@@ -1650,7 +1650,9 @@ class Navigator:
             odom_topic=rospy.get_param('~qlp_odom_topic', '/odom'),
             threads=int(rospy.get_param('~qlp_threads', 1)),
             log_dir=str(rospy.get_param('~qlp_log_dir', '')),
+            # People for the obstacle rows: none | tracked_people (mattbot_image_detection people_tracker)
             obstacle_source=str(rospy.get_param('~qlp_obstacle_source', 'none')),
+            obstacle_params=dict(rospy.get_param('~qlp_obstacle_params', {}) or {}),
             # Other robots (/agent_location) for bundles trained with robot tracks; 'auto' = only then
             robot_source=str(rospy.get_param('~qlp_robot_source', 'auto')),
         )
