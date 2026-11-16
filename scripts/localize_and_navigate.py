@@ -1651,6 +1651,8 @@ class Navigator:
             threads=int(rospy.get_param('~qlp_threads', 1)),
             log_dir=str(rospy.get_param('~qlp_log_dir', '')),
             obstacle_source=str(rospy.get_param('~qlp_obstacle_source', 'none')),
+            # Other robots (/agent_location) for bundles trained with robot tracks; 'auto' = only then
+            robot_source=str(rospy.get_param('~qlp_robot_source', 'auto')),
         )
 
     def _tracker_for_plan(self, timed=False):
