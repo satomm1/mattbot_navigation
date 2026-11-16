@@ -41,6 +41,7 @@ from navigation_utils import (
     plan_start_heading,
 )
 from navigation_utils.observation_policy import check_etas, is_own_goal, pick_scout, scout_deadline, yields_to
+from navigation_utils.progress_watchdog import ProgressWatchdog
 
 
 V_PREV_THRES = 0.0001
@@ -193,6 +194,10 @@ class Navigator:
     This node handles point to point mattbot motion, avoiding obstacles.
     It is the sole node that should publish to cmd_vel
     """
+
+    #: Whether ~local_planner:=qlp (the learned TRACK controller, q_local_planner) may be used.
+    #: Subclasses whose plans must keep a timetable (the multi-agent navigator) turn it off.
+    SUPPORTS_QLP = True
 
     def __init__(self, node_name="mattbot_navigator"):
         rospy.init_node(node_name, anonymous=True)
@@ -448,11 +453,14 @@ class Navigator:
 
         self.track_accel_max = rospy.get_param('~track_accel_max', 0.3)
         self.track_soft_start_sec = rospy.get_param('~track_soft_start_sec', 1.5)
-        self.traj_controller = TrajectoryTracker(
+        self.classical_tracker = TrajectoryTracker(
             self.kpx, self.kpy, self.kdx, self.kdy, self.v_max, self.om_max,
             a_max=self.track_accel_max,
             soft_start_sec=self.track_soft_start_sec,
         )
+        # TRACK controller: classical (above) or the learned planner (~local_planner:=qlp)
+        self.traj_controller = self.classical_tracker
+        self._init_local_planner()
         self.pose_controller = PoseController(
             rospy.get_param("~park_k1", 1.0),
             rospy.get_param("~park_k2", 2.0),
@@ -1270,6 +1278,7 @@ class Navigator:
         if new_mode == Mode.TRACK:
             self.track_start_time = rospy.get_rostime().to_sec()
             self._odom_history = []
+            self.qlp_watchdog.reset()  # ALIGN / stops before TRACK are not "no progress"
             self._reset_plan_clock_slip()
             self.robot_slowed_by_person = False  # So a person already nearby re-triggers the slow notice
         self.mode = new_mode
@@ -1490,11 +1499,12 @@ class Navigator:
 
         threading.Thread(target=post, daemon=True).start()
 
-    def modify_velocity_for_person(self, V, om):
+    def modify_velocity_for_person(self, V, om, scale_slow=True):
         """
         Scale cmd_vel for nearby people (TRACK mode only).
         Full stop -> STOPPED_FOR_PERSON mode + replan on resume (run loop).
         Slow zone -> scale by PERSON_SLOW_SCALE; plan clock slip in publish_control.
+        scale_slow=False (learned planner) keeps the full stop but skips the slow-zone scaling.
         """
         if self.distance_to_person < PERSON_STOP_DISTANCE and self.person_in_path:
             self.robot_slowed_by_person = False
@@ -1508,7 +1518,7 @@ class Navigator:
             self.robot_stopped_by_person = True
             return V, om
 
-        if self.distance_to_person < PERSON_SLOW_DISTANCE:
+        if scale_slow and self.distance_to_person < PERSON_SLOW_DISTANCE:
             if not self.robot_slowed_by_person:
                 _nav_loginfo("Slowing down for person")
                 self._notify_screen("Slowing for human", speak=False)
@@ -1590,6 +1600,116 @@ class Navigator:
                 pose_st.header.stamp = rospy.Duration(times[i]) + current_time
             path_msg.poses.append(pose_st)
         publisher.publish(path_msg)
+
+    # ---------- TRACK controller selection (classical / learned) ----------
+
+    def _init_local_planner(self):
+        """Read ~local_planner and build the learned TRACK controller if asked for (falls back to classical)."""
+        self.local_planner = str(rospy.get_param('~local_planner', 'classical')).strip().lower()
+        self.qlp_tracker = None
+        self.qlp_max_bad_steps = int(rospy.get_param('~qlp_max_bad_steps', 5))
+        self.qlp_max_failed_replans = int(rospy.get_param('~qlp_max_failed_replans', 3))
+        self.qlp_time_budget_factor = float(rospy.get_param('~qlp_time_budget_factor', 2.0))
+        self.qlp_watchdog = ProgressWatchdog(float(rospy.get_param('~qlp_stuck_window_sec', 8.0)),
+                                             float(rospy.get_param('~qlp_stuck_min_progress_m', 0.2)))
+        self._qlp_failed_replans = 0
+        if self.local_planner not in ('classical', 'qlp'):
+            rospy.logwarn("[Navigator] unknown ~local_planner %r; using classical", self.local_planner)
+            self.local_planner = 'classical'
+        if self.local_planner == 'qlp':
+            if not self.SUPPORTS_QLP:
+                rospy.logwarn("[Navigator] ~local_planner:=qlp is not supported by %s yet (its plans keep a "
+                              "timetable); using the classical tracker", type(self).__name__)
+                self.local_planner = 'classical'
+            else:
+                try:
+                    self.qlp_tracker = self._make_qlp_tracker()
+                except Exception as e:  # noqa: BLE001 - never take the navigator down: drive classically
+                    rospy.logerr("[Navigator] learned local planner unavailable (%s: %s); using the classical "
+                                 "tracker", type(e).__name__, e)
+                    self.local_planner = 'classical'
+        self.traj_controller = self._tracker_for_plan()
+        _nav_loginfo("TRACK controller: %s", self.local_planner if self.qlp_tracker is None
+                     else "qlp (%s)" % self.qlp_tracker.policy.id)
+
+    def _make_qlp_tracker(self):
+        bundle = os.path.expanduser(str(rospy.get_param('~qlp_bundle', '')))
+        if not bundle:
+            raise ValueError("~qlp_bundle is not set (path of a q_local_planner deploy bundle)")
+        try:
+            # Before torch is imported: the Jetson's default OpenBLAS kernel returns NaN (q_local_planner docs)
+            from qlp.utils.blas import configure_openblas
+            configure_openblas()
+            from qlp_ros.tracker import QlpTracker
+        except ImportError as e:
+            raise ImportError("q_local_planner is not built in this workspace (%s)" % e)
+        return QlpTracker(
+            bundle,
+            base_frame=rospy.get_param('~qlp_base_frame', 'base_footprint'),
+            scan_topic=rospy.get_param('~qlp_scan_topic', '/scan'),
+            odom_topic=rospy.get_param('~qlp_odom_topic', '/odom'),
+            threads=int(rospy.get_param('~qlp_threads', 1)),
+            log_dir=str(rospy.get_param('~qlp_log_dir', '')),
+            obstacle_source=str(rospy.get_param('~qlp_obstacle_source', 'none')),
+        )
+
+    def _tracker_for_plan(self, timed=False):
+        """The TRACK controller for a plan. Timed (coordinated) plans must keep their timetable: classical."""
+        if timed or self.qlp_tracker is None:
+            return self.classical_tracker
+        return self.qlp_tracker
+
+    def _using_qlp(self):
+        return self.qlp_tracker is not None and self.traj_controller is self.qlp_tracker
+
+    def plan_time_for_checks(self):
+        """Plan time for the run loop's plan-time comparisons (observation stops, fleet intents).
+
+        Classical: time since TRACK started (the robot keeps the timetable). Learned planner: the
+        trajectory time at the robot's progress along the path, which it reaches at its own pace.
+        """
+        if self._using_qlp():
+            return self.traj_controller.progress_time()
+        return self.get_current_plan_time()
+
+    def _out_of_time(self):
+        """TRACK has taken too long for this plan (then: replan, or park if near the goal)."""
+        if self._using_qlp():  # no timetable: a looser budget on elapsed time
+            return self.get_current_plan_time() > self.qlp_time_budget_factor * self.current_plan_duration + 2.0
+        return self.get_current_plan_time() > self.current_plan_duration * 1.2
+
+    def _handle_qlp_failure(self):
+        """After ~qlp_max_bad_steps failed steps (stale inputs, non-finite action): stop and replan; after
+        ~qlp_max_failed_replans such replans in a row, give the goal up. Returns True if it acted."""
+        tr = self.traj_controller
+        if tr.consecutive_failures == 0:
+            if tr.last_result is not None and tr.last_result.ok:
+                self._qlp_failed_replans = 0  # a healthy step since the last failure replan
+            return False
+        if tr.consecutive_failures < self.qlp_max_bad_steps:
+            return False
+        self.nav_vel_pub.publish(Twist())
+        self._qlp_failed_replans += 1
+        if self._qlp_failed_replans > self.qlp_max_failed_replans:
+            rospy.logerr("[Navigator] learned planner failed %d replans in a row (%s); giving up the goal",
+                         self.qlp_max_failed_replans, tr.last_reason)
+            self._qlp_failed_replans = 0
+            self._notify_screen("Local planner failed", speak=True)
+            if self._detour is not None:
+                self._abandon_detour("learned planner failed")
+            elif self._scout is not None:
+                self._abandon_scout("learned planner failed")
+            else:
+                self.x_g = None
+                self.y_g = None
+                self.theta_g = None
+                self.switch_mode(Mode.IDLE)
+            return True
+        _nav_loginfo("Learned planner failed for %d steps (%s); stopping and replanning (%d/%d)",
+                     tr.consecutive_failures, tr.last_reason, self._qlp_failed_replans, self.qlp_max_failed_replans)
+        self.switch_mode(Mode.IDLE)
+        self.replan()
+        return True
 
     def get_current_plan_time(self):
         # returns the time since the current plan started
@@ -1792,6 +1912,7 @@ class Navigator:
 
         # Load the new trajectory into the controllers
         self.pose_controller.load_goal(gx, gy, gth)
+        self.traj_controller = self._tracker_for_plan()
         self.traj_controller.load_traj(t_new, traj_new)
         self._progress = 0.0
         self.current_plan = traj_new
@@ -1959,7 +2080,7 @@ class Navigator:
         along = (self.x - sx) * np.cos(sh) + (self.y - sy) * np.sin(sh)
         if np.hypot(self.x - sx, self.y - sy) < self.observe_trigger_m and along >= -0.05:
             return True
-        if self.get_current_plan_time() > entry["t"] + 2.0:
+        if self.plan_time_for_checks() > entry["t"] + 2.0:
             _nav_loginfo("Passed observation stop for %s without reaching it; skipping", list(stop.object_ids))
             self._observation_stops.pop(0)
         return False
@@ -2598,11 +2719,16 @@ class Navigator:
                 self.x, self.y, self.theta, t
             )
 
-            V, om = self.modify_velocity_for_person(V, om)
-            if self.robot_slowed_by_person:
-                self._advance_plan_clock_slip(PERSON_SLOW_SCALE)
+            if self._using_qlp():
+                # The learned planner was trained with humans: no slow-zone scaling (and it keeps
+                # no timetable, so no clock slip). The full stop for a person in the path stays.
+                V, om = self.modify_velocity_for_person(V, om, scale_slow=False)
             else:
-                self._reset_plan_clock_slip()
+                V, om = self.modify_velocity_for_person(V, om)
+                if self.robot_slowed_by_person:
+                    self._advance_plan_clock_slip(PERSON_SLOW_SCALE)
+                else:
+                    self._reset_plan_clock_slip()
         elif self.mode == Mode.ALIGN:
             if self._in_post_align_pause():
                 V, om = 0.0, 0.0
@@ -2747,8 +2873,10 @@ class Navigator:
             elif self.mode == Mode.TRACK:
                 self._maybe_recover_from_stall()
                 current_time = rospy.get_rostime().to_sec()
-                self._progress = self.get_current_plan_time()
-                if self._check_detour_yields():
+                self._progress = self.plan_time_for_checks()
+                if self._using_qlp() and self._handle_qlp_failure():
+                    pass  # the learned planner failed repeatedly: stopped and replanned (or gave up)
+                elif self._check_detour_yields():
                     pass  # gave way to another robot: replanned to the goal
                 elif self.near_goal():
                     if self._detour is not None:
@@ -2779,9 +2907,17 @@ class Navigator:
 
                     # Now replan
                     self.replan()
+                elif self._using_qlp() and self.qlp_watchdog.update(current_time, self.traj_controller.progress_m()):
+                    # The learned planner keeps no timetable: stuck = no progress along the path
+                    _nav_loginfo("Backing up because the learned planner made no progress for %.0f s",
+                                 self.qlp_watchdog.window_s)
+                    self.backing_start_time = current_time
+                    self.backing_for_waypoints = True
+                    self.switch_mode(Mode.BACKING)
                 elif len(self.waypoints) > 0 and not self.robot_stopped_by_person:
                     # If we have waypoints, check if we have reached them in time
-                    if self.get_current_plan_time() > self.waypoints[0][2]:
+                    # (learned planner: no deadlines; the progress watchdog above covers it)
+                    if not self._using_qlp() and self.get_current_plan_time() > self.waypoints[0][2]:
                         _nav_loginfo("Backing up because haven't reached waypoint")
                         self.backing_start_time = current_time
                         self.backing_for_waypoints = True
@@ -2820,7 +2956,7 @@ class Navigator:
                 #     # Now replan
                 #     self.replan(obj_x=obj_x, obj_y=obj_y, obj_d=obj_d)
 
-                if self.mode == Mode.TRACK and self.get_current_plan_time() > self.current_plan_duration * 1.2:
+                if self.mode == Mode.TRACK and self._out_of_time():
                     gx, gy, _gth = self._active_goal()
                     if (gx is not None and gy is not None and np.linalg.norm(np.array([self.x - gx, self.y - gy])) > 0.5):
                         _nav_loginfo("replanning because out of time")

@@ -61,6 +61,11 @@
   <arg name="robot_clearance" default="0.4"/>
   <!-- Max wall-clock time (s) for A* before giving up on a plan. -->
   <arg name="max_plan_time_sec" default="15.0"/>
+  <!-- TRACK controller: classical (differential-flatness trajectory tracker) or qlp (the learned
+       local planner from q_local_planner; needs a deploy bundle). The multi-agent navigator always
+       uses classical. -->
+  <arg name="local_planner" default="classical"/>
+  <arg name="qlp_bundle" default=""/>
 
   <!-- Launch the occupancy grid mapper -->
   <node name="occupancy_grid_node" pkg="mattbot_navigation" type="occupancy_grid_mapper.py" output="screen">
@@ -87,6 +92,10 @@
     <param name="nearest_free_search_radius" value="1.0"/>
     <param name="robot_clearance" value="$(arg robot_clearance)"/>
     <param name="max_plan_time_sec" value="$(arg max_plan_time_sec)"/>
+    <param name="local_planner" value="$(arg local_planner)"/>
+    <param name="qlp_bundle" value="$(arg qlp_bundle)"/>
+    <!-- qlp only: the Jetson's default OpenBLAS kernel returns NaN from float32 matmul (torch) -->
+    <env if="$(eval local_planner == 'qlp')" name="OPENBLAS_CORETYPE" value="CORTEXA57"/>
   </node>
 
   <node if="$(arg observe)" name="observation_planner" pkg="mattbot_navigation" type="observation_planner.py" output="screen">

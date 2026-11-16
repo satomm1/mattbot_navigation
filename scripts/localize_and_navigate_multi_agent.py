@@ -140,6 +140,10 @@ class MultiAgentNavigator(nav_impl.Navigator):
     - ``_peer_active_trajectories``: cache of peers' **committed** timed plans (for sequential replanning).
     """
 
+    #: Timed (coordinated) trajectories must keep their timetable, which the learned local planner
+    #: (~local_planner:=qlp) does not: not supported here yet, so TRACK always uses the classical tracker.
+    SUPPORTS_QLP = False
+
     def __init__(self, node_name="mattbot_navigator_multi_agent"):
         # --- Goal-source flags (drive whether replan() re-enters pre-MULTI + timing) ---
         self._from_multi_robot_goal = False
