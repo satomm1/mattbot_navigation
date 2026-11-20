@@ -41,10 +41,7 @@
   <arg name="observe_intent_margin_s" default="10.0"/>
   <arg name="observe_intent_commit_s" default="15.0"/>
 
-  <!-- AMCL odom/laser values live in mattbot_bringup/launch/amcl.launch; z_hit/z_rand/sigma_hit below are read by mattbot_mcl/localization_quality -->
-  <param name="z_hit"  value="0.95"/>
-  <param name="z_rand" value="0.05"/>
-  <param name="sigma_hit" value="0.15"/>
+  <!-- AMCL odom/laser values live in mattbot_bringup/launch/amcl.launch (localization_quality reads the /amcl laser params) -->
 
     <!-- Nominal trajectory speed (m/s); override from bringup via launch arg when included. -->
   <arg name="cruising_velocity" default="0.40"/>
@@ -64,8 +61,10 @@
   <arg name="max_plan_time_sec" default="15.0"/>
   <!-- Spin rate (rad/s) of the startup localize spins and the recovery relocalize spin. The lidar sweeps
        for 0.1 s, so faster spins smear each scan more. -->
-  <arg name="localize_spin_rate" default="0.75"/>
-  <arg name="relocalize_duration_sec" default="10.0"/>
+  <arg name="localize_spin_rate" default="1.0"/>
+  <!-- Max relocalize spin (s); it only runs if the stationary validation after a recovery fails, and
+       stops as soon as localization_quality validates the pose -->
+  <arg name="relocalize_duration_sec" default="6.5"/>
   <!-- TRACK controller: classical (differential-flatness trajectory tracker) or qlp (the learned
        local planner from q_local_planner; needs a deploy bundle). The multi-agent navigator always
        uses classical. -->
