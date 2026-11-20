@@ -292,6 +292,9 @@ class Navigator:
         self.relocalize_duration_sec = rospy.get_param(
             '~relocalize_duration_sec', 5.0
         )
+        # Spin rate (rad/s) for LOCALIZING / LOCALIZING2 / RELOCALIZING. Each lidar sweep takes ~0.1 s,
+        # so AMCL matches a scan smeared over rate * 0.1 rad; slower spins give cleaner scans.
+        self.localize_spin_rate = abs(float(rospy.get_param('~localize_spin_rate', 1.5)))
         self.backing_duration_sec = rospy.get_param('~backing_duration_sec', 1.25)
         self.nearest_free_search_radius = rospy.get_param(
             '~nearest_free_search_radius', 1.0
@@ -1039,12 +1042,9 @@ class Navigator:
     def recovery_validated_callback(self, msg):
         if self.mode != Mode.RECOVERY_VALIDATE:
             return
-        if not msg.data:
-            elapsed = (
-                rospy.get_rostime().to_sec() - self.recovery_validate_start_time
-            )
-            if elapsed < self.recovery_validate_min_sec:
-                return
+        # Keep an early False too: localization_quality publishes once per attempt, so dropping
+        # it turned every failure into a validation timeout. The state machine still waits
+        # recovery_validate_min_sec before acting on a failure.
         self._recovery_validated = bool(msg.data)
         _nav_loginfo(
             "[Navigator][Recovery] recovery_validated=%s",
@@ -2748,7 +2748,7 @@ class Navigator:
             om = 0.0
         elif self.mode == Mode.LOCALIZING or self.mode == Mode.RELOCALIZING:
             V = 0.0
-            om = 1.5
+            om = self.localize_spin_rate
         elif self.mode == Mode.LOCALIZING2:
             if self.localize_begin_time is not None and rospy.get_rostime() - self.localize_begin_time < rospy.Duration(2):
                 # If we are still localizing, use a high angular velocity to align
@@ -2756,7 +2756,7 @@ class Navigator:
                 om = 0.0
             else:
                 V = 0.0
-                om = -1.5
+                om = -self.localize_spin_rate
         elif self.mode == Mode.WAITING_FOR_INIT:
             V = 0.0
             om = 0.0
@@ -3099,7 +3099,10 @@ class Navigator:
                         _nav_loginfo(
                             "[Navigator][Recovery] validated, staying IDLE"
                         )
-                elif self._recovery_validated is False or (
+                elif (
+                    self._recovery_validated is False
+                    and elapsed >= self.recovery_validate_min_sec
+                ) or (
                     self._recovery_validated is None
                     and elapsed >= self.recovery_validate_timeout_sec
                 ):

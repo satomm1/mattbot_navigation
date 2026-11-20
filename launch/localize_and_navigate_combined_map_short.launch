@@ -62,6 +62,10 @@
   <arg name="robot_clearance" default="0.4"/>
   <!-- Max wall-clock time (s) for A* before giving up on a plan. -->
   <arg name="max_plan_time_sec" default="15.0"/>
+  <!-- Spin rate (rad/s) of the startup localize spins and the recovery relocalize spin. The lidar sweeps
+       for 0.1 s, so faster spins smear each scan more. -->
+  <arg name="localize_spin_rate" default="0.75"/>
+  <arg name="relocalize_duration_sec" default="10.0"/>
   <!-- TRACK controller: classical (differential-flatness trajectory tracker) or qlp (the learned
        local planner from q_local_planner; needs a deploy bundle). The multi-agent navigator always
        uses classical. -->
@@ -90,7 +94,8 @@
     <param name="stall_odom_displacement_m" value="0.02"/>
     <param name="stall_window_sec" value="0.5"/>
     <param name="backing_duration_sec" value="1.0"/>
-    <param name="relocalize_duration_sec" value="5.0"/>
+    <param name="relocalize_duration_sec" value="$(arg relocalize_duration_sec)"/>
+    <param name="localize_spin_rate" value="$(arg localize_spin_rate)"/>
     <param name="track_stall_grace_sec" value="1.0"/>
     <param name="nearest_free_search_radius" value="1.0"/>
     <param name="robot_clearance" value="$(arg robot_clearance)"/>
